@@ -85,7 +85,7 @@ export ONNX_MLIR_INCLUDE=$ONNX_MLIR_ROOT/include
 export ONNX_MLIR_BIN=$ONNX_MLIR_ROOT/build/Debug/bin
 
 # Include ONNX-MLIR executable directories part of $PATH.
-export PATH=$ONNX_MLIR_ROOT/build/Debug/bin:$PATH
+export PATH=$ONNX_MLIR_BIN:$PATH
 ```
 
 Run these commands directly in the docs/docs/mnist_example and everything should work fine. You may also simply execute `. update_env.sh`
