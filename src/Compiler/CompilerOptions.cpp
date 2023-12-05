@@ -77,6 +77,7 @@ std::vector<std::string> extraLibPaths;                // onnx-mlir only
 std::vector<std::string> extraLibs;                    // onnx-mlir only
 ProfileIRs profileIR;                                  // onnx-mlir only
 OptReport optReport;                                   // onnx-mlir only
+bool useOldBufferization;                              // onnx-mlir only
 bool split_input_file;                                 // onnx-mlir-opt only
 bool verify_diagnostics;                               // onnx-mlir-opt only
 bool verify_passes;                                    // onnx-mlir-opt only
@@ -548,6 +549,15 @@ static llvm::cl::opt<bool, true> allowUnregisteredDialectsOpt(
     llvm::cl::desc("Allow operation with no registered dialects"),
     llvm::cl::location(allowUnregisteredDialects), llvm::cl::init(false),
     llvm::cl::cat(OnnxMlirOptOptions));
+
+// Removed once the new LLVM bufferization works without performance regression.
+static llvm::cl::opt<bool, true> useOldBufferizationOpt("use-old-bufferization",
+    llvm::cl::desc(
+        "Enable the old LLVM bufferization mechanism (default=true)\n"
+        "This option should be removed once the new LLVM bufferization works "
+        "well in onnx-mlir"),
+    llvm::cl::location(useOldBufferization), llvm::cl::init(true),
+    llvm::cl::cat(OnnxMlirOptions));
 
 // Configuration states associated with certain options.
 // For example, when maccel is specified, NNPA can register
@@ -1087,6 +1097,10 @@ void initCompilerConfig() {
     addCompilerConfig(CCM_SHARED_LIB_PATH_DEPS, {getLibraryPath()});
 
     if (enableParallel) {
+#ifdef USE_STATIC_OMP
+      // Add OpenMP LLVM library if parallel is enabled.
+      addCompilerConfig(CCM_SHARED_LIB_DEPS, {"ompruntime"});
+#else
       // Add the static and dynamic path to OMP lib, which resides with the llvm
       // tools. Thus fetch library path associated with "llc".
       std::string libPath = getLLVMLibraryPath();
@@ -1095,8 +1109,8 @@ void initCompilerConfig() {
           CCM_SHARED_LIB_PATH_DEPS, std::vector<std::string>{libPath});
       addCompilerConfig(
           CCM_SHARED_DYN_LIB_PATH_DEPS, std::vector<std::string>{libPath});
+#endif
     }
-
     // Add user specified libs and their path
     // Multiple lib or directory can be specified with multiple options.
     // For example, -lextra1, -lextra2, -Lpath1, -Lpath2
