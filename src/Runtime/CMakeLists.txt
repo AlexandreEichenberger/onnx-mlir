@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 add_subdirectory(jni)
-add_subdirectory(omp)
+# hi alex, removed this
+# add_subdirectory(omp)
 
 # TODO: should add for each accelerator its subdirectory that implements InitAccel##name
 # and ShutdownAccel##name.
