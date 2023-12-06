@@ -924,12 +924,13 @@ struct GenericLayerNormaOpLowering : public OpConversionPattern<OP_TYPE> {
           invStdDevFlatMemRef);
     // Alloc mem for reductions (should be private if parallel)
     MemRefType tmpRedType = MemRefType::get({B, VL}, elementType);
-    Value tmpRedMemRef;
-    if constexpr (std::is_same<OP_TYPE, ONNXLayerNormalizationOp>::value) {
-      // First reduction only needed for LayerNorm.
-      tmpRedMemRef = create.mem.alignedAlloca(tmpRedType);
-    }
-    Value tmpRedMemRef2 = create.mem.alignedAlloca(tmpRedType);
+    // Hi alex, fix this
+    // Value tmpRedMemRef;
+    // if constexpr (std::is_same<OP_TYPE, ONNXLayerNormalizationOp>::value) {
+    //   // First reduction only needed for LayerNorm.
+    //   tmpRedMemRef = create.mem.alignedAlloca(tmpRedType);
+    // }
+    // Value tmpRedMemRef2 = create.mem.alignedAlloca(tmpRedType);
     // Iterate over 1st dim by block
     ValueRange loopDefs = create.krnl.defineLoops(1);
     IndexExpr zero = LiteralIndexExpr(0);
