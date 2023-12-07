@@ -340,6 +340,7 @@ static inline void replaceGenericLayerNormOp(
 template <typename OP_TYPE>
 LogicalResult generateGenericLayerNormOpONNXCode(
     ConversionPatternRewriter &rewriter, Location loc, OP_TYPE lnOp) {
+  LLVM_DEBUG(llvm::dbgs() << "LayerNorm (generic)\n");
   MDBuilder create(rewriter, loc);
   Value X = lnOp.getX(); // Original value, not translated.
   TensorType XType = X.getType().cast<TensorType>();
@@ -863,6 +864,7 @@ struct GenericLayerNormaOpLowering : public OpConversionPattern<OP_TYPE> {
       SHAPE_HELPER_TYPE &shapeHelper, int64_t B, int64_t VL,
       BroadcastKind scaleBroadcastKind, BroadcastKind biasBroadcastKind,
       IndexExpr scaleModFactor, IndexExpr biasModFactor) const {
+    LLVM_DEBUG(llvm::dbgs() << "LayerNorm (SIMD)\n");
 
     MDBuilder create(rewriter, loc);
     Value XMemRef = adaptor.getX();
