@@ -33,15 +33,11 @@
 
 #define DEBUG_TYPE "zhigh-to-zlow"
 #define ENABLE_CSU_PAR true /* Allow parallel compiler gen Stick/Unstick. */
-#define PREFETCH_CSU_INPUT_DIST (0 * 1)
-#define PREFETCH_CSU_OUTPUT_DIST (0 * 64)
 #define PREFETCH_CSU 1
 #define PREFETCH_LOCALITY 1
 
 // For roberta: stick N/M=1 with dist = 0 performs marginally better than the
 // other combinations.
-#define CS_N 1 /* Tiling for Stick */
-#define CS_M 1 /* Tiling for Stick */
 #define CU_N 2 /* Tiling for Unstick */
 #define CU_M 2 /* Tiling for Unstick */
 
@@ -576,8 +572,8 @@ struct ZHighToZLowStickOpLowering : public ConversionPattern {
     bool is2DS = layout.getValue().equals_insensitive("2DS");
 
     // Tiling for Stick in the E2 x E1 dim: N x 64M.
-    int64_t N = CS_N;
-    int64_t M = CS_M;
+    int64_t N = 1; // 1 behave marginally better than 2.
+    int64_t M = 1; // 1 behave marginally better than 2.
     if (rank == 1 || is2DS)
       N = 1; // No tiling on E2 dim for
     assert(32 % N == 0 && "Tiling by N (along E2) must divide 32");
@@ -695,12 +691,10 @@ struct ZHighToZLowStickOpLowering : public ConversionPattern {
                 // => 64 (e1+m) and add the "l" local E1 offset.
                 prefetchInputAF[E1] = (prefetchInputAF[E1] + m) * 64;
 #if PREFETCH_CSU
-                IndexExpr origE1 = prefetchInputAF[E1];
-                // Temporarily increase prefetch input AF on E1 by input dist.
-                prefetchInputAF[E1] = origE1 + PREFETCH_CSU_INPUT_DIST;
+                // Dist of 0*64 ahead behaved best. Locality of 1 behaved
+                // slightly better than 2, and 3 was really bad.
                 create.krnl.prefetchIE(input, prefetchInputAF,
-                    /*isWrite*/ false, /*locality*/ PREFETCH_LOCALITY);
-                prefetchInputAF[E1] = origE1;
+                    /*isWrite*/ false, /*locality*/ 1);
 #endif
                 // Loop over 64.
                 create.affine.forIE(litZero, lit64, VL,
@@ -742,10 +736,10 @@ struct ZHighToZLowStickOpLowering : public ConversionPattern {
                 Value allocAsNx64 = create.mem.reinterpretCast(
                     alloc, litZero.getValue(), reallocTileDims);
 #if PREFETCH_CSU
-                // Calculate the prefetch
-                outputAF[E1] = outputAF[E1] + PREFETCH_CSU_OUTPUT_DIST;
+                // Calculate the prefetch. Dist of 0*1 was best, locality of 1
+                // was nearly same as 2, better than 3.
                 create.krnl.prefetchIE(alloc, outputAF, /*write*/ true,
-                    /*locality*/ PREFETCH_LOCALITY);
+                    /*locality*/ 1);
 #endif
                 // Calculate buffer offset
                 int64_t num = N * 64;
