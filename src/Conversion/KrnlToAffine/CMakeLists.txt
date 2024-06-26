@@ -7,6 +7,7 @@ add_onnx_mlir_library(OMKrnlToAffine
   KrnlGetLinearOffsetIndex.cpp
   KrnlLoad.cpp
   KrnlMatmul.cpp
+  KrnlMemcpy.cpp
   KrnlMemset.cpp
   KrnlPrefetch.cpp
   KrnlStore.cpp

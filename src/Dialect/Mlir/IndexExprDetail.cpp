@@ -105,16 +105,20 @@ void IndexExprImpl::initAsLiteral(double const val, const IndexExprKind kind) {
 static bool getIntegerLiteralFromValue(Value value, int64_t &intLit) {
   // From lib/Dialect/LinAlg/Transform/Promotion.cpp
   if (auto constantOp = value.getDefiningOp<arith::ConstantOp>()) {
-    if (mlir::isa<IndexType>(constantOp.getType()))
+    if (mlir::isa<IndexType>(constantOp.getType())) {
       intLit = mlir::cast<IntegerAttr>(constantOp.getValue()).getInt();
-    return true;
-  }
-  // Since ConstantIndexOp is a subclass of ConstantOp, not sure if this one is
-  // needed.
-  if (auto constantOp = value.getDefiningOp<arith::ConstantIndexOp>()) {
-    if (mlir::isa<IndexType>(constantOp.getType()))
+      return true;
+    } else if (mlir::isa<IntegerType>(constantOp.getType())) {
+      intLit = mlir::cast<IntegerAttr>(constantOp.getValue()).getInt();
+      return true;
+    }
+  } else if (auto constantOp = value.getDefiningOp<arith::ConstantIndexOp>()) {
+    // Since ConstantIndexOp is a subclass of ConstantOp, not sure if this one
+    // is needed.
+    if (mlir::isa<IndexType>(constantOp.getType())) {
       intLit = constantOp.value();
-    return true;
+      return true;
+    }
   }
   return false;
 }
@@ -122,17 +126,18 @@ static bool getIntegerLiteralFromValue(Value value, int64_t &intLit) {
 static bool getFloatLiteralFromValue(Value value, double &floatLit) {
   // From lib/Dialect/LinAlg/Transform/Promotion.cpp
   if (auto constantOp = value.getDefiningOp<arith::ConstantOp>()) {
-    if (mlir::isa<FloatType>(constantOp.getType()))
+    if (mlir::isa<FloatType>(constantOp.getType())) {
       floatLit =
           mlir::cast<FloatAttr>(constantOp.getValue()).getValueAsDouble();
-    return true;
-  }
-  // Since ConstantFloatOp is a subclass of ConstantOp, not sure if this one is
-  // needed.
-  if (auto constantOp = value.getDefiningOp<arith::ConstantFloatOp>()) {
-    if (mlir::isa<FloatType>(constantOp.getType()))
+      return true;
+    }
+  } else if (auto constantOp = value.getDefiningOp<arith::ConstantFloatOp>()) {
+    // Since ConstantFloatOp is a subclass of ConstantOp, not sure if this one
+    // is needed.
+    if (mlir::isa<FloatType>(constantOp.getType())) {
       floatLit = constantOp.value().convertToDouble();
-    return true;
+      return true;
+    }
   }
   return false;
 }
