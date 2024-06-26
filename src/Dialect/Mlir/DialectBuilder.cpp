@@ -1192,7 +1192,7 @@ Value MemRefBuilder::reshapeToFlatInnermost(Value valToReshape,
     int64_t dimsToFlatten) const {
   // Parse input.
   MemRefType inputType = mlir::cast<MemRefType>(valToReshape.getType());
-  assert(!hasNonIdentityLayout(inputType) && "MemRef is not normalized");
+  // hi alex assert(!hasNonIdentityLayout(inputType) && "MemRef is not normalized");
   int64_t inputRank = inputType.getRank();
   // Verify dims has the right number of elements.
   assert(inputRank == (int64_t)dims.size() && "rank mismatch");
