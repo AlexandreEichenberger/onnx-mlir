@@ -128,6 +128,12 @@ mlir::Value getDimOrConstant(mlir::ConversionPatternRewriter &rewriter,
 /// opsToCall. The op name is used for matching
 bool checkOpToCall(mlir::Operation *op, std::string opsForCall);
 
+// Look for layout pattern of the type "dx" or "dx mod c" where dx is the last
+// dim of the map and c is a constant literal. Return true on success with
+// mod set to the proper value (-1 in the absence of a modulo).
+bool isMappedLowestDimIdentityOrModConst(
+    mlir::MemRefType type, int64_t &modVal);
+
 //===----------------------------------------------------------------------===//
 // Fold and emit support.
 //===----------------------------------------------------------------------===//
@@ -164,7 +170,7 @@ mlir::Value emitMemRefReinterpretCastOp(
     mlir::Value data, llvm::SmallVectorImpl<IndexExpr> &outputDims,
     mlir::Type outputType);
 
-/// Emit krnl iterate to compute argsort of a given MemRef along a given axis.
+/// Emit krnl iterate to compute ArgSort of a given MemRef along a given axis.
 /// Output MemRef has the same shape as the input MemRef but is of IndexType.
 mlir::Value emitArgSort(mlir::ConversionPatternRewriter &rewriter,
     mlir::Location loc, mlir::Value input, int64_t axis,
@@ -473,7 +479,7 @@ void populateLoweringONNXCustomOpPattern(
 // Utilities for generating krnl.call for ONNX Ops
 
 // Create allocate based on COMPUTED shapeHelper.
-// The generic computed shapehelper avoids the specific type of shape helper
+// The generic computed shape helper avoids the specific type of shape helper
 // for each op, and shape helper may be used in krnl loop generation, too.
 // Use template in case some op has special allocation. For the generic cases,
 // the typename is only used in location, which is not absolutely needed
@@ -506,7 +512,7 @@ std::vector<mlir::Value> allocForONNXOp(mlir::Operation *op,
 }
 
 // Template to create ONNXOp to Call pattern
-template <typename OP_TYPE, typename SHAPEHELPER_TYPE>
+template <typename OP_TYPE, typename SHAPE_HELPER_TYPE>
 struct ONNXGenericOpToCall : public mlir::OpConversionPattern<OP_TYPE> {
   using ADAPTOR_TYPE = typename OP_TYPE::Adaptor;
   ONNXGenericOpToCall(mlir::TypeConverter &typeConverter,
@@ -535,7 +541,7 @@ struct ONNXGenericOpToCall : public mlir::OpConversionPattern<OP_TYPE> {
     MultiDialectBuilder<IndexExprBuilderForKrnl, MemRefBuilder> create(
         rewriter, loc);
 
-    SHAPEHELPER_TYPE shapeHelper(op, operands, &create.krnlIE);
+    SHAPE_HELPER_TYPE shapeHelper(op, operands, &create.krnlIE);
     shapeHelper.computeShapeAndAssertOnFailure();
     // Insert an allocation and deallocation for the result of this operation.
     std::vector<mlir::Value> allocs = allocForONNXOp<OP_TYPE>(
@@ -566,7 +572,7 @@ using ONNXConvOpToCall =
 int64_t getAllocArgIndex(mlir::memref::AllocOp allocOp, int64_t index);
 
 /// This function returns a scalar of type 'dtype' from an optional value.
-/// Optional value must be: NoneType, memref<1xdtype> or memref<dtype>.
+/// Optional value must be: NoneType, memref<1 x dtype> or memref<dtype>.
 /// Default value is used in case of NoneType.
 mlir::Value getOptionalScalarValue(mlir::ConversionPatternRewriter &rewriter,
     mlir::Location loc, mlir::Value optionalScalar, mlir::Type elementType,

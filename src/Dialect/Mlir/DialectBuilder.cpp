@@ -1192,7 +1192,8 @@ Value MemRefBuilder::reshapeToFlatInnermost(Value valToReshape,
     int64_t dimsToFlatten) const {
   // Parse input.
   MemRefType inputType = mlir::cast<MemRefType>(valToReshape.getType());
-  // hi alex assert(!hasNonIdentityLayout(inputType) && "MemRef is not normalized");
+  // hi alex assert(!hasNonIdentityLayout(inputType) && "MemRef is not
+  // normalized");
   int64_t inputRank = inputType.getRank();
   // Verify dims has the right number of elements.
   assert(inputRank == (int64_t)dims.size() && "rank mismatch");
@@ -1480,18 +1481,20 @@ void SCFBuilder::yield() const { b().create<scf::YieldOp>(loc()); }
 // Vector Builder
 //===----------------------------------------------------------------------===//
 
-int64_t VectorBuilder::getMachineVectorLength(const Type &elementType) const {
+/* static */ int64_t VectorBuilder::getMachineVectorLength(
+    const Type &elementType) {
   VectorMachineSupport *vms =
       VectorMachineSupport::getGlobalVectorMachineSupport();
   // Even if unsupported, we can always compute one result per vector.
   return std::max((int64_t)1, vms->getVectorLength(elementType));
 }
 
-int64_t VectorBuilder::getMachineVectorLength(const VectorType &vecType) const {
+/* static */ int64_t VectorBuilder::getMachineVectorLength(
+    const VectorType &vecType) {
   return getMachineVectorLength(vecType.getElementType());
 }
 
-int64_t VectorBuilder::getMachineVectorLength(Value vecValue) const {
+/* static */ int64_t VectorBuilder::getMachineVectorLength(Value vecValue) {
   VectorType vecType = mlir::dyn_cast_or_null<VectorType>(vecValue.getType());
   assert(vecType && "expected vector type");
   return getMachineVectorLength(vecType.getElementType());

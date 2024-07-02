@@ -310,7 +310,7 @@ struct MemRefBuilder final : DialectBuilder {
   // collapse (dimsToFlatten). The function computes the new flattened
   // dimensions (flattenDims) and return the flattened value. Values of
   // dimsToFlatten are in the [1, rank of input] range. Legal only on types
-  // with identity layouts.
+  // with identity layouts. Legal only on types with identity layouts.
   mlir::Value reshapeToFlatInnermost(mlir::Value valToReshape,
       llvm::SmallVectorImpl<IndexExpr> &dims,
       llvm::SmallVectorImpl<IndexExpr> &flattenDims,
@@ -318,7 +318,8 @@ struct MemRefBuilder final : DialectBuilder {
   // Flatten to a 2D MemRef, with outer dim including outermost dim to axis -1,
   // and inner dim including the remaining innermost dims. Values of axis are
   // in the [1, rank of input) range. Negative axis values are taken from the
-  // back. Legal only on types with identity layouts.
+  // back. Legal only on types with identity layouts. Legal only on types with
+  // identity layouts.
   mlir::Value reshapeToFlat2D(mlir::Value valToReshape,
       llvm::SmallVectorImpl<IndexExpr> &dims,
       llvm::SmallVectorImpl<IndexExpr> &flattenDims, int64_t axis) const;
@@ -431,9 +432,9 @@ struct VectorBuilder final : DialectBuilder {
 
   // Get the machine SIMD vector length for the given elementary type.
   // This can help guide certain optimizations.
-  int64_t getMachineVectorLength(const mlir::Type &elementType) const;
-  int64_t getMachineVectorLength(const mlir::VectorType &vecType) const;
-  int64_t getMachineVectorLength(mlir::Value vecValue) const;
+  static int64_t getMachineVectorLength(const mlir::Type &elementType);
+  static int64_t getMachineVectorLength(const mlir::VectorType &vecType);
+  static int64_t getMachineVectorLength(mlir::Value vecValue);
 
   // Vector load: memref is expected to be scalar, will load a vector's worth of
   // values: e.g.

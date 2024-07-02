@@ -264,6 +264,56 @@ bool checkOpToCall(Operation *op, std::string opsForCall) {
   }
 }
 
+// Look for layout pattern of the type "dx" or "dx mod c" where dx is the last
+// dim of the map and c is a constant literal. Return true on success with
+// mod set to the proper value (-1 if no modulo).
+bool isMappedLowestDimIdentityOrModConst(MemRefType type, int64_t &modVal) {
+  modVal = -1; // Set to undefined value.
+  AffineMap affineMap = type.getLayout().getAffineMap();
+  int64_t numDims = affineMap.getNumDims();
+  int64_t numResults = affineMap.getNumResults();
+  AffineExpr innerAffineExpr = affineMap.getResult(numResults - 1);
+  LLVM_DEBUG({
+    llvm::dbgs() << "Investigate Layout transform\n";
+    affineMap.dump();
+  });
+
+  // Check if we have a "d2" pattern.
+  if (innerAffineExpr.getKind() == AffineExprKind::DimId) {
+    AffineDimExpr dimExpr = mlir::cast<AffineDimExpr>(innerAffineExpr);
+    int64_t dimId = dimExpr.getPosition();
+    if (dimId != numDims - 1)
+      return false;
+    LLVM_DEBUG(llvm::dbgs() << "  found d" << dimId << "\n");
+    return true;
+  }
+  // Check if we have a "d2 mod 64" pattern.
+  if (innerAffineExpr.getKind() == AffineExprKind::Mod) {
+    AffineBinaryOpExpr modExpr =
+        mlir::cast<AffineBinaryOpExpr>(innerAffineExpr);
+    // Expect dim on the LHS.
+    AffineExpr expectedDimExpr = modExpr.getLHS();
+    if (expectedDimExpr.getKind() != AffineExprKind::DimId)
+      return false;
+    AffineDimExpr dimExpr = mlir::cast<AffineDimExpr>(expectedDimExpr);
+    int64_t dimId = dimExpr.getPosition();
+    if (dimId != numDims - 1)
+      return false;
+    // Expect literal on the RHS.
+    AffineExpr expectedConstExpr = modExpr.getRHS();
+    if (expectedConstExpr.getKind() != AffineExprKind::Constant)
+      return false;
+    AffineConstantExpr valExpr =
+        mlir::cast<AffineConstantExpr>(expectedConstExpr);
+    modVal = valExpr.getValue();
+    LLVM_DEBUG(
+        llvm::dbgs() << "  found d" << dimId << " mod " << modVal << "\n");
+    return modVal > 0;
+  }
+  LLVM_DEBUG(llvm::dbgs() << "  did not find d2 or d2 mod 64 type pattern\n");
+  return false;
+}
+
 namespace {
 // Returns the DenseElementsAttr of input if it's a krnl.global constant or
 // onnx.Constant, or if it's one step removed from a krnl/onnx constant by a

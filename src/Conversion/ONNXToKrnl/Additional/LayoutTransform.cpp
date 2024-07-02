@@ -29,8 +29,9 @@ struct ONNXLayoutTransformOpLowering
     : public OpConversionPattern<ONNXLayoutTransformOp> {
   bool enableParallel = false;
 
-  using MDBuilder = MultiDialectBuilder<IndexExprBuilderForKrnl, KrnlBuilder,
-      MathBuilder, MemRefBuilder, VectorBuilder, AffineBuilder, SCFBuilder>;
+  using MDBuilder =
+      MultiDialectBuilder<IndexExprBuilderForKrnl, KrnlBuilder, MathBuilder,
+          MemRefBuilder, VectorBuilder, AffineBuilderKrnlMem, SCFBuilder>;
 
   ONNXLayoutTransformOpLowering(
       TypeConverter &typeConverter, MLIRContext *ctx, bool enableParallel)
@@ -39,56 +40,6 @@ struct ONNXLayoutTransformOpLowering
         enableParallel &&
         OnnxToKrnlLoweringConfiguration::enableSpecificParallelOps.isEnabled(
             ONNXLayoutTransformOp::getOperationName());
-  }
-
-  // Look for layout pattern of the type "dx" or "dx mod c" where dx is the last
-  // dim of the map and c is a constant literal. Return true on success with
-  // mod set to the proper value (-1 if no modulo).
-  bool inspectMappedLowestDim(MemRefType type, int64_t &modVal) const {
-    modVal = -1; // Set to undefined value.
-    AffineMap affineMap = type.getLayout().getAffineMap();
-    int64_t numDims = affineMap.getNumDims();
-    int64_t numResults = affineMap.getNumResults();
-    AffineExpr innerAffineExpr = affineMap.getResult(numResults - 1);
-    LLVM_DEBUG({
-      llvm::dbgs() << "Investigate Layout transform\n";
-      affineMap.dump();
-    });
-
-    // Check if we have a "d2" pattern.
-    if (innerAffineExpr.getKind() == AffineExprKind::DimId) {
-      AffineDimExpr dimExpr = mlir::cast<AffineDimExpr>(innerAffineExpr);
-      int64_t dimId = dimExpr.getPosition();
-      if (dimId != numDims - 1)
-        return false;
-      LLVM_DEBUG(llvm::dbgs() << "  found d" << dimId << "\n");
-      return true;
-    }
-    // Check if we have a "d2 mod 64" pattern.
-    if (innerAffineExpr.getKind() == AffineExprKind::Mod) {
-      AffineBinaryOpExpr modExpr =
-          mlir::cast<AffineBinaryOpExpr>(innerAffineExpr);
-      // Expect dim on the LHS.
-      AffineExpr expectedDimExpr = modExpr.getLHS();
-      if (expectedDimExpr.getKind() != AffineExprKind::DimId)
-        return false;
-      AffineDimExpr dimExpr = mlir::cast<AffineDimExpr>(expectedDimExpr);
-      int64_t dimId = dimExpr.getPosition();
-      if (dimId != numDims - 1)
-        return false;
-      // Expect literal on the RHS.
-      AffineExpr expectedConstExpr = modExpr.getRHS();
-      if (expectedConstExpr.getKind() != AffineExprKind::Constant)
-        return false;
-      AffineConstantExpr valExpr =
-          mlir::cast<AffineConstantExpr>(expectedConstExpr);
-      modVal = valExpr.getValue();
-      LLVM_DEBUG(
-          llvm::dbgs() << "  found d" << dimId << " mod " << modVal << "\n");
-      return modVal > 0;
-    }
-    LLVM_DEBUG(llvm::dbgs() << "  did not find d2 or d2 mod 64 type pattern\n");
-    return false;
   }
 
   // If both input and output have defined modVals (!=-1), then they must have
@@ -229,8 +180,8 @@ struct ONNXLayoutTransformOpLowering
     // Inspect input and output layout to see if we can optimize the
     // transformation.
     int64_t inMod, outMod;
-    bool inValid = inspectMappedLowestDim(inMemRefType, inMod);
-    bool outValid = inspectMappedLowestDim(outMemRefType, outMod);
+    bool inValid = isMappedLowestDimIdentityOrModConst(inMemRefType, inMod);
+    bool outValid = isMappedLowestDimIdentityOrModConst(outMemRefType, outMod);
     if (inValid && outValid && rank >= 2) {
       // For the moment, support only a mod in the one or the other direction.
       if ((inMod == -1 && outMod >= 16) || (inMod >= 16 && outMod == -1)) {
