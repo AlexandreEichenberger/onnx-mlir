@@ -37,10 +37,8 @@ public:
       : ConversionPattern(
             typeConverter, KrnlMemcpyOp::getOperationName(), 1, context) {}
 
-  // hi alex, prune
-  using MDBuild =
-      MultiDialectBuilder<IndexExprBuilderForKrnl, AffineBuilderKrnlMem,
-          SCFBuilder, VectorBuilder, MemRefBuilder, MathBuilder>;
+  using MDBuild = MultiDialectBuilder<IndexExprBuilderForKrnl, SCFBuilder,
+      VectorBuilder, MemRefBuilder, MathBuilder>;
 
   static const int64_t undefMod = -1;
 
@@ -66,49 +64,28 @@ public:
     if (srcMod != undefMod && destMod != undefMod && srcMod != destMod)
       return false;
 
-    // if we have a defined mod and literal len, make sure len<=mod.
+      // if we have a defined mod and literal len, make sure len<=mod.
+#if 0
     int64_t mod = srcMod != undefMod ? srcMod : destMod;
     IndexExpr lenIE = SymIE(len);
 
     if (mod != undefMod && lenIE.isLiteral()) {
       assert(lenIE.getLiteral() <= mod && "memcpy cannot span mapped memory");
     }
-
+#endif
     // All good.
     return true;
   }
-
-#if 0
-  Value flattenMem(MDBuild &create, Value memref, DimsExpr dims, int64_t mod,
-      IndexExpr offset, IndexExpr &flatOffset1, IndexExpr &flatOffset2) const {
-    if (mod == undefMod) {
-      flatOffset1 = offset;
-      flatOffset2 = LitIE(0); // Should not be used.
-      DimsExpr flatDims;
-      return create.mem.reshapeToFlatInnermost(
-          memref, dims, flatDims, dims.size());
-    }
-    // Have a friendly mapping
-    srcCopyOffset1 = srcCopyOffset.ceilDiv(srcMod);
-    srcCopyOffset2 = srcCopyOffset % srcMod;
-    IndexExpr T = LitIE(2);
-    IndexExpr M = LitIE(srcMod);
-    DimsExpr reallocTileDims = {T, M};
-    srcCopyValue =
-        create.mem.reinterpretCast(src, litZero.getValue(), reallocTileDims);
-
-  }
-#endif
 
   // Only for element type source/dest.
   LogicalResult matchAndRewrite(Operation *op, ArrayRef<Value> operands,
       ConversionPatternRewriter &rewriter) const override {
     Location loc = op->getLoc();
     MDBuild create(rewriter, loc);
-    IndexExprScope outerScope(create.affineKMem);
+    IndexExprScope outerScope(create.mem);
 
     // Get op info.
-    auto krnlOp = llvm::cast<KrnlMemcpyOp>(op);
+    KrnlMemcpyOp krnlOp = llvm::cast<KrnlMemcpyOp>(op);
     KrnlMemcpyOpAdaptor operandAdaptor(krnlOp);
     Value src = operandAdaptor.getSrc();
     Value dest = operandAdaptor.getDest();
@@ -181,9 +158,18 @@ public:
   }
 };
 
-void populateLoweringKrnlMemcpyOpPattern(TypeConverter &typeConverter,
-    RewritePatternSet &patterns, MLIRContext *ctx) {
-  patterns.insert<KrnlMemcpyOpLoweringToAffine>(typeConverter, ctx);
+bool canLowerKrnlMemcpyOpToAffine(KrnlMemcpyOp op) {
+  return KrnlMemcpyOpLoweringToAffine::matchReplacementPattern(
+      op.getDest(), op.getSrc(), op.getNumElems());
+}
+
+void populateLoweringKrnlMemcpyToAffineOpPattern(TypeConverter &typeConverter,
+    RewritePatternSet &patterns, MLIRContext *ctx, bool enableSIMD) {
+  if (enableSIMD) {
+    // Do not want to replace a llvm memcpy with custom code if SIMD is
+    // disabled.
+    patterns.insert<KrnlMemcpyOpLoweringToAffine>(typeConverter, ctx);
+  }
 }
 
 } // namespace krnl

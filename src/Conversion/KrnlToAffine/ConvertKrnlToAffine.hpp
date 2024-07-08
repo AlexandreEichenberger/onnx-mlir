@@ -55,7 +55,7 @@ using UnrollAndJamList = llvm::SmallVector<UnrollAndJamRecord, 4>;
 using UnrollAndJamMap = std::map<mlir::Operation *, UnrollAndJamList *>;
 
 void populateKrnlToAffineConversion(mlir::TypeConverter &typeConverter,
-    mlir::RewritePatternSet &patterns, mlir::MLIRContext *ctx);
+    mlir::RewritePatternSet &patterns, mlir::MLIRContext *ctx, bool enableSIMD);
 
 void populateLoweringKrnlCopyFromBufferOpPattern(
     mlir::TypeConverter &typeConverter, mlir::RewritePatternSet &patterns,
@@ -78,8 +78,10 @@ void populateLoweringKrnlGetLinearOffsetIndexOpPattern(
 void populateLoweringKrnlMatmultOpPattern(mlir::TypeConverter &typeConverter,
     mlir::RewritePatternSet &patterns, mlir::MLIRContext *ctx);
 
-void populateLoweringKrnlMemcpyOpPattern(mlir::TypeConverter &typeConverter,
-    mlir::RewritePatternSet &patterns, mlir::MLIRContext *ctx);
+bool canLowerKrnlMemcpyOpToAffine(mlir::KrnlMemcpyOp op);
+void populateLoweringKrnlMemcpyToAffineOpPattern(
+    mlir::TypeConverter &typeConverter, mlir::RewritePatternSet &patterns,
+    mlir::MLIRContext *ctx, bool enableSIMD);
 
 void populateLoweringKrnlMemsetOpPattern(mlir::TypeConverter &typeConverter,
     mlir::RewritePatternSet &patterns, mlir::MLIRContext *ctx);

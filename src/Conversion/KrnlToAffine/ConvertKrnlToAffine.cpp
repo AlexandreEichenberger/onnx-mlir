@@ -826,7 +826,21 @@ struct ConvertKrnlToAffinePass
 
   StringRef getDescription() const override { return "Lower Krnl dialect."; }
 
+  // Make sure that we have a valid default constructor and copy
+  // constructor to make sure that the options are initialized properly.
+  ConvertKrnlToAffinePass() = default;
+  ConvertKrnlToAffinePass(const ConvertKrnlToAffinePass &pass)
+      : PassWrapper<ConvertKrnlToAffinePass, OperationPass<func::FuncOp>>() {}
+  ConvertKrnlToAffinePass(bool enableSIMD) {
+    // Below, need explicit assignment to enable implicit conversion of bool to
+    // Option<bool>.
+    this->enableSIMD = enableSIMD;
+  }
+
   void runOnOperation() final;
+
+  Option<bool> enableSIMD{*this, "enable-simd",
+      llvm::cl::desc("Enable SIMD code gen"), llvm::cl::init(false)};
 };
 
 void ConvertKrnlToAffinePass::runOnOperation() {
@@ -969,11 +983,11 @@ void ConvertKrnlToAffinePass::runOnOperation() {
   target.addIllegalOp<KrnlCopyToBufferOp>();
   target.addIllegalOp<KrnlCopyFromBufferOp>();
   target.addIllegalOp<KrnlPrefetchOp>();
-  target.addIllegalOp<KrnlMemcpyOp>(); // hi alex
-  // hi alex, included in the legal dialect
-  // target.addLegalOp<AffineYieldOp>();
-  // target.addLegalOp<AffineLoadOp>();
-  // target.addLegalOp<AffineStoreOp>();
+  if (enableSIMD) {
+    // target.addIllegalOp<KrnlMemcpyOp>(); // hi alex
+    target.addDynamicallyLegalOp<KrnlMemcpyOp>(
+        [](KrnlMemcpyOp op) { return !canLowerKrnlMemcpyOpToAffine(op); });
+  }
   target.addLegalOp<KrnlVectorTypeCastOp>();
   target.addLegalOp<UnrealizedConversionCastOp>();
   target.addLegalDialect<mlir::affine::AffineDialect, mlir::arith::ArithDialect,
@@ -984,7 +998,7 @@ void ConvertKrnlToAffinePass::runOnOperation() {
   RewritePatternSet patterns(ctx);
   AffineTypeConverter typeConverter;
 
-  populateKrnlToAffineConversion(typeConverter, patterns, ctx);
+  populateKrnlToAffineConversion(typeConverter, patterns, ctx, enableSIMD);
 
   // Create list for recording the <loop, unroll factor> pairs associated with
   // this function.
@@ -1018,12 +1032,12 @@ void ConvertKrnlToAffinePass::runOnOperation() {
   delete currUnrollAndJamList;
 }
 
-std::unique_ptr<Pass> createConvertKrnlToAffinePass() {
-  return std::make_unique<ConvertKrnlToAffinePass>();
+std::unique_ptr<Pass> createConvertKrnlToAffinePass(bool enableSIMD) {
+  return std::make_unique<ConvertKrnlToAffinePass>(enableSIMD);
 }
 
 void populateKrnlToAffineConversion(TypeConverter &typeConverter,
-    RewritePatternSet &patterns, MLIRContext *ctx) {
+    RewritePatternSet &patterns, MLIRContext *ctx, bool enableSIMD) {
   krnl::populateLoweringKrnlCopyFromBufferOpPattern(
       typeConverter, patterns, ctx);
   krnl::populateLoweringKrnlCopyToBufferOpPattern(typeConverter, patterns, ctx);
@@ -1033,7 +1047,8 @@ void populateKrnlToAffineConversion(TypeConverter &typeConverter,
       typeConverter, patterns, ctx);
   krnl::populateLoweringKrnlMatmultOpPattern(typeConverter, patterns, ctx);
   // hi alex, add only at -O3 and SIMD
-  krnl::populateLoweringKrnlMemcpyOpPattern(typeConverter, patterns, ctx);
+  krnl::populateLoweringKrnlMemcpyToAffineOpPattern(
+      typeConverter, patterns, ctx, enableSIMD);
   krnl::populateLoweringKrnlMemsetOpPattern(typeConverter, patterns, ctx);
   krnl::populateLoweringKrnlPrefetchOpPattern(typeConverter, patterns, ctx);
   krnl::populateLoweringKrnlTerminatorOpPattern(typeConverter, patterns, ctx);

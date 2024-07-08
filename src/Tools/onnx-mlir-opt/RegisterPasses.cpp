@@ -82,8 +82,9 @@ void registerOMPasses(int optLevel) {
     return createONNXPreKrnlVerifyPass();
   });
 
-  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
-    return krnl::createConvertKrnlToAffinePass();
+  mlir::registerPass([optLevel]() -> std::unique_ptr<mlir::Pass> {
+    return krnl::createConvertKrnlToAffinePass(
+        /*enableSIMD, should consider disableSimdOption*/ optLevel >= 3);
   });
 
   mlir::registerPass([optLevel]() -> std::unique_ptr<mlir::Pass> {

@@ -195,9 +195,9 @@ void addONNXToKrnlPasses(mlir::PassManager &pm, int optLevel, bool enableCSE,
   pm.addPass(mlir::createCanonicalizerPass());
 }
 
-void addKrnlToAffinePasses(mlir::PassManager &pm) {
-  pm.addNestedPass<func::FuncOp>(
-      onnx_mlir::krnl::createConvertKrnlToAffinePass());
+void addKrnlToAffinePasses(mlir::PassManager &pm, int optLevel) {
+  pm.addNestedPass<func::FuncOp>(onnx_mlir::krnl::createConvertKrnlToAffinePass(
+      /*enableSIMD*/ optLevel >= 3 && !disableSimdOption));
 }
 
 void addKrnlToLLVMPasses(
@@ -306,7 +306,7 @@ void addPasses(mlir::OwningOpRef<ModuleOp> &module, mlir::PassManager &pm,
       addONNXToKrnlPasses(pm, OptimizationLevel, /*enableCSE*/ true,
           instrumentONNXSignature, ONNXOpStats);
     if (inputIRLevel <= MLIRLevel)
-      addKrnlToAffinePasses(pm);
+      addKrnlToAffinePasses(pm, OptimizationLevel);
   }
 
   if (inputIRLevel <= LLVMLevel && emissionTarget >= EmitLLVMIR)
