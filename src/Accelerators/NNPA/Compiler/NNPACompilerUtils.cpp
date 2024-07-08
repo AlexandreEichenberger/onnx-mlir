@@ -138,7 +138,7 @@ void addONNXToZHighPasses(mlir::PassManager &pm) {
     pm.addNestedPass<func::FuncOp>(
         onnx_mlir::zhigh::createZHighDecomposeStickUnstickPass());
     pm.addPass(mlir::createCanonicalizerPass());
-    // hi alex
+    // hi alex, reenable once testing works
     //pm.addNestedPass<func::FuncOp>(
     //    onnx_mlir::zhigh::createZHighRecomposeToStickUnstickPass());
   }

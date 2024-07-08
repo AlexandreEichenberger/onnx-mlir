@@ -113,30 +113,18 @@ public:
     Value src = operandAdaptor.getSrc();
     Value dest = operandAdaptor.getDest();
     Value lenInt = operandAdaptor.getNumElems(); // int64;
-    fprintf(stderr, "hi alex, try to match replacement for op:\n");
-    op->dump();
     assert(matchReplacementPattern(dest, src, lenInt) && "expected match");
-    fprintf(stderr, "hi alex, success, do it now\n");
     IndexExpr len = SymIE(operandAdaptor.getNumElems());              // int64
     IndexExpr srcInitOffset = SymIE(operandAdaptor.getSrcOffset());   // index
     IndexExpr destInitOffset = SymIE(operandAdaptor.getDestOffset()); // index
     IndexExpr zero = LitIE(0);
 
     // Type and vector type.
-    // hi alex MemRefType srcType = mlir::cast<MemRefType>(src.getType());
     MemRefType destType = mlir::cast<MemRefType>(dest.getType());
     Type elementType = destType.getElementType();
     int64_t VL = create.vec.getMachineVectorLength(elementType);
     VectorType vecType = VectorType::get({VL}, elementType);
     int64_t U = 2;
-
-// Mapping.
-#if 0
-    int64_t srcMod, destMod;
-    isMappedLowestDimIdentityOrModConst(srcType, srcMod);
-    isMappedLowestDimIdentityOrModConst(destType, destMod);
-    int64_t mod = srcMod != undefMod ? srcMod : destMod;
-#endif
 
     // Mem dimensions.
     IndexExpr srcMinSize = srcInitOffset + len;
@@ -188,8 +176,6 @@ public:
           Value tmp = create.mem.loadIE(srcFlat, {srcOffset});
           create.mem.storeIE(tmp, destFlat, {destOffset});
         });
-    fprintf(stderr, "hi alex, success with this op, erase\n");
-    op->dump();
     rewriter.eraseOp(op);
     return success();
   }
