@@ -37,8 +37,10 @@ public:
       : ConversionPattern(
             typeConverter, KrnlMemcpyOp::getOperationName(), 1, context) {}
 
-  using MDBuild = MultiDialectBuilder<IndexExprBuilderForKrnl,
-      AffineBuilderKrnlMem, VectorBuilder, MemRefBuilder, MathBuilder>;
+  // hi alex, prune
+  using MDBuild =
+      MultiDialectBuilder<IndexExprBuilderForKrnl, AffineBuilderKrnlMem,
+          SCFBuilder, VectorBuilder, MemRefBuilder, MathBuilder>;
 
   static const int64_t undefMod = -1;
 
@@ -111,7 +113,10 @@ public:
     Value src = operandAdaptor.getSrc();
     Value dest = operandAdaptor.getDest();
     Value lenInt = operandAdaptor.getNumElems(); // int64;
+    fprintf(stderr, "hi alex, try to match replacement for op:\n");
+    op->dump();
     assert(matchReplacementPattern(dest, src, lenInt) && "expected match");
+    fprintf(stderr, "hi alex, success, do it now\n");
     IndexExpr len = SymIE(operandAdaptor.getNumElems());              // int64
     IndexExpr srcInitOffset = SymIE(operandAdaptor.getSrcOffset());   // index
     IndexExpr destInitOffset = SymIE(operandAdaptor.getDestOffset()); // index
@@ -148,39 +153,43 @@ public:
     int B = U * VL;
     IndexExpr lb = zero;
     IndexExpr ub = len - LitIE(B - 1);
-    create.affineKMem.forIE(lb, ub, B, [&](AffineBuilderKrnlMem &c, Value i) {
-      MDBuild create(c);
-      IndexExprScope innerScope(create.mem, &outerScope);
-      IndexExpr ii = DimIE(i);
-      IndexExpr srcOffset = SymIE(srcInitOffset) + ii;
-      IndexExpr destOffset = SymIE(destInitOffset) + ii;
-      // Guaranteed full iterations, manually unroll for more ILP.
-      Value tmp[U];
-      Value litOffset[U];
-      // Load U * VL simd values.
-      for (int u = 0; u < U; ++u) {
-        litOffset[u] = create.math.constantIndex(u * VL);
-        tmp[u] =
-            create.vec.loadIE(vecType, srcFlat, {srcOffset}, {litOffset[u]});
-      }
-      // Store U * VL simd values.
-      for (int u = 0; u < U; ++u) {
-        create.vec.storeIE(tmp[u], destFlat, {destOffset}, {litOffset[u]});
-      }
-    });
+    create.scf.forLoop(
+        lb.getValue(), ub.getValue(), B, [&](SCFBuilder &c, Value i) {
+          MDBuild create(c);
+          IndexExprScope innerScope(create.mem, &outerScope);
+          IndexExpr ii = DimIE(i);
+          IndexExpr srcOffset = SymIE(srcInitOffset) + ii;
+          IndexExpr destOffset = SymIE(destInitOffset) + ii;
+          // Guaranteed full iterations, manually unroll for more ILP.
+          Value tmp[U];
+          Value litOffset[U];
+          // Load U * VL simd values.
+          for (int u = 0; u < U; ++u) {
+            litOffset[u] = create.math.constantIndex(u * VL);
+            tmp[u] = create.vec.loadIE(
+                vecType, srcFlat, {srcOffset}, {litOffset[u]});
+          }
+          // Store U * VL simd values.
+          for (int u = 0; u < U; ++u) {
+            create.vec.storeIE(tmp[u], destFlat, {destOffset}, {litOffset[u]});
+          }
+        });
     // Elements not covered by blocked loop.
     IndexExpr remainingElements = len % B;
     ub = len;
     lb = ub - remainingElements;
-    create.affineKMem.forIE(lb, ub, 1, [&](AffineBuilderKrnlMem &c, Value i) {
-      MDBuild create(c);
-      IndexExprScope innermostScope(create.mem, &outerScope);
-      IndexExpr ii = DimIE(i);
-      IndexExpr srcOffset = SymIE(srcInitOffset) + ii;
-      IndexExpr destOffset = SymIE(destInitOffset) + ii;
-      Value tmp = create.affineKMem.loadIE(srcFlat, {srcOffset}, {});
-      create.affineKMem.storeIE(tmp, destFlat, {destOffset}, {});
-    });
+    create.scf.forLoop(
+        lb.getValue(), ub.getValue(), 1, [&](SCFBuilder &c, Value i) {
+          MDBuild create(c);
+          IndexExprScope innermostScope(create.mem, &outerScope);
+          IndexExpr ii = DimIE(i);
+          IndexExpr srcOffset = SymIE(srcInitOffset) + ii;
+          IndexExpr destOffset = SymIE(destInitOffset) + ii;
+          Value tmp = create.mem.loadIE(srcFlat, {srcOffset});
+          create.mem.storeIE(tmp, destFlat, {destOffset});
+        });
+    fprintf(stderr, "hi alex, success with this op, erase\n");
+    op->dump();
     rewriter.eraseOp(op);
     return success();
   }

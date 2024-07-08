@@ -372,7 +372,13 @@ struct MemRefBuilder final : DialectBuilder {
   mlir::Value dim(mlir::Value val, int64_t index) const;
   mlir::Value dim(mlir::Value val, mlir::Value index) const;
 
-  void prefetchIE(mlir::Value memref, llvm::SmallVectorImpl<IndexExpr> &indices,
+  // Load/store/prefetch,
+  mlir::Value load(mlir::Value memref, mlir::ValueRange indices);
+  mlir::Value loadIE(mlir::Value memref, llvm::ArrayRef<IndexExpr> indices);
+  void store(mlir::Value val, mlir::Value memref, mlir::ValueRange indices);
+  void storeIE(
+      mlir::Value val, mlir::Value memref, llvm::ArrayRef<IndexExpr> indices);
+  void prefetchIE(mlir::Value memref, llvm::ArrayRef<IndexExpr> indices,
       bool isWrite, unsigned locality, bool isData = true);
   void prefetch(mlir::Value memref, mlir::ValueRange indices, bool isWrite,
       unsigned locality, bool isData = true);

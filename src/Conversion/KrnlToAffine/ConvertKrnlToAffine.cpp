@@ -17,6 +17,7 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Types.h"
@@ -969,14 +970,15 @@ void ConvertKrnlToAffinePass::runOnOperation() {
   target.addIllegalOp<KrnlCopyFromBufferOp>();
   target.addIllegalOp<KrnlPrefetchOp>();
   target.addIllegalOp<KrnlMemcpyOp>(); // hi alex
-  target.addLegalOp<AffineYieldOp>();
-  target.addLegalOp<AffineLoadOp>();
-  target.addLegalOp<AffineStoreOp>();
+  // hi alex, included in the legal dialect
+  // target.addLegalOp<AffineYieldOp>();
+  // target.addLegalOp<AffineLoadOp>();
+  // target.addLegalOp<AffineStoreOp>();
   target.addLegalOp<KrnlVectorTypeCastOp>();
   target.addLegalOp<UnrealizedConversionCastOp>();
   target.addLegalDialect<mlir::affine::AffineDialect, mlir::arith::ArithDialect,
       mlir::memref::MemRefDialect, mlir::func::FuncDialect,
-      mlir::vector::VectorDialect>();
+      mlir::vector::VectorDialect, mlir::scf::SCFDialect>();
 
   // Patterns.
   RewritePatternSet patterns(ctx);
@@ -1030,7 +1032,7 @@ void populateKrnlToAffineConversion(TypeConverter &typeConverter,
   krnl::populateLoweringKrnlGetLinearOffsetIndexOpPattern(
       typeConverter, patterns, ctx);
   krnl::populateLoweringKrnlMatmultOpPattern(typeConverter, patterns, ctx);
-// hi alex, add only at -O3 and SIMD
+  // hi alex, add only at -O3 and SIMD
   krnl::populateLoweringKrnlMemcpyOpPattern(typeConverter, patterns, ctx);
   krnl::populateLoweringKrnlMemsetOpPattern(typeConverter, patterns, ctx);
   krnl::populateLoweringKrnlPrefetchOpPattern(typeConverter, patterns, ctx);

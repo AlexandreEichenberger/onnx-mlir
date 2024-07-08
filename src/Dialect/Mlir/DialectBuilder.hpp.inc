@@ -83,6 +83,13 @@ inline void GenericAffineBuilder<LOAD_OP, STORE_OP>::forIE(IndexExpr lb,
   llvm::SmallVector<mlir::Value, 8> lbOperands, ubOperands;
   lb.getAffineMapAndOperands(lbMap, lbOperands);
   ub.getAffineMapAndOperands(ubMap, ubOperands);
+  fprintf(stderr, "hi alex, print for maps lb\n");
+  lbMap.dump();
+  for(int i=0; i<(int)lbOperands.size();++i) lbOperands[i].dump();
+  fprintf(stderr, "hi alex, print for maps ub\n");
+  ubMap.dump();
+  for(int i=0; i<(int)ubOperands.size();++i) ubOperands[i].dump();
+  fprintf(stderr, "hi alex, print for maps done\n");
   // Create affine for.
   b().template create<mlir::affine::AffineForOp>(loc(), lbOperands, lbMap,
       ubOperands, ubMap, step, mlir::ValueRange{},

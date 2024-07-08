@@ -1400,6 +1400,30 @@ Value MemRefBuilder::dim(Value val, Value index) const {
 }
 
 //===----------------------------------------------------------------------===//
+// Load / store.
+
+Value MemRefBuilder ::load(Value memref, ValueRange indices) {
+  return b().create<memref::LoadOp>(loc(), memref, indices);
+}
+
+Value MemRefBuilder ::loadIE(Value memref, llvm::ArrayRef<IndexExpr> indices) {
+  SmallVector<Value, 4> indexValues;
+  IndexExpr::getValues(indices, indexValues);
+  return load(memref, indexValues);
+}
+
+void MemRefBuilder ::store(Value val, Value memref, ValueRange indices) {
+  b().create<memref::StoreOp>(loc(), val, memref, indices);
+}
+
+void MemRefBuilder ::storeIE(
+    Value val, Value memref, llvm::ArrayRef<IndexExpr> indices) {
+  SmallVector<Value, 4> indexValues;
+  IndexExpr::getValues(indices, indexValues);
+  store(val, memref, indexValues);
+}
+
+//===----------------------------------------------------------------------===//
 // Prefetch.
 
 void MemRefBuilder::prefetch(Value memref, ValueRange indices, bool isWrite,
@@ -1408,9 +1432,8 @@ void MemRefBuilder::prefetch(Value memref, ValueRange indices, bool isWrite,
       loc(), memref, indices, isWrite, locality, isData);
 }
 
-void MemRefBuilder::prefetchIE(Value memref,
-    llvm::SmallVectorImpl<IndexExpr> &indices, bool isWrite, unsigned locality,
-    bool isData) {
+void MemRefBuilder::prefetchIE(Value memref, llvm::ArrayRef<IndexExpr> indices,
+    bool isWrite, unsigned locality, bool isData) {
   SmallVector<Value, 4> indexVals;
   IndexExpr::getValues(indices, indexVals);
   prefetch(memref, indexVals, isWrite, locality, isData);
