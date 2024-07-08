@@ -984,7 +984,6 @@ void ConvertKrnlToAffinePass::runOnOperation() {
   target.addIllegalOp<KrnlCopyFromBufferOp>();
   target.addIllegalOp<KrnlPrefetchOp>();
   if (enableSIMD) {
-    // target.addIllegalOp<KrnlMemcpyOp>(); // hi alex
     target.addDynamicallyLegalOp<KrnlMemcpyOp>(
         [](KrnlMemcpyOp op) { return !canLowerKrnlMemcpyOpToAffine(op); });
   }
@@ -1046,7 +1045,6 @@ void populateKrnlToAffineConversion(TypeConverter &typeConverter,
   krnl::populateLoweringKrnlGetLinearOffsetIndexOpPattern(
       typeConverter, patterns, ctx);
   krnl::populateLoweringKrnlMatmultOpPattern(typeConverter, patterns, ctx);
-  // hi alex, add only at -O3 and SIMD
   krnl::populateLoweringKrnlMemcpyToAffineOpPattern(
       typeConverter, patterns, ctx, enableSIMD);
   krnl::populateLoweringKrnlMemsetOpPattern(typeConverter, patterns, ctx);

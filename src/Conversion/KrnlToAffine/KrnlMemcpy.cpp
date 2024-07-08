@@ -42,7 +42,6 @@ public:
 
   static const int64_t undefMod = -1;
 
-  // hi alex: make sure we only replace when this is true.
   static bool matchReplacementPattern(Value dest, Value src, Value len) {
     // Only accept memref of scalar types
     MemRefType destType = mlir::cast<MemRefType>(dest.getType());
@@ -101,7 +100,7 @@ public:
     Type elementType = destType.getElementType();
     int64_t VL = create.vec.getMachineVectorLength(elementType);
     VectorType vecType = VectorType::get({VL}, elementType);
-    int64_t U = 2;
+    int64_t U = 8;
 
     // Mem dimensions.
     IndexExpr srcMinSize = srcInitOffset + len;
