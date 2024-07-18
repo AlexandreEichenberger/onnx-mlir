@@ -146,38 +146,37 @@ struct ONNXLayoutTransformOpLowering
           create.krnl.prefetchIE(alloc, prefetchAF, /*isWrite*/ true,
               /*locality*/ 1);
 #endif
-          // Now if we copy into a modVal, and ub1 was not a multiple of modVal,
-          // we may read and write a few values that should not be read/written
-          // but since the output data physical memory will have the extra space
-          // for it, we simply write it all.
+          // Now if we copy into a modVal (outModVal != -1), and ub1 was not a
+          // multiple of modVal, we may read and write a few values that should
+          // not be read/written but since the output data physical memory will
+          // have the extra space for it, we simply write it all.
+          IndexExpr isFull;
           if (outModVal != -1) {
-            create.krnl.memcpy(alloc, input, len, allocOffset, inputOffset);
+            isFull = LitIE(1);
+            // create.krnl.memcpy(alloc, input, len, allocOffset, inputOffset);
           } else {
             // Compute if we have a last tile.
-            IndexExpr modLit = LiteralIndexExpr(modVal);
-            IndexExpr isFull =
-                create.krnlIE.isTileFull(memAF[E1], modLit, SymIE(ub1));
-            IndexExpr isFullLogical = isFull >= 0;
-            create.scf.ifThenElse(
-                // Condition
-                isFullLogical.getValue(),
-                // Then (is full).
-                [&](SCFBuilder b) {
-                  MDBuilder create(b);
-                  create.krnl.memcpy(
-                      alloc, input, len, allocOffset, inputOffset);
-                },
-                // Else, we don't have a full tile.
-                [&](SCFBuilder b) {
-                  MDBuilder create(b);
-                  IndexExprScope middleScope(b, &outerScope);
-                  IndexExpr tripCount = SymIE(ub1) - SymIE(memAF[E1]);
-                  Value len = create.math.cast(
-                      rewriter.getI64Type(), tripCount.getValue());
-                  create.krnl.memcpy(
-                      alloc, input, len, allocOffset, inputOffset);
-                });
+            IndexExpr modLit = LitIE(modVal);
+            isFull = create.krnlIE.isTileFull(memAF[E1], modLit, SymIE(ub1));
           }
+          IndexExpr isFullLogical = isFull >= 0;
+          create.scf.ifThenElse(
+              // Condition
+              isFullLogical.getValue(),
+              // Then (is full).
+              [&](SCFBuilder b) {
+                MDBuilder create(b);
+                create.krnl.memcpy(alloc, input, len, allocOffset, inputOffset);
+              },
+              // Else, we don't have a full tile.
+              [&](SCFBuilder b) {
+                MDBuilder create(b);
+                IndexExprScope middleScope(b, &outerScope);
+                IndexExpr tripCount = SymIE(ub1) - SymIE(memAF[E1]);
+                Value len = create.math.cast(
+                    rewriter.getI64Type(), tripCount.getValue());
+                create.krnl.memcpy(alloc, input, len, allocOffset, inputOffset);
+              });
         });
     rewriter.replaceOp(op, alloc);
     return success();
