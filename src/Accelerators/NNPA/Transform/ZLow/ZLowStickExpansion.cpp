@@ -221,13 +221,14 @@ public:
                   return; // Nothing to do here.
 
 #if 1
-                int64_t vecSize = unrollVL * archVL;
+                // Unrolled vector of f16 and f32 have the same number of
+                // elements.
                 VectorType vecUnrolledF16Type =
                     VectorType::get({unrollVL * archVL}, f16Type);
                 VectorType vecUnrolledF32Type =
-                    VectorType::get({unrollVL * archVLHalf}, f32Type);
+                    VectorType::get({(2 * unrollVL) * archVLHalf}, f32Type);
                 VectorType vecUnrolled2DF32Type =
-                    VectorType::get({unrollVL, archVLHalf}, f32Type);
+                    VectorType::get({2 * unrollVL, archVLHalf}, f32Type);
 
                 Value zeroF32 = create.math.constant(f32Type, 0.0);
                 Value splattedZeroF32 =
@@ -245,32 +246,30 @@ public:
                           inputAsTx64, {SymIE(inputTileOffset), l});
 
                       // Convert back to f32.
-                      Value vec2DF32H = splattedZeroF32;
-                      Value vec2DF32L = splattedZeroF32;
+                      Value vec2DF32 = splattedZeroF32;
                       int64_t outerDim;
-                      Value vec2DF16 = create.vec.shapeCast2D(vecF16, outerDim, archVL);
+                      Value vec2DF16 =
+                          create.vec.shapeCast2D(vecF16, outerDim, archVL);
                       assert(outerDim == unrollVL && "bad assumptions");
                       for (int64_t i = 0; i < unrollVL; ++i) {
                         Value currSlot = create.vec.extractFrom2D(vec2DF16, i);
                         auto convertOp =
                             rewriter.create<ZLowConvertDLF16ToF32VectorOp>(
                                 loc, currSlot);
-                        vec2DF32H = create.vec.insertInto2D(
-                            convertOp.getResult(0), vec2DF32H, i);
-                        vec2DF32L = create.vec.insertInto2D(
-                            convertOp.getResult(1), vec2DF32L, i);
+                        // Insert high.
+                        vec2DF32 = create.vec.insertInto2D(
+                            convertOp.getResult(0), vec2DF32, 2 * i);
+                        // Insert low.
+                        vec2DF32 = create.vec.insertInto2D(
+                            convertOp.getResult(1), vec2DF32, 2 * i + 1);
                       }
-                      Value vecF32H =
-                          create.vec.shapeCast(vecUnrolledF32Type, vec2DF32H);
-                      Value vecF32L =
-                          create.vec.shapeCast(vecUnrolledF32Type, vec2DF32L);
+                      Value vecF32 =
+                          create.vec.shapeCast(vecUnrolledF32Type, vec2DF32);
 
                       // Store f32 values back to the (normal layout) output.
                       DimsExpr outputAF = SymListIE(inputAF);
                       outputAF[E1] = outputAF[E1] + l;
-                      create.vec.storeIE(vecF32H, alloc, outputAF);
-                      create.vec.storeIE(
-                          vecF32L, alloc, outputAF, {litArchVLHalf.getValue()});
+                      create.vec.storeIE(vecF32, alloc, outputAF);
                     });
 #else
                 create.scf.forLoop(litZero.getValue(), lit64.getValue(), totVL,
