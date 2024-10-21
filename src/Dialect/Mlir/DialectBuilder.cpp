@@ -2130,6 +2130,20 @@ Value VectorBuilder::shapeCast(VectorType newType, Value vector) const {
   return b().create<vector::ShapeCastOp>(loc(), newType, vector);
 }
 
+Value VectorBuilder::shapeCast2D(
+    Value vector, int64_t &outerDim, /*inner dim*/ int64_t archVL) const {
+  assert(archVL > 1 && "expected vector with archVL>1");
+  VectorType vecType = mlir::dyn_cast<VectorType>(vector.getType());
+  Type elementType = vecType.getElementType();
+  assert(vecType.getRank() == 1 && "1D vec only");
+  int64_t vecSize = vecType.getShape()[0];
+  assert(vecSize >= archVL && "expected at least archVL elements");
+  assert(vecSize % archVL == 0 && "expected multiple of archVL elements");
+  outerDim = vecSize / archVL;
+  VectorType vecType2D = VectorType::get({outerDim, archVL}, elementType);
+  return shapeCast(vecType2D, vector);
+}
+
 // Extract  1D vector from 2D vector.
 Value VectorBuilder::extractFrom2D(Value vector2D, int64_t position) const {
   llvm::SmallVector<int64_t> pos = {position};

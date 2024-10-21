@@ -579,8 +579,12 @@ struct VectorBuilder final : DialectBuilder {
   void multiReduction(mlir::ArrayRef<mlir::Value> inputVecArray,
       F2 reductionFct, llvm::SmallVectorImpl<mlir::Value> &outputVecArray);
 
-  // Cast vectors to vectors of different shape (e.g. 1D to 2D and back).
+  // Cast vectors to vectors of different shape.
   mlir::Value shapeCast(mlir::VectorType newType, mlir::Value vector) const;
+  // Cast vector into a 2D vector of shape [outerDim, archVL].
+  mlir::Value shapeCast2D(mlir::Value vector, int64_t &outerDim,
+      /*inner dim*/ int64_t archVL) const;
+
   // Extract and insert 1D vector from/to 2D vector.
   mlir::Value extractFrom2D(mlir::Value vector2D, int64_t position) const;
   mlir::Value insertInto2D(
