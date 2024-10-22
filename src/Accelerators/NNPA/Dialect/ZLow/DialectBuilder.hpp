@@ -20,6 +20,23 @@
 
 namespace onnx_mlir {
 
+//===----------------------------------------------------------------------===//
+// ZLow Builder
+//===----------------------------------------------------------------------===//
+
+struct ZLowBuilder final : DialectBuilder {
+  ZLowBuilder(mlir::Location loc) : DialectBuilder(loc) {}
+  ZLowBuilder(mlir::OpBuilder &b, mlir::Location loc)
+      : DialectBuilder(b, loc) {}
+  ZLowBuilder(const DialectBuilder &db) : DialectBuilder(db) {}
+  virtual ~ZLowBuilder() {}
+
+  // Supports vectors that have multiple of 8 dlf16 values.
+  mlir::Value convertDLF16ToF32Vector(mlir::Value dlf16Vals) const;
+  // Supports vectors that have multiple of 8 f32 values.
+  mlir::Value convertF32ToDLF16Vector(mlir::Value f32Vals) const;
+};
+
 // =============================================================================
 // IndexExpr Builder for building
 // =============================================================================
@@ -40,6 +57,16 @@ protected:
 // =============================================================================
 // MultiDialectBuilder for ZLow
 // =============================================================================
+
+// Recursive class specialized for ZLowBuilder refereed to as zlow.
+template <class... Ts>
+struct MultiDialectBuilder<ZLowBuilder, Ts...> : MultiDialectBuilder<Ts...> {
+  MultiDialectBuilder(mlir::OpBuilder &b, mlir::Location loc)
+      : MultiDialectBuilder<Ts...>(b, loc), zlow(b, loc) {}
+  MultiDialectBuilder(const DialectBuilder &db)
+      : MultiDialectBuilder<Ts...>(db), zlow(db) {}
+  ZLowBuilder zlow;
+};
 
 // Recursive class specialized for IndexExprBuilderForZLow referred to as
 // zlowIE.

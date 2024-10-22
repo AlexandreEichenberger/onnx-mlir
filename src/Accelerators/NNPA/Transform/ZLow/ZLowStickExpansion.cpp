@@ -224,11 +224,11 @@ public:
                 // Unrolled vector of f16 and f32 have the same number of
                 // elements.
                 VectorType vecUnrolledF16Type =
-                    VectorType::get({unrollVL * archVL}, f16Type);
+                    VectorType::get({totVL}, f16Type);
                 VectorType vecUnrolledF32Type =
-                    VectorType::get({(2 * unrollVL) * archVLHalf}, f32Type);
+                    VectorType::get({totVL}, f32Type);
                 VectorType vecUnrolled2DF32Type =
-                    VectorType::get({2 * unrollVL, archVLHalf}, f32Type);
+                    VectorType::get({totVL / archVLHalf, archVLHalf}, f32Type);
 
                 Value zeroF32 = create.math.constant(f32Type, 0.0);
                 Value splattedZeroF32 =

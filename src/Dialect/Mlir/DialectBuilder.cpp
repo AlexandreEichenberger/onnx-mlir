@@ -2133,7 +2133,7 @@ Value VectorBuilder::shapeCast(VectorType newType, Value vector) const {
 Value VectorBuilder::shapeCast2D(
     Value vector, int64_t &outerDim, /*inner dim*/ int64_t archVL) const {
   assert(archVL > 1 && "expected vector with archVL>1");
-  VectorType vecType = mlir::dyn_cast<VectorType>(vector.getType());
+  VectorType vecType = mlir::cast<VectorType>(vector.getType());
   Type elementType = vecType.getElementType();
   assert(vecType.getRank() == 1 && "1D vec only");
   int64_t vecSize = vecType.getShape()[0];
