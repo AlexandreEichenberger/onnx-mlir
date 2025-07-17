@@ -854,7 +854,7 @@ class InferenceSession:
                 expected_string = cache_string(args.model, args.compile_args)
                 with open(compiler_option_file_path, "w") as ff:
                     print("Saving the compilation options to", args.save_model, "\n")
-                    ff.write(expected_string)
+                    ff.write(expected_string + "\n")
 
             # Exit if only compiling the model.
             if args.compile_only:
