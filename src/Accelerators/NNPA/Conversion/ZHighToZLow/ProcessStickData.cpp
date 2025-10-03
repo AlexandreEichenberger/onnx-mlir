@@ -38,6 +38,8 @@ using namespace mlir;
 // the "allowed" values in the output for the last couple of values.
 #define STICK_OUTPUT_WRITE_PAST_BOUNDS true
 
+#define LAYER_NORM_BUFFER_X true
+
 // Include necessary info from elementwise so as to gen code here.
 #include "src/Conversion/ONNXToKrnl/Math/Elementwise.hpp"
 
@@ -589,6 +591,7 @@ struct FuzedStickUnstickGenericLayerNormaOpLowering
     SHAPE_HELPER_TYPE shapeHelper(op, operands, &create.krnlIE);
     shapeHelper.computeShapeAndAssertOnFailure();
     IndexExpr E1 = shapeHelper.getOutputDims(0)[XRank - 1];
+    assert(E1.isLiteral() && "assume only compiler constant E1 multiple of 64");
 
     // Create Stick mem support for X.
     UnifiedStickSupport xUSS(create.krnl, lnOp.getX(), xMemRef, E1,
@@ -651,28 +654,20 @@ struct FuzedStickUnstickGenericLayerNormaOpLowering
     }
 
     // Temp reduction buffers
-    MemRefType redType = MemRefType::get({B, archVL}, elementType);
-    Value redMemRef1 = nullptr, redMemRef2 = nullptr;
-    if (!useParallel) {
-      // Sequential, alloc before loop.
-      if (isTraditionalLayerNorm)
-        redMemRef1 = create.mem.alignedAlloc(redType);
-      redMemRef2 = create.mem.alignedAlloc(redType);
-    }
-
+    Value redMemRef1, redMemRef2, xBufferMemRef;
+    bool useXBuffer = LAYER_NORM_BUFFER_X && xUSS.hasStick();
+    if (!useParallel)
+      allocTemps(create, E1, B, elementType, isTraditionalLayerNorm, useXBuffer,
+          redMemRef1, redMemRef2, xBufferMemRef);
     create.krnl.iterateIE(loopDefs, outerOptLoops, lbs, ubs,
         [&](const KrnlBuilder &ck, ValueRange outerLoopInd) {
           MDBuilder create(ck);
           IndexExprScope middleScope(ck);
           DimsExpr outerIndices = DimListIE(outerLoopInd); // no e1.
           int64_t d2 = outerIndices.size() - 1;
-          if (useParallel) {
-            // Parallel, alloc inside parallel loop.
-            if (isTraditionalLayerNorm)
-              redMemRef1 = create.mem.alignedAlloc(redType);
-            redMemRef2 = create.mem.alignedAlloc(redType);
-          }
-
+          if (useParallel)
+            allocTemps(create, E1, B, elementType, isTraditionalLayerNorm,
+                useXBuffer, redMemRef1, redMemRef2, xBufferMemRef);
           // Determine full tile.
           IndexExpr blockedCurrIndex = DimIE(outerIndices[d2]);
           IndexExpr blockedUB = DimIE(ubs[d2]);
@@ -688,9 +683,9 @@ struct FuzedStickUnstickGenericLayerNormaOpLowering
                 // create.krnl.printf("full tile\n");
                 //  Compute a full tile of B
                 generateIter<B>(create, lnOp, elementType,
-                    isTraditionalLayerNorm, xUSS, biasUSS, scaleUSS, redMemRef1,
-                    redMemRef2, yUSS, outerIndices, E1, epsilon, archVL,
-                    stickLen);
+                    isTraditionalLayerNorm, useXBuffer, xUSS, biasUSS, scaleUSS,
+                    redMemRef1, redMemRef2, xBufferMemRef, yUSS, outerIndices,
+                    E1, epsilon, archVL, stickLen);
               },
               [&](const SCFBuilder &scf) {
                 MDBuilder create(scf);
@@ -707,9 +702,9 @@ struct FuzedStickUnstickGenericLayerNormaOpLowering
                       DimsExpr currOuterIndices = DimListIE(outerIndices);
                       currOuterIndices[d2] = DimIE(loopInd[0]);
                       generateIter<1>(create, lnOp, elementType,
-                          isTraditionalLayerNorm, xUSS, biasUSS, scaleUSS,
-                          redMemRef1, redMemRef2, yUSS, currOuterIndices, E1,
-                          epsilon, archVL, stickLen);
+                          isTraditionalLayerNorm, useXBuffer, xUSS, biasUSS,
+                          scaleUSS, redMemRef1, redMemRef2, xBufferMemRef, yUSS,
+                          currOuterIndices, E1, epsilon, archVL, stickLen);
                     }); // Last values of b.
               });       // If full then else.
         });             // Blocked outer loop.
@@ -725,11 +720,32 @@ struct FuzedStickUnstickGenericLayerNormaOpLowering
     return success();
   }
 
+  void allocTemps(MDBuilder &create, IndexExpr E1, const int64_t B,
+      Type elementType, bool isTraditionalLayerNorm, bool useXBuffer,
+      Value &redMemRef1, Value &redMemRef2, Value &xBufferMemRef) const {
+    // Init
+    redMemRef1 = redMemRef2 = xBufferMemRef = nullptr;
+    // Alloc reduction data
+    const int64_t archVL = UnifiedStickSupport::archVL;
+    MemRefType redType = MemRefType::get({B, archVL}, elementType);
+    if (isTraditionalLayerNorm)
+      redMemRef1 = create.mem.alignedAlloc(redType);
+    redMemRef2 = create.mem.alignedAlloc(redType);
+    if (useXBuffer) {
+      // Alloc buffer for temporary storage of X.
+      assert(E1.isLiteral() && "support only literal E1 here");
+      MemRefType xBufferType =
+          MemRefType::get({B, E1.getLiteral()}, elementType);
+      xBufferMemRef = create.mem.alignedAlloc(xBufferType);
+    }
+  }
+
   template <int64_t B>
   void generateIter(MDBuilder &create, OP_TYPE lnOp, Type elementType,
-      bool isTraditionalLayerNorm, UnifiedStickSupport &xUSS,
+      bool isTraditionalLayerNorm, bool useXBuffer, UnifiedStickSupport &xUSS,
       UnifiedStickSupport &biasUSS, UnifiedStickSupport &scaleUSS,
-      Value redMemRef1, Value redMemRef2, UnifiedStickSupport &yUSS,
+      Value redMemRef1, Value redMemRef2, Value xBufferMemRef,
+      UnifiedStickSupport &yUSS,
       /* index expr param */ DimsExpr outerLoopIndices, IndexExpr E1,
       /* value params */ Value epsilon,
       /* int params */ int64_t archVL, int64_t stickLen) const {
@@ -741,6 +757,7 @@ struct FuzedStickUnstickGenericLayerNormaOpLowering
     Value initVec = create.vec.splat(vecType, init);
     Value zero = create.math.constantIndex(0);
     UnifiedStickSupportList blockedMeanUSSList[B];
+    mlir::SmallVector<Value, 4> xBlockSubviewList;
     int64_t xRank = getRank(xUSS.getOriginalVal().getType());
     inlineFor(create, B, [&](int64_t b, Value bb) {
       // Init tmpRed1 as second parameter.
@@ -758,8 +775,16 @@ struct FuzedStickUnstickGenericLayerNormaOpLowering
           create.mem.subview(redMemRef2, {b, 0}, {1, archVL}, {1, 1});
       UnifiedStickSupport redUSS2(create.krnl, redSubview2, redSubview2, E1,
           /*read/write*/ true, true, disableSaturation);
+      UnifiedStickSupport xBlockUSS;
+      if (useXBuffer) {
+        Value xBufferSubview =
+            create.mem.subview(xBufferMemRef, {b, 0}, {1, archVL}, {1, 1});
+        xBlockSubviewList.emplace_back(xBufferSubview);
+        UnifiedStickSupport xBlockUSS(create.krnl, xBufferSubview,
+            xBufferSubview, E1, /*write*/ false, true, disableSaturation);
+      }
       // Set list.
-      blockedMeanUSSList[b].list = {xUSS, redUSS1, redUSS2};
+      blockedMeanUSSList[b].list = {xUSS, redUSS1, redUSS2, xBlockUSS};
     });
 
     // Compute parallel reductions to compute red1 and red2, iterating over
@@ -801,9 +826,10 @@ struct FuzedStickUnstickGenericLayerNormaOpLowering
                       [&](const KrnlBuilder &kb,
                           mlir::SmallVectorImpl<mlir::Value> &listOfF32Vals) {
                         MDBuilder create(ck);
-                        Value x = listOfF32Vals[0];     // Input.
-                        Value &red1 = listOfF32Vals[1]; // Input and output.
-                        Value &red2 = listOfF32Vals[2]; // Input and output.
+                        Value x = listOfF32Vals[0];       // Input.
+                        Value &red1 = listOfF32Vals[1];   // Input and output.
+                        Value &red2 = listOfF32Vals[2];   // Input and output.
+                        Value &xBlock = listOfF32Vals[3]; // Output.
                         // Compute x^2.
                         Value xSquare = create.math.mul(x, x);
                         // Perform reduction on x values.
@@ -811,6 +837,9 @@ struct FuzedStickUnstickGenericLayerNormaOpLowering
                           red1 = create.math.add(red1, x);
                         // Perform reduction of x^2 values.
                         red2 = create.math.add(red2, xSquare);
+                        // If uses xBuffer, save in it the unstickified x value.
+                        if (useXBuffer)
+                          xBlock = x;
                       };
                   blockedMeanUSSList[b].genericLoadComputeStore(
                       create.krnl, fct, offsetWithinStick, 0);
@@ -852,9 +881,19 @@ struct FuzedStickUnstickGenericLayerNormaOpLowering
 
     // Normalize of entire vectors.
     UnifiedStickSupportList blockedNormUSSList[B];
-    for (int64_t b = 0; b < B; ++b)
-      blockedNormUSSList[b].list = {xUSS, scaleUSS, biasUSS, yUSS};
-
+    for (int64_t b = 0; b < B; ++b) {
+      if (useXBuffer) {
+        // Reuse the subview from the first loop, but have it as read here.
+        Value xBufferSubview = xBlockSubviewList[b];
+        UnifiedStickSupport xBufferUSS(create.krnl, xBufferSubview,
+            xBufferSubview, E1, /*read*/ true, false, disableSaturation);
+        // Insert xBufferUSS instead of xUSS.
+        blockedNormUSSList[b].list = {xBufferUSS, scaleUSS, biasUSS, yUSS};
+      } else {
+        // No reuse of x buffer, read it directly.
+        blockedNormUSSList[b].list = {xUSS, scaleUSS, biasUSS, yUSS};
+      }
+    }
     // Iterates over sticks
     create.affineKMem.forLoopIE(lit0, E1, stickLen,
         [&](const onnx_mlir::AffineBuilderKrnlMem &ck, ValueRange loopInd) {
