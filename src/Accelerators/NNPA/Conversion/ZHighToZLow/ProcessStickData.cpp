@@ -757,7 +757,6 @@ struct FuzedStickUnstickGenericLayerNormaOpLowering
     Value initVec = create.vec.splat(vecType, init);
     Value zero = create.math.constantIndex(0);
     UnifiedStickSupportList blockedMeanUSSList[B];
-    mlir::SmallVector<Value, 4> xBlockSubviewList;
     int64_t xRank = getRank(xUSS.getOriginalVal().getType());
     inlineFor(create, B, [&](int64_t b, Value bb) {
       // Init tmpRed1 as second parameter.
@@ -775,16 +774,15 @@ struct FuzedStickUnstickGenericLayerNormaOpLowering
           create.mem.subview(redMemRef2, {b, 0}, {1, archVL}, {1, 1});
       UnifiedStickSupport redUSS2(create.krnl, redSubview2, redSubview2, E1,
           /*read/write*/ true, true, disableSaturation);
-      UnifiedStickSupport xBlockUSS;
+      UnifiedStickSupport xBufferUSS;
       if (useXBuffer) {
-        Value xBufferSubview =
-            create.mem.subview(xBufferMemRef, {b, 0}, {1, archVL}, {1, 1});
-        xBlockSubviewList.emplace_back(xBufferSubview);
-        UnifiedStickSupport xBlockUSS(create.krnl, xBufferSubview,
-            xBufferSubview, E1, /*write*/ false, true, disableSaturation);
+        Value xBufferSubview = create.mem.subview(
+            xBufferMemRef, {b, 0}, {1, E1.getLiteral()}, {1, 1});
+        xBufferUSS.init(create.krnl, xBufferSubview, xBufferSubview, E1,
+            /*write*/ false, true, disableSaturation);
       }
       // Set list.
-      blockedMeanUSSList[b].list = {xUSS, redUSS1, redUSS2, xBlockUSS};
+      blockedMeanUSSList[b].list = {xUSS, redUSS1, redUSS2, xBufferUSS};
     });
 
     // Compute parallel reductions to compute red1 and red2, iterating over
@@ -884,7 +882,8 @@ struct FuzedStickUnstickGenericLayerNormaOpLowering
     for (int64_t b = 0; b < B; ++b) {
       if (useXBuffer) {
         // Reuse the subview from the first loop, but have it as read here.
-        Value xBufferSubview = xBlockSubviewList[b];
+        Value xBufferSubview =
+            blockedMeanUSSList[b].list[3].getOriginalMemRef();
         UnifiedStickSupport xBufferUSS(create.krnl, xBufferSubview,
             xBufferSubview, E1, /*read*/ true, false, disableSaturation);
         // Insert xBufferUSS instead of xUSS.
