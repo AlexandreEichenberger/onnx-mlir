@@ -370,7 +370,6 @@ std::vector<std::string> PyExecutionSessionBase::pyQueryEntryPoints() {
         "uninitialized PyExecutionSession");
   assert(_queryEntryPointsFunc && "Query entry point not loaded.");
   const char **entryPointArr = _queryEntryPointsFunc(NULL);
-
   std::vector<std::string> outputPyArrays;
   int i = 0;
   while (entryPointArr[i] != NULL) {
