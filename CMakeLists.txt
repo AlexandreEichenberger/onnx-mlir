@@ -5,13 +5,14 @@ cmake_minimum_required(VERSION 3.20.0)
 
 project(onnx-mlir)
 
+# Configurate cmake
+
+# General options
 option(ONNX_MLIR_BUILD_TESTS "Build ONNX-MLIR test executables. If OFF, just generate build targets." ON)
 option(ONNX_MLIR_CCACHE_BUILD "Set to ON for a ccache enabled build." OFF)
-option(ONNX_MLIR_ENABLE_STABLEHLO "Enable StableHLO support." ON)
 option(ONNX_MLIR_ENABLE_WERROR "Enable warnings as errors." OFF)
 option(ONNX_MLIR_SUPPRESS_THIRD_PARTY_WARNINGS "Suppress warning in third_party code." ON)
-option(ONNX_MLIR_ENABLE_JAVA "Set to ON for building the Java runtime, tools, and tests" ON)
-option(ONNX_MLIR_ENABLE_PYRUNTIME_LIGHT "Set to ON for building Python driver of running the compiled model without llvm-project." OFF)
+option(ONNX_MLIR_BUILD_STANDALONE "Build onnx-mlir as standalone binary with static linking" OFF)
 
 set(CMAKE_CXX_STANDARD 17)
 
@@ -74,11 +75,37 @@ set(ONNX_MLIR_INCLUDE_PATH ${CMAKE_INCLUDE_OUTPUT_DIRECTORY})
 set(ONNX_MLIR_VENDOR ${PACKAGE_VENDOR} CACHE STRING
   "Vendor-specific text for showing with version information.")
 
+# This file contained general cmake set up and special mlir-related functions.
+# ToFix: split it later.
+# Currently, it is control by variables.
+include(MLIR.cmake)
+
+macro(choose_build_target)
+# Check whether the build is for a tool (sub-project for now).
+  if (DEFINED ONNX_MLIR_TARGET_TO_BUILD)
+    include(${ONNX_MLIR_TARGET_TO_BUILD}.cmake)
+    return()
+  endif()
+# Otherwise, continue with default onnx-mlir project.
+endmacro()
+
+choose_build_target()
+
+option(ONNX_MLIR_ENABLE_STABLEHLO "Enable StableHLO support." ON)
+option(ONNX_MLIR_ENABLE_JAVA "Set to ON for building the Java runtime, tools, and tests" ON)
+option(ONNX_MLIR_ENABLE_PYRUNTIME_LIGHT "Set to ON for building Python driver of running the compiled model without llvm-project." OFF)
+
+# Disable StableHLO in standalone mode to reduce dependencies.
+# Note: Java/JNI support is compatible with standalone builds as it uses static libraries.
+if(ONNX_MLIR_BUILD_STANDALONE)
+  set(ONNX_MLIR_ENABLE_STABLEHLO OFF CACHE BOOL "" FORCE)
+  message(STATUS "ONNX_MLIR_BUILD_STANDALONE: ON - Disabling StableHLO support")
+endif()
+
 if(NOT ONNX_MLIR_ENABLE_PYRUNTIME_LIGHT)
   include(CTest)
   include(ExternalProject)
 endif()
-include(MLIR.cmake)
 
 # MLIR.cmake calls find_package(MLIR) which sets LLVM_MINIMUM_PYTHON_VERSION
 if (WIN32)
@@ -163,17 +190,33 @@ set(CMAKE_MESSAGE_LOG_LEVEL NOTICE)
 
 # Add third party subdirectories and define options appropriate to run their cmakes.
 if (ONNX_MLIR_ENABLE_PYRUNTIME_LIGHT)
-  add_subdirectory(third_party/onnx)
+  #add_subdirectory(third_party/onnx)
   add_subdirectory(third_party/pybind11)
 else()
   set(pybind11_FIND_QUIETLY ON)
+
+  # Configure ONNX for standalone builds.
+  if(ONNX_MLIR_BUILD_STANDALONE)
+    set(ONNX_BUILD_CUSTOM_PROTOBUF ON CACHE BOOL "" FORCE)
+    set(ONNX_USE_PROTOBUF_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    set(BUILD_ONNX_PYTHON OFF CACHE BOOL "" FORCE)
+    # Force protobuf to fetch and build its own abseil (not find system one).
+    set(protobuf_ABSL_PROVIDER "module" CACHE STRING "" FORCE)
+    set(protobuf_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    message(STATUS "Standalone mode: ONNX will build its own static protobuf and abseil")
+  endif()
+
   add_subdirectory(third_party/onnx)
   add_subdirectory(third_party/pybind11)
 
   add_subdirectory(third_party/rapidcheck)
 
   if (ONNX_MLIR_ENABLE_STABLEHLO)
+    # Workaround for stablehlo failing to link libStablehloOptimizationPasses.so if built with shared libs.
+    set(ONNX_MLIR_BUILD_SHARED_LIBS_STORE ${BUILD_SHARED_LIBS})
+    set(BUILD_SHARED_LIBS OFF)
     add_subdirectory(third_party/stablehlo EXCLUDE_FROM_ALL)
+    set(BUILD_SHARED_LIBS ${ONNX_MLIR_BUILD_SHARED_LIBS_STORE})
   endif()
 
   if (NOT TARGET benchmark)
