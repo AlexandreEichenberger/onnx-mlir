@@ -145,7 +145,12 @@ void FusionOpChain::retrieveOpsAndOutputValues(ONNXFusedOp fusedOp) {
     if (isa<ONNXYieldOp>(&op)) {
       for (Value v : op.getOperands())
         finalResults.push_back(v);
-    } else {
+    } else if (!op.hasTrait<mlir::OpTrait::ConstantLike>() &&
+               !isa<ONNXNoneOp, ONNXConstantOp>(&op)) {
+      // Constants and none-values are body implementation details (cloned from
+      // the outer IR by createFusedOp).  Exclude them so that ops[] always
+      // contains exactly the semantic chain ops — the same set that
+      // detectIfBeneficial() collected — making verify() reliable at all times.
       ops.push_back(&op);
     }
   }

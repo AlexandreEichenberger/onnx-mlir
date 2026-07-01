@@ -93,6 +93,44 @@ public:
   bool verify() const override;
 };
 
+//===----------------------------------------------------------------------===//
+// ExpandMulStickFusion
+//
+// Subclass for ONNXFusedOp(kind = "zhigh.expand-mul-stick").
+//
+// Pattern:
+//   ONNXUnsqueezeOp  one axis P; innermost dim of result static mod 64 (required)
+//   ONNXExpandOp     dim P expands from 1 to N (N static, >= 2)         (required)
+//   ONNXMulOp        element-wise mul by scalar F32/I32/I64 const        (required)
+//   ONNXReshapeOp    dims 0..P may collapse; dims after P unchanged      (required)
+//   ZHighStickOp     stick to 3D / 3DS / 4D                             (required)
+//
+// Unique-use invariant: every intermediate value (unsqueeze through reshape)
+// has exactly one use.  The stick result is not checked.
+//===----------------------------------------------------------------------===//
+
+class ExpandMulStickFusion : public onnx_mlir::FusionOpChain {
+public:
+  static constexpr llvm::StringLiteral kKind{"zhigh.expand-mul-stick"};
+
+  int64_t unsqueezedPosition       = -1;   ///< P: axis inserted by unsqueeze
+  int64_t expansionN               = -1;   ///< N: value dim P expands to
+  float   mulScalar                = 1.f;  ///< scalar multiplier (F32; 1 = neutral)
+  int64_t reshapeFirstCollapsedDim = -1;   ///< first input dim in merge run (-1 = none)
+  int64_t reshapeCollapsedCount    =  0;   ///< # consecutive input dims merged into 1
+  std::optional<mlir::StringAttr> stickFormat; ///< "3D", "3DS", or "4D"
+
+  /// Detect and parameterize the expand-mul-stick chain.
+  /// \p dimAnalysis must be non-null.
+  bool detectIfBeneficial(
+      const DimAnalysis *dimAnalysis, mlir::ONNXUnsqueezeOp startOp);
+
+  llvm::StringRef getKind() const override { return kKind; }
+  void embedAttrs(mlir::ONNXFusedOp fusedOp) const override;
+  bool retrieveAttrs(mlir::ONNXFusedOp fusedOp) override;
+  bool verify() const override;
+};
+
 } // namespace zhigh
 } // namespace onnx_mlir
 

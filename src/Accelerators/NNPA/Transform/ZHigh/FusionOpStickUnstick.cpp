@@ -868,6 +868,31 @@ public:
 };
 
 //===----------------------------------------------------------------------===//
+// FusedOp variant for the expand-mul-stick pattern.
+//
+// Anchors on ONNXUnsqueezeOp (head of the chain) and walks forward through
+// Expand -> Mul -> Reshape -> ZHighStickOp.
+//===----------------------------------------------------------------------===//
+
+class FusedPatternsForExpandMulStick
+    : public OpRewritePattern<ONNXUnsqueezeOp> {
+  DimAnalysis *dimAnalysis;
+
+public:
+  FusedPatternsForExpandMulStick(MLIRContext *context, DimAnalysis *dimAnalysis)
+      : OpRewritePattern(context), dimAnalysis(dimAnalysis) {}
+
+  LogicalResult matchAndRewrite(
+      ONNXUnsqueezeOp unsqueezeOp, PatternRewriter &rewriter) const override {
+    ExpandMulStickFusion fusion;
+    if (!fusion.detectIfBeneficial(dimAnalysis, unsqueezeOp))
+      return failure();
+    fusion.fuse(rewriter, unsqueezeOp.getLoc());
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // Pass.
 
 struct FusionOpStickUnstick
@@ -911,10 +936,12 @@ struct FusionOpStickUnstick
     RewritePatternSet patterns(&getContext());
     patterns.insert<PatternsStartingFromUnstick>(&getContext(), dimAnalysis);
     patterns.insert<PatternsEndingWithStick>(&getContext(), dimAnalysis);
-    if (!disableFusedOpOption && !disableFusedOp)
+    if (!disableFusedOpOption && !disableFusedOp) {
       patterns.insert<FusedPatternsForExtendedLayoutTransform>(
           &getContext(), dimAnalysis);
-    else
+      patterns.insert<FusedPatternsForExpandMulStick>(
+          &getContext(), dimAnalysis);
+    } else
       patterns.insert<PatternsForExtendedLayoutTransform>(
           &getContext(), dimAnalysis);
 
