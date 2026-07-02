@@ -98,6 +98,15 @@ public:
   /// first).
   bool verifyAndRetrieveAttrs(mlir::ONNXFusedOp fusedOp);
 
+  /// Fallback: inline the FusedOp body back into the enclosing function.
+  /// Call this when a dedicated lowering cannot proceed (verify() failed,
+  /// or the kind has no lowering yet).  Uses the original pre-conversion
+  /// FusedOp inputs so that block-argument types are preserved; the caller's
+  /// PatternRewriter then converts the newly exposed ops in the same pass.
+  /// Always returns LogicalResult::success().
+  mlir::LogicalResult inlineFallback(
+      mlir::PatternRewriter &rewriter, mlir::ONNXFusedOp fusedOp);
+
 protected:
   // -- Helper for subclass detect methods ------------------------------------
 

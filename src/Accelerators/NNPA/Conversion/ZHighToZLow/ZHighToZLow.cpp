@@ -2484,7 +2484,12 @@ struct ZHighToZLowExtendedLayoutTransformLowering
 };
 
 //===----------------------------------------------------------------------===//
-// ONNXFusedOp lowering for kind "zhigh.extended_layout_transform"
+//===----------------------------------------------------------------------===//
+// ONNXFusedOp lowering — handles all zhigh.* kinds.
+// Kind "zhigh.extended_layout_transform" receives a dedicated lowering.
+// Any other kind (unrecognised or not yet implemented) falls back to
+// FusionOpChain::inlineFallback, which re-exposes the body ops for conversion
+// by their own patterns in the same pass.
 //===----------------------------------------------------------------------===//
 
 struct ZHighToZLowFusedExtLayoutTransformLowering
@@ -2505,8 +2510,10 @@ struct ZHighToZLowFusedExtLayoutTransformLowering
 
   LogicalResult matchAndRewrite(ONNXFusedOp fusedOp, OpAdaptor adaptor,
       ConversionPatternRewriter &rewriter) const final {
+    // Declare fusion early so both fallback call sites can use the instance.
+    ExtLayoutTransformFusion fusion;
     if (fusedOp.getKind() != "zhigh.extended_layout_transform")
-      return failure();
+      return fusion.inlineFallback(rewriter, fusedOp);
 
     Location loc = fusedOp.getLoc();
     MDBuilder create(rewriter, loc);
@@ -2523,13 +2530,11 @@ struct ZHighToZLowFusedExtLayoutTransformLowering
 
     // Retrieve and verify the fusion parameters stored as attributes when the
     // FusedOp was created.  verifyAndRetrieveAttrs cross-checks the body ops
-    // against the stored params; if an optimisation pass altered the body, we
-    // fall back to failure so the generic inlining pattern can take over.
-    ExtLayoutTransformFusion fusion;
+    // against the stored params; if an optimisation pass altered the body,
+    // fall back to inlining the body ops individually.
     fusion.retrieveOpsAndOutputValues(fusedOp);
     if (!fusion.verifyAndRetrieveAttrs(fusedOp))
-      return rewriter.notifyMatchFailure(fusedOp,
-          "body does not match stored extended layout transform params");
+      return fusion.inlineFallback(rewriter, fusedOp);
     int64_t reshapeSplitAxis = fusion.reshapeSplitAxis;
     int64_t reshapeSplitFactor = fusion.reshapeSplitFactor;
     int64_t reshapeMergeAxis = fusion.reshapeMergeAxis;
@@ -2802,7 +2807,8 @@ void populateZHighToZLowConversionPattern(mlir::RewritePatternSet &patterns,
   // Extended transpose
   patterns.insert<ZHighToZLowExtendedLayoutTransformLowering>(
       typeConverter, ctx, enableParallel, disableSaturation);
-  // FusedOp variant of extended layout transform.
+  // FusedOp lowering: handles all zhigh.* kinds; unknown kinds fall back to
+  // FusionOpChain::inlineFallback via the kind check inside the pattern.
   patterns.insert<ZHighToZLowFusedExtLayoutTransformLowering>(
       typeConverter, ctx, enableParallel, disableSaturation);
 }

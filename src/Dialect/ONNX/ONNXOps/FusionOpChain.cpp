@@ -185,4 +185,22 @@ bool FusionOpChain::verifyAndRetrieveAttrs(ONNXFusedOp fusedOp) {
   return true;
 }
 
+LogicalResult FusionOpChain::inlineFallback(
+    PatternRewriter &rewriter, ONNXFusedOp fusedOp) {
+  LLVM_DEBUG(llvm::dbgs() << "FusionOpChain::inlineFallback: inlining "
+                          << "onnx.Fused (kind='" << fusedOp.getKind()
+                          << "') — no dedicated lowering or verify failed\n");
+  Block &body = fusedOp.getBody().front();
+  auto yieldOp = cast<ONNXYieldOp>(body.getTerminator());
+  // Snapshot yield operands before they move during inlining.
+  SmallVector<Value> results(yieldOp.getOperands());
+  // Inline the body just before the FusedOp.  Pass the original
+  // (pre-conversion) FusedOp inputs so that block-argument types match;
+  // the rewriter then converts the newly exposed ops in the same pass.
+  rewriter.inlineBlockBefore(&body, fusedOp, fusedOp.getInputs());
+  rewriter.eraseOp(yieldOp);
+  rewriter.replaceOp(fusedOp, results);
+  return success();
+}
+
 } // namespace onnx_mlir
