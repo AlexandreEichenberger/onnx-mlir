@@ -22,6 +22,7 @@
 #include "src/Builder/ModelInputShaper.hpp"
 #include "src/Compiler/OptionUtils.hpp"
 #include "src/Conversion/ONNXToKrnl/ONNXToKrnlCommon.hpp"
+#include "src/Dialect/ONNX/ONNXOps/FusedOpLoweringBase.hpp"
 #include "src/Dialect/Mlir/VectorMachineSupport.hpp"
 
 using namespace mlir;
@@ -300,6 +301,10 @@ void populateONNXToKrnlConversionPattern(RewritePatternSet &patterns,
   populateLoweringONNXLayoutTransformOpPattern(patterns, typeConverter, ctx, enableParallel);
   populateLoweringONNXShapeTransformOpPattern(patterns, typeConverter, ctx);
   populateLoweringONNXUpsampleAndPadOpPattern(patterns, typeConverter, ctx, enableParallel);
+  // Safety net for ONNXFusedOp: inline any instance whose kind has no
+  // dedicated lowering registered (in this pass or an accelerator pass).
+  // Registered at benefit=0 so all per-kind patterns take priority.
+  patterns.insert<FusedOpInlineFallback>(typeConverter, ctx);
   // clang-format on
 }
 

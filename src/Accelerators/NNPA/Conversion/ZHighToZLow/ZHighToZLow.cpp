@@ -35,6 +35,7 @@
 #include "src/Conversion/ONNXToKrnl/ONNXToKrnlCommon.hpp"
 #include "src/Conversion/ONNXToKrnl/Quantization/QuantizeHelper.hpp"
 #include "src/Dialect/Krnl/KrnlHelper.hpp"
+#include "src/Dialect/ONNX/ONNXOps/FusedOpLoweringBase.hpp"
 #include "src/Support/TypeUtilities.hpp"
 
 #define DEBUG_TYPE "zhigh-to-zlow"
@@ -2485,36 +2486,32 @@ struct ZHighToZLowExtendedLayoutTransformLowering
 
 //===----------------------------------------------------------------------===//
 //===----------------------------------------------------------------------===//
-// ONNXFusedOp lowering — handles all zhigh.* kinds.
-// Kind "zhigh.extended_layout_transform" receives a dedicated lowering.
-// Any other kind (unrecognised or not yet implemented) falls back to
-// FusionOpChain::inlineFallback, which re-exposes the body ops for conversion
-// by their own patterns in the same pass.
+// ONNXFusedOp lowering — one struct per zhigh.* kind.
+// Each struct inherits FusedOpKindLowering<FusionT> which handles kind
+// dispatch, retrieve/verify, and the inline fallback automatically.
+// A benefit-0 FusedOpInlineFallback catch-all is registered in the general
+// ONNX→Krnl pass (ConvertONNXToKrnl.cpp) for any unregistered kind.
 //===----------------------------------------------------------------------===//
 
 struct ZHighToZLowFusedExtLayoutTransformLowering
-    : public OpConversionPattern<ONNXFusedOp> {
+    : public FusedOpKindLowering<ExtLayoutTransformFusion> {
+  using Base = FusedOpKindLowering<ExtLayoutTransformFusion>;
   using OpAdaptor = typename ONNXFusedOp::Adaptor;
   bool enableParallel = false;
   bool disableSaturation = false;
 
   ZHighToZLowFusedExtLayoutTransformLowering(TypeConverter &typeConverter,
       MLIRContext *ctx, bool enableParallel, bool disableSaturation)
-      : OpConversionPattern<ONNXFusedOp>(typeConverter, ctx),
-        disableSaturation(disableSaturation) {
+      : Base(typeConverter, ctx), disableSaturation(disableSaturation) {
     this->enableParallel =
         enableParallel &&
         OnnxToKrnlLoweringConfiguration::enableSpecificParallelOps.isEnabled(
             ONNXFusedOp::getOperationName());
   }
 
-  LogicalResult matchAndRewrite(ONNXFusedOp fusedOp, OpAdaptor adaptor,
-      ConversionPatternRewriter &rewriter) const final {
-    // Declare fusion early so both fallback call sites can use the instance.
-    ExtLayoutTransformFusion fusion;
-    if (fusedOp.getKind() != "zhigh.extended_layout_transform")
-      return fusion.inlineFallback(rewriter, fusedOp);
-
+  LogicalResult lowerVerified(ONNXFusedOp fusedOp, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter,
+      ExtLayoutTransformFusion &fusion) const override {
     Location loc = fusedOp.getLoc();
     MDBuilder create(rewriter, loc);
     // Single function-level scope: all DimsExpr must outlive the nested
@@ -2527,14 +2524,6 @@ struct ZHighToZLowFusedExtLayoutTransformLowering
     // inputs[0] is the single source ZTensor (isolated region contract).
     Value inputVal = adaptor.getInputs()[0];
     Value outputVal = fusedOp.getOutputs()[0];
-
-    // Retrieve and verify the fusion parameters stored as attributes when the
-    // FusedOp was created.  verifyAndRetrieveAttrs cross-checks the body ops
-    // against the stored params; if an optimisation pass altered the body,
-    // fall back to inlining the body ops individually.
-    fusion.retrieveOpsAndOutputValues(fusedOp);
-    if (!fusion.verifyAndRetrieveAttrs(fusedOp))
-      return fusion.inlineFallback(rewriter, fusedOp);
     int64_t reshapeSplitAxis = fusion.reshapeSplitAxis;
     int64_t reshapeSplitFactor = fusion.reshapeSplitFactor;
     int64_t reshapeMergeAxis = fusion.reshapeMergeAxis;
@@ -2742,6 +2731,30 @@ struct ZHighToZLowFusedExtLayoutTransformLowering
 };
 
 //===----------------------------------------------------------------------===//
+// Lowering stub for kind "zhigh.expand-mul-stick".
+// No code-generation implemented yet; inlines the body so constituent ops
+// are lowered by their own patterns.  Replace lowerVerified() with the actual
+// lowering once it is ready.
+//===----------------------------------------------------------------------===//
+
+struct ZHighToZLowFusedExpandMulStickLowering
+    : public FusedOpKindLowering<ExpandMulStickFusion> {
+  using Base = FusedOpKindLowering<ExpandMulStickFusion>;
+  using OpAdaptor = typename ONNXFusedOp::Adaptor;
+
+  ZHighToZLowFusedExpandMulStickLowering(
+      TypeConverter &typeConverter, MLIRContext *ctx)
+      : Base(typeConverter, ctx) {}
+
+  LogicalResult lowerVerified(ONNXFusedOp fusedOp, OpAdaptor,
+      ConversionPatternRewriter &rewriter,
+      ExpandMulStickFusion &fusion) const override {
+    // TODO: implement lowering for expand-mul-stick fusion.
+    return FusionOpChain::inlineFallback(rewriter, fusedOp);
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // Populate all the patterns.
 //===----------------------------------------------------------------------===//
 void populateZHighToZLowConversionPattern(mlir::RewritePatternSet &patterns,
@@ -2807,10 +2820,11 @@ void populateZHighToZLowConversionPattern(mlir::RewritePatternSet &patterns,
   // Extended transpose
   patterns.insert<ZHighToZLowExtendedLayoutTransformLowering>(
       typeConverter, ctx, enableParallel, disableSaturation);
-  // FusedOp lowering: handles all zhigh.* kinds; unknown kinds fall back to
-  // FusionOpChain::inlineFallback via the kind check inside the pattern.
+  // FusedOp: one pattern per zhigh.* kind.  The benefit-0 FusedOpInlineFallback
+  // catch-all for unregistered kinds is in populateONNXToKrnlConversionPattern.
   patterns.insert<ZHighToZLowFusedExtLayoutTransformLowering>(
       typeConverter, ctx, enableParallel, disableSaturation);
+  patterns.insert<ZHighToZLowFusedExpandMulStickLowering>(typeConverter, ctx);
 }
 
 } // namespace zhigh

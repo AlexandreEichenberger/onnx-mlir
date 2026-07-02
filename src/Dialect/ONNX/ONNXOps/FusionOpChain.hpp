@@ -104,7 +104,12 @@ public:
   /// FusedOp inputs so that block-argument types are preserved; the caller's
   /// PatternRewriter then converts the newly exposed ops in the same pass.
   /// Always returns LogicalResult::success().
-  mlir::LogicalResult inlineFallback(
+  /// Static so that callers without a FusionOpChain instance (e.g. the
+  /// generic FusedOpInlineFallback catch-all) can invoke it directly.
+  /// Per-kind lowerings that do have an instance can still call it as
+  /// fusion.inlineFallback(...) — calling a static method via an instance
+  /// is valid C++.
+  static mlir::LogicalResult inlineFallback(
       mlir::PatternRewriter &rewriter, mlir::ONNXFusedOp fusedOp);
 
 protected:

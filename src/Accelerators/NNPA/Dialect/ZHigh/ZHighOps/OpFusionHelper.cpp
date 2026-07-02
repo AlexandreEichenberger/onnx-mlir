@@ -666,10 +666,6 @@ bool ExpandMulStickFusion::retrieveAttrs(ONNXFusedOp fusedOp) {
 }
 
 bool ExpandMulStickFusion::verify() const {
-  // hi alex, return false for the moment because we have no lowering
-  // implementation yet.
-  return false;
-
   constexpr int expected = 5; // unsqueeze + expand + mul + reshape + stick
   if ((int64_t)ops.size() != expected) {
     LLVM_DEBUG(llvm::dbgs() << "EMS verify: op count " << ops.size()
