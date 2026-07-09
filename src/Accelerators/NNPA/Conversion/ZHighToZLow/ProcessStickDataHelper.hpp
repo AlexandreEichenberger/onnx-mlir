@@ -46,7 +46,7 @@ public:
   //
   // OriginalMemRef is the original translated tensor in memref.
   //
-  // At least one of isRead or isWrite must be
+  // At least one of isRead or isWrite must be set.
   //
   // DisableSaturation indicates if saturation should not occur during
   // conversions from f32 to dlf16.

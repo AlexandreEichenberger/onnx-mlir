@@ -99,8 +99,7 @@ struct FusedOpInlineFallback
   mlir::LogicalResult matchAndRewrite(mlir::ONNXFusedOp fusedOp, OpAdaptor,
       mlir::ConversionPatternRewriter &rewriter) const final {
     fusedOp.emitWarning()
-        << "no dedicated lowering for onnx.Fused (kind='"
-        << fusedOp.getKind()
+        << "no dedicated lowering for onnx.Fused (kind='" << fusedOp.getKind()
         << "'); inlining body as fallback — add a FusedOpKindLowering subclass";
     return FusionOpChain::inlineFallback(rewriter, fusedOp);
   }
