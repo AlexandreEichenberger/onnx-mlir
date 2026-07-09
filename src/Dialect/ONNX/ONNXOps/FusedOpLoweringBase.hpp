@@ -12,8 +12,10 @@
 //
 // FusedOpKindLowering<FusionT>
 //   Template base for per-kind lowering patterns.  Subclasses only implement
-//   lowerVerified(); the base handles kind dispatch, retrieve/verify, and the
-//   inline fallback.  Register one subclass per FusedOp kind.
+//   lowerVerified(), returning the Value that replaces the FusedOp; the base
+//   handles kind dispatch, retrieve/verify, the inline fallback, and (on
+//   success) dropping the body's intra-region def-use edges and replacing the
+//   op.  Register one subclass per FusedOp kind.
 //
 // FusedOpInlineFallback
 //   Benefit-0 catch-all registered in the general ONNX→Krnl pass.  Fires for
@@ -41,7 +43,7 @@ namespace onnx_mlir {
 //     MyLowering(TypeConverter &tc, MLIRContext *ctx, ...)
 //         : FusedOpKindLowering(tc, ctx) { ... }
 //
-//     LogicalResult lowerVerified(ONNXFusedOp, OpAdaptor,
+//     FailureOr<Value> lowerVerified(ONNXFusedOp, OpAdaptor,
 //         ConversionPatternRewriter &, MyFusion &) const override { ... }
 //   };
 //===----------------------------------------------------------------------===//
@@ -65,16 +67,37 @@ struct FusedOpKindLowering
     // Retrieve body ops and cross-check stored params.  If the body was
     // altered by an optimisation pass, fall back to inline.
     fusion.retrieveOpsAndOutputValues(fusedOp);
-    if (fusion.verifyAndRetrieveAttrs(fusedOp))
-      return lowerVerified(fusedOp, adaptor, rewriter, fusion);
-    // Failed, use the inline fallback to allow constituent ops to be lowered on
-    // their own.
-    return FusionOpChain::inlineFallback(rewriter, fusedOp);
+    if (!fusion.verifyAndRetrieveAttrs(fusedOp))
+      // Failed, use the inline fallback to allow constituent ops to be
+      // lowered on their own.
+      return FusionOpChain::inlineFallback(rewriter, fusedOp);
+
+    mlir::FailureOr<mlir::Value> replacement =
+        lowerVerified(fusedOp, adaptor, rewriter, fusion);
+    if (mlir::failed(replacement))
+      return mlir::failure();
+
+    // Drop all intra-body def-use edges before handing the FusedOp to the
+    // conversion framework's deferred eraser.  Without this, the conversion
+    // framework (applyRewrites / EraseBlockRewrite::cleanup) may encounter
+    // ops that still appear to have uses when erased, triggering an
+    // assertion in eraseSingleOp even though the RegionKindInterface marks
+    // the body as a Graph region.  Dropping all result uses here makes every
+    // inner op use_empty() regardless of the order in which the eraser
+    // visits them.
+    for (mlir::Block &block : fusedOp.getBody())
+      for (mlir::Operation &innerOp : block)
+        innerOp.dropAllUses();
+
+    rewriter.replaceOp(fusedOp, *replacement);
+    return mlir::success();
   }
 
   /// Implement the actual lowering.  Called only when the kind matches and
   /// verifyAndRetrieveAttrs() succeeded; fusion fields are fully populated.
-  virtual mlir::LogicalResult lowerVerified(mlir::ONNXFusedOp fusedOp,
+  /// Return the Value that replaces the FusedOp — do not call
+  /// rewriter.replaceOp() or drop body uses; the base class does both.
+  virtual mlir::FailureOr<mlir::Value> lowerVerified(mlir::ONNXFusedOp fusedOp,
       OpAdaptor adaptor, mlir::ConversionPatternRewriter &rewriter,
       FusionT &fusion) const = 0;
 };

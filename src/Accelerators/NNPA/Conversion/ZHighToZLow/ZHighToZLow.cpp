@@ -2509,7 +2509,7 @@ struct ZHighToZLowFusedExtLayoutTransformLowering
             ONNXFusedOp::getOperationName());
   }
 
-  LogicalResult lowerVerified(ONNXFusedOp fusedOp, OpAdaptor adaptor,
+  FailureOr<Value> lowerVerified(ONNXFusedOp fusedOp, OpAdaptor adaptor,
       ConversionPatternRewriter &rewriter,
       ExtLayoutTransformFusion &fusion) const override {
     Location loc = fusedOp.getLoc();
@@ -2714,19 +2714,7 @@ struct ZHighToZLowFusedExtLayoutTransformLowering
           }
         });
 
-    // Drop all intra-body def-use edges before handing the FusedOp to the
-    // conversion framework's deferred eraser.  Without this, the conversion
-    // framework (applyRewrites / EraseBlockRewrite::cleanup) may encounter ops
-    // that still appear to have uses when erased, triggering an assertion in
-    // eraseSingleOp even though the RegionKindInterface marks the body as a
-    // Graph region.  Dropping all result uses here makes every inner op
-    // use_empty() regardless of the order in which the eraser visits them.
-    for (Block &block : fusedOp.getBody())
-      for (Operation &innerOp : block)
-        innerOp.dropAllUses();
-
-    rewriter.replaceOp(fusedOp, allocVal);
-    return success();
+    return allocVal;
   }
 };
 
@@ -2784,10 +2772,9 @@ struct ZHighToZLowFusedExpandMulStickLowering
       MLIRContext *ctx, bool disableSaturation)
       : Base(typeConverter, ctx), disableSaturation(disableSaturation) {}
 
-  LogicalResult lowerVerified(ONNXFusedOp fusedOp, OpAdaptor adaptor,
+  FailureOr<Value> lowerVerified(ONNXFusedOp fusedOp, OpAdaptor adaptor,
       ConversionPatternRewriter &rewriter,
       ExpandMulStickFusion &fusion) const override {
-    fprintf(stderr, "hi alex from Lowering zhigh.expand-mul-stick\n");
     Location loc = fusedOp.getLoc();
     MDBuilder create(rewriter, loc);
     // Single function-level scope: all DimsExpr must outlive the nested
@@ -2920,15 +2907,7 @@ struct ZHighToZLowFusedExpandMulStickLowering
               });
         });
 
-    // Drop all intra-body def-use edges before handing the FusedOp to the
-    // conversion framework's deferred eraser (see identical rationale in
-    // ZHighToZLowFusedExtLayoutTransformLowering above).
-    for (Block &block : fusedOp.getBody())
-      for (Operation &innerOp : block)
-        innerOp.dropAllUses();
-
-    rewriter.replaceOp(fusedOp, allocVal);
-    return success();
+    return allocVal;
   }
 };
 
