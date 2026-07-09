@@ -2892,22 +2892,31 @@ struct ZHighToZLowFusedExpandMulStickLowering
 
           int64_t U = 4;
           int64_t totVL = U * UnifiedStickSupport::archVL;
-          UnifiedStickSupportList::GenericIterateFctOver4xF32M fct =
-              [&](const KrnlBuilder &b, SmallVectorImpl<Value> &vals) {
-                MultiDialectBuilder<MathBuilder> mcreate(b);
-                // Compute the scaled value once (read is vals[0]) and copy it
-                // to all N write slots.
-                Value scaled = mcreate.math.mul(vals[0], scalarConst);
-                for (int64_t n = 0; n < N; ++n)
-                  vals[1 + n] = scaled;
-              };
           create.krnl.forLoopIE(LitIE(0), LitIE(64), totVL, /*par*/ false,
               [&](const KrnlBuilder kb, ValueRange loopInd) {
                 IndexExprScope innerScope(kb, &outerScope);
                 MDBuilder create(ck);
                 IndexExpr l = DimIE(loopInd[0]);
-                for (int64_t u = 0; u < U; ++u)
-                  uss.genericLoadComputeStore(create.krnl, fct, l, u);
+                for (int64_t u = 0; u < U; ++u) {
+                  // Load the (sole) read reference; no-op for write-only ones.
+                  uss.beforeCompute(create.krnl, l, u);
+                  Value highIn, lowIn;
+                  uss.list[0].get4xF32Vals(highIn, lowIn);
+
+                  // Scale once and convert to dlf16 once, then reuse the same
+                  // converted vector for all N write slots — avoids redoing
+                  // the saturate+convert step N times for identical values.
+                  MultiDialectBuilder<MathBuilder, ZLowBuilder> mcreate(
+                      create.krnl);
+                  Value highScaled = mcreate.math.mul(highIn, scalarConst);
+                  Value lowScaled = mcreate.math.mul(lowIn, scalarConst);
+                  Value dlf16 = mcreate.zlow.convertF32ToDLF16(
+                      highScaled, lowScaled, disableSaturation);
+
+                  for (int64_t n = 0; n < N; ++n)
+                    uss.list[1 + n].storeConvertedDLF16(
+                        create.krnl, dlf16, l, u);
+                }
               });
         });
 

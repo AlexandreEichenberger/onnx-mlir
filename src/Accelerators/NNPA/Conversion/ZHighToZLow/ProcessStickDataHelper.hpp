@@ -87,6 +87,16 @@ public:
   void afterCompute(KrnlBuilder &kb, IndexExpr offsetWithinStick,
       int64_t offsetWithinVector, mlir::Value tempBufferMemRef);
 
+  // Store an already-computed (already saturated + converted) dlf16 vector
+  // at this write reference's current stick location, skipping the
+  // saturate+convert step. Use when several write references share the same
+  // underlying F32 values (e.g. broadcast/expand semantics) so the
+  // conversion only has to happen once. Only valid for a non-broadcast,
+  // non-buffer stick write reference, after beforeStickLoop() has set its
+  // stick offset.
+  void storeConvertedDLF16(KrnlBuilder &kb, mlir::Value dlf16Vec,
+      IndexExpr offsetWithinStick, int64_t offsetWithinVector);
+
   // Get the values to perform the computation, and must set the values for the
   // values that will be stored.
   void get4xF32Vals(mlir::Value &highVal, mlir::Value &lowVal);
