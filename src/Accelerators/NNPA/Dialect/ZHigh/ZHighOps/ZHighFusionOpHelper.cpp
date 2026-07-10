@@ -142,10 +142,10 @@ static bool detectMergeReshape(
 }
 
 //===----------------------------------------------------------------------===//
-// ExtLayoutTransformFusion — virtual method implementations
+// ExtLayoutTransformFusionHelper — virtual method implementations
 //===----------------------------------------------------------------------===//
 
-bool ExtLayoutTransformFusion::detectIfBeneficial(
+bool ExtLayoutTransformFusionHelper::detectIfBeneficial(
     const DimAnalysis *dimAnalysis, ONNXLayoutTransformOp startOp) {
   auto returnFailure = [](llvm::StringRef msg) -> bool {
     LLVM_DEBUG(llvm::dbgs() << "  detectIfBeneficial ext-layout-trans failed: "
@@ -255,7 +255,7 @@ bool ExtLayoutTransformFusion::detectIfBeneficial(
   return true;
 }
 
-void ExtLayoutTransformFusion::embedAttrs(ONNXFusedOp fusedOp) const {
+void ExtLayoutTransformFusionHelper::embedAttrs(ONNXFusedOp fusedOp) const {
   Builder b(fusedOp->getContext());
   fusedOp->setAttr("reshapeSplitAxis", b.getI64IntegerAttr(reshapeSplitAxis));
   fusedOp->setAttr(
@@ -268,7 +268,7 @@ void ExtLayoutTransformFusion::embedAttrs(ONNXFusedOp fusedOp) const {
     fusedOp->setAttr("finalLayout", *finalLayout);
 }
 
-bool ExtLayoutTransformFusion::retrieveAttrs(ONNXFusedOp fusedOp) {
+bool ExtLayoutTransformFusionHelper::retrieveAttrs(ONNXFusedOp fusedOp) {
   auto getI64 = [&](StringRef name, int64_t &out) -> bool {
     auto attr = fusedOp->getAttrOfType<IntegerAttr>(name);
     if (!attr)
@@ -298,7 +298,7 @@ bool ExtLayoutTransformFusion::retrieveAttrs(ONNXFusedOp fusedOp) {
   return true;
 }
 
-bool ExtLayoutTransformFusion::verify() const {
+bool ExtLayoutTransformFusionHelper::verify() const {
   // Expected op count from the stored params.
   int expected = 1; // ops[0]: initial ONNXLayoutTransformOp
   if (reshapeSplitAxis != -1)
@@ -391,7 +391,7 @@ bool ExtLayoutTransformFusion::verify() const {
 }
 
 //===----------------------------------------------------------------------===//
-// ExpandMulStickFusion — static helpers
+// ExpandMulStickFusionHelper — static helpers
 //===----------------------------------------------------------------------===//
 
 /// Verify that expandOp expands only dim P (currently 1) to a static N >= 2,
@@ -503,10 +503,10 @@ static bool detectUpperCollapse(ONNXReshapeOp reshapeOp, int64_t P,
 }
 
 //===----------------------------------------------------------------------===//
-// ExpandMulStickFusion — virtual method implementations
+// ExpandMulStickFusionHelper — virtual method implementations
 //===----------------------------------------------------------------------===//
 
-bool ExpandMulStickFusion::detectIfBeneficial(
+bool ExpandMulStickFusionHelper::detectIfBeneficial(
     const DimAnalysis *dimAnalysis, ONNXUnsqueezeOp startOp) {
   auto returnFailure = [](llvm::StringRef msg) -> bool {
     LLVM_DEBUG(llvm::dbgs()
@@ -625,7 +625,7 @@ bool ExpandMulStickFusion::detectIfBeneficial(
   return true;
 }
 
-void ExpandMulStickFusion::embedAttrs(ONNXFusedOp fusedOp) const {
+void ExpandMulStickFusionHelper::embedAttrs(ONNXFusedOp fusedOp) const {
   Builder b(fusedOp->getContext());
   fusedOp->setAttr(
       "unsqueezedPosition", b.getI64IntegerAttr(unsqueezedPosition));
@@ -639,7 +639,7 @@ void ExpandMulStickFusion::embedAttrs(ONNXFusedOp fusedOp) const {
   fusedOp->setAttr("stickFormat", *stickFormat);
 }
 
-bool ExpandMulStickFusion::retrieveAttrs(ONNXFusedOp fusedOp) {
+bool ExpandMulStickFusionHelper::retrieveAttrs(ONNXFusedOp fusedOp) {
   auto getI64 = [&](StringRef name, int64_t &out) -> bool {
     auto attr = fusedOp->getAttrOfType<IntegerAttr>(name);
     if (!attr)
@@ -666,7 +666,7 @@ bool ExpandMulStickFusion::retrieveAttrs(ONNXFusedOp fusedOp) {
   return true;
 }
 
-bool ExpandMulStickFusion::verify() const {
+bool ExpandMulStickFusionHelper::verify() const {
   constexpr int expectedWithMul =
       5; // unsqueeze + expand + mul + reshape + stick
   constexpr int expectedWithoutMul = 4; // unsqueeze + expand + reshape + stick

@@ -2493,8 +2493,8 @@ struct ZHighToZLowExtendedLayoutTransformLowering
 //===----------------------------------------------------------------------===//
 
 struct ZHighToZLowFusedExtLayoutTransformLowering
-    : public FusedOpKindLowering<ExtLayoutTransformFusion> {
-  using Base = FusedOpKindLowering<ExtLayoutTransformFusion>;
+    : public FusedOpKindLowering<ExtLayoutTransformFusionHelper> {
+  using Base = FusedOpKindLowering<ExtLayoutTransformFusionHelper>;
   using OpAdaptor = typename ONNXFusedOp::Adaptor;
   bool enableParallel = false;
   bool disableSaturation = false;
@@ -2510,7 +2510,7 @@ struct ZHighToZLowFusedExtLayoutTransformLowering
 
   FailureOr<Value> lowerVerified(ONNXFusedOp fusedOp, OpAdaptor adaptor,
       ConversionPatternRewriter &rewriter,
-      ExtLayoutTransformFusion &fusion) const override {
+      ExtLayoutTransformFusionHelper &fusion) const override {
     Location loc = fusedOp.getLoc();
     MDBuilder create(rewriter, loc);
     // Single function-level scope: all DimsExpr must outlive the nested
@@ -2762,8 +2762,8 @@ static DimsExpr buildExpandMulStickOutputAF(DimsExpr &loopIndices, int64_t n,
 }
 
 struct ZHighToZLowFusedExpandMulStickLowering
-    : public FusedOpKindLowering<ExpandMulStickFusion> {
-  using Base = FusedOpKindLowering<ExpandMulStickFusion>;
+    : public FusedOpKindLowering<ExpandMulStickFusionHelper> {
+  using Base = FusedOpKindLowering<ExpandMulStickFusionHelper>;
   using OpAdaptor = typename ONNXFusedOp::Adaptor;
   bool disableSaturation = false;
 
@@ -2773,7 +2773,7 @@ struct ZHighToZLowFusedExpandMulStickLowering
 
   FailureOr<Value> lowerVerified(ONNXFusedOp fusedOp, OpAdaptor adaptor,
       ConversionPatternRewriter &rewriter,
-      ExpandMulStickFusion &fusion) const override {
+      ExpandMulStickFusionHelper &fusion) const override {
     Location loc = fusedOp.getLoc();
     MDBuilder create(rewriter, loc);
     // Single function-level scope: all DimsExpr must outlive the nested
@@ -2860,7 +2860,7 @@ struct ZHighToZLowFusedExpandMulStickLowering
     UnifiedStickSupportList uss(
         create.krnl, ussVals, ussMemRefs, isReads, isWrites, disableSaturation);
     // A neutral (1.f) scalar means the source chain had no Mul op at all
-    // (ExpandMulStickFusion::detectIfBeneficial leaves mulScalar at its
+    // (ExpandMulStickFusionHelper::detectIfBeneficial leaves mulScalar at its
     // default when the Mul step is absent); skip the multiply entirely
     // rather than emitting a multiply-by-one.
     bool hasMulScalar = mulScalar != 1.0f;

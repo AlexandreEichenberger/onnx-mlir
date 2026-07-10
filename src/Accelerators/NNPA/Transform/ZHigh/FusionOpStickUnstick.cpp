@@ -844,15 +844,16 @@ public:
 // src/Dialect/ONNX/Transforms/FusionOpBasePattern.hpp.
 //===----------------------------------------------------------------------===//
 
-// Anchors on ONNXLayoutTransformOp; ExtLayoutTransformFusion walks forward
-// through the optional Reshape/Transpose/Reshape/LayoutTransform chain.
+// Anchors on ONNXLayoutTransformOp; ExtLayoutTransformFusionHelper walks
+// forward through the optional Reshape/Transpose/Reshape/LayoutTransform chain.
 using FusedPatternsForExtendedLayoutTransform =
-    FusedPatternForOpKind<ONNXLayoutTransformOp, ExtLayoutTransformFusion>;
+    FusedPatternForOpKind<ONNXLayoutTransformOp,
+        ExtLayoutTransformFusionHelper>;
 
-// Anchors on ONNXUnsqueezeOp (head of the chain); ExpandMulStickFusion walks
-// forward through Expand -> Mul -> Reshape -> ZHighStickOp.
+// Anchors on ONNXUnsqueezeOp (head of the chain); ExpandMulStickFusionHelper
+// walks forward through Expand -> Mul -> Reshape -> ZHighStickOp.
 using FusedPatternsForExpandMulStick =
-    FusedPatternForOpKind<ONNXUnsqueezeOp, ExpandMulStickFusion>;
+    FusedPatternForOpKind<ONNXUnsqueezeOp, ExpandMulStickFusionHelper>;
 
 //===----------------------------------------------------------------------===//
 // Pass.

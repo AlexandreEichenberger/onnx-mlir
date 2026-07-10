@@ -17,7 +17,7 @@
 //
 // -- Fusion pass (pattern creation) ------------------------------------------
 //
-//   ExtLayoutTransformFusion fusion;
+//   ExtLayoutTransformFusionHelper fusion;
 //   if (!fusion.detectIfBeneficial(dimAnalysis, layoutTransformOp))
 //     return failure();
 //
@@ -25,7 +25,7 @@
 //
 // -- Lowering pass (code generation) ------------------------------------------
 //
-//   ExtLayoutTransformFusion fusion;
+//   ExtLayoutTransformFusionHelper fusion;
 //   fusion.retrieveOpsAndOutputValues(fusedOp);
 //
 //   if (!fusion.verifyAndRetrieveAttrs(fusedOp))
@@ -50,7 +50,7 @@ namespace onnx_mlir {
 namespace zhigh {
 
 //===----------------------------------------------------------------------===//
-// ExtLayoutTransformFusion
+// ExtLayoutTransformFusionHelper
 //
 // Subclass for ONNXFusedOp(kind = "zhigh.extended_layout_transform").
 //
@@ -63,7 +63,7 @@ namespace zhigh {
 //     OR ZHighDLF16ToF32Op (opt.)   DLF16 => F32            (step 5b)
 //===----------------------------------------------------------------------===//
 
-class ExtLayoutTransformFusion : public onnx_mlir::FusionOpKindHelper {
+class ExtLayoutTransformFusionHelper : public onnx_mlir::FusionOpKindHelper {
 public:
   static constexpr llvm::StringLiteral kKind{"zhigh.extended_layout_transform"};
 
@@ -95,7 +95,7 @@ public:
 };
 
 //===----------------------------------------------------------------------===//
-// ExpandMulStickFusion
+// ExpandMulStickFusionHelper
 //
 // Subclass for ONNXFusedOp(kind = "zhigh.expand-mul-stick").
 //
@@ -114,7 +114,7 @@ public:
 // has exactly one use.  The stick result is not checked.
 //===----------------------------------------------------------------------===//
 
-class ExpandMulStickFusion : public onnx_mlir::FusionOpKindHelper {
+class ExpandMulStickFusionHelper : public onnx_mlir::FusionOpKindHelper {
 public:
   static constexpr llvm::StringLiteral kKind{"zhigh.expand-mul-stick"};
 
