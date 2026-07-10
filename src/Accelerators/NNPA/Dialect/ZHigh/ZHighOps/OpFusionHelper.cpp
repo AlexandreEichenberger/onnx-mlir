@@ -18,7 +18,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "llvm/Support/Debug.h"
 
-#define DEBUG_TYPE "op-fusion-helper"
+#define DEBUG_TYPE "op-fusion"
 
 using namespace mlir;
 
@@ -568,33 +568,35 @@ bool ExpandMulStickFusion::detectIfBeneficial(
   ops.push_back(expandOp.getOperation());
   current = expandOp.getOutput();
 
-  // ---- Step 3: Mul --------------------------------------------------------
-  auto mulOp = singleUserOfType<ONNXMulOp>(current);
-  if (!mulOp)
-    return returnFailure("mul: not single user of type ONNXMulOp");
+  // ---- Step 3: Mul (optional) ----------------------------------------------
+  // If the expand output's single user is not an ONNXMulOp, skip this step
+  // and leave mulScalar at its neutral default (1.f); `current` still points
+  // at the expand output, so Step 4 matches the reshape directly against it.
+  if (auto mulOp = singleUserOfType<ONNXMulOp>(current)) {
+    // Identify the scalar operand (accept either argument order).
+    Value lhs = mulOp.getA();
+    Value rhs = mulOp.getB();
+    Value scalarVal =
+        (lhs == current) ? rhs : (rhs == current) ? lhs : nullptr;
+    if (!scalarVal)
+      return returnFailure("mul: neither operand comes from the chain");
 
-  // Identify the scalar operand (accept either argument order).
-  Value lhs = mulOp.getA();
-  Value rhs = mulOp.getB();
-  Value scalarVal = (lhs == current) ? rhs : (rhs == current) ? lhs : nullptr;
-  if (!scalarVal)
-    return returnFailure("mul: neither operand comes from the chain");
-
-  std::optional<float> sv = std::nullopt;
-  // F32 path: reuse existing NNPA helper.
-  if (auto fa = getScalarF32AttrFromConstant(scalarVal))
-    sv = fa.getValue().convertToFloat();
-  // Integer path: fall back to getScalarValue (handles I32 / I64).
-  else if (auto cst = scalarVal.getDefiningOp<ONNXConstantOp>()) {
-    Type et = cast<ShapedType>(scalarVal.getType()).getElementType();
-    if (et.isInteger(32) || et.isInteger(64))
-      sv = static_cast<float>(getScalarValue<double>(cst));
+    std::optional<float> sv = std::nullopt;
+    // F32 path: reuse existing NNPA helper.
+    if (auto fa = getScalarF32AttrFromConstant(scalarVal))
+      sv = fa.getValue().convertToFloat();
+    // Integer path: fall back to getScalarValue (handles I32 / I64).
+    else if (auto cst = scalarVal.getDefiningOp<ONNXConstantOp>()) {
+      Type et = cast<ShapedType>(scalarVal.getType()).getElementType();
+      if (et.isInteger(32) || et.isInteger(64))
+        sv = static_cast<float>(getScalarValue<double>(cst));
+    }
+    if (!sv)
+      return returnFailure("mul: scalar operand is not F32/I32/I64 constant");
+    mulScalar = *sv;
+    ops.push_back(mulOp.getOperation());
+    current = mulOp.getC();
   }
-  if (!sv)
-    return returnFailure("mul: scalar operand is not F32/I32/I64 constant");
-  mulScalar = *sv;
-  ops.push_back(mulOp.getOperation());
-  current = mulOp.getC();
 
   // ---- Step 4: Reshape ----------------------------------------------------
   auto reshapeOp = singleUserOfType<ONNXReshapeOp>(current);
@@ -666,10 +668,17 @@ bool ExpandMulStickFusion::retrieveAttrs(ONNXFusedOp fusedOp) {
 }
 
 bool ExpandMulStickFusion::verify() const {
-  constexpr int expected = 5; // unsqueeze + expand + mul + reshape + stick
-  if ((int64_t)ops.size() != expected) {
+  constexpr int expectedWithMul = 5;    // unsqueeze + expand + mul + reshape + stick
+  constexpr int expectedWithoutMul = 4; // unsqueeze + expand + reshape + stick
+  bool hasMul;
+  if ((int64_t)ops.size() == expectedWithMul) {
+    hasMul = true;
+  } else if ((int64_t)ops.size() == expectedWithoutMul) {
+    hasMul = false;
+  } else {
     LLVM_DEBUG(llvm::dbgs() << "EMS verify: op count " << ops.size()
-                            << " != " << expected << "\n");
+                            << " != " << expectedWithMul << " or "
+                            << expectedWithoutMul << "\n");
     return false;
   }
   int idx = 0;
@@ -703,16 +712,18 @@ bool ExpandMulStickFusion::verify() const {
     }
   }
 
-  // ops[2]: ONNXMulOp.
-  if (!dyn_cast<ONNXMulOp>(ops[idx++])) {
-    LLVM_DEBUG(llvm::dbgs() << "EMS verify: ops[2] not Mul\n");
-    return false;
+  // ops[2]: ONNXMulOp (only present when the pattern includes a Mul).
+  if (hasMul) {
+    if (!dyn_cast<ONNXMulOp>(ops[idx++])) {
+      LLVM_DEBUG(llvm::dbgs() << "EMS verify: ops[2] not Mul\n");
+      return false;
+    }
   }
 
-  // ops[3]: ONNXReshapeOp — rank delta consistent with reshapeCollapsedCount.
+  // ops[idx]: ONNXReshapeOp — rank delta consistent with reshapeCollapsedCount.
   auto reshape = dyn_cast<ONNXReshapeOp>(ops[idx++]);
   if (!reshape) {
-    LLVM_DEBUG(llvm::dbgs() << "EMS verify: ops[3] not Reshape\n");
+    LLVM_DEBUG(llvm::dbgs() << "EMS verify: ops[idx] not Reshape\n");
     return false;
   }
   if (reshapeCollapsedCount > 0) {
@@ -726,10 +737,10 @@ bool ExpandMulStickFusion::verify() const {
     }
   }
 
-  // ops[4]: ZHighStickOp — layout matches stored stickFormat.
+  // ops[idx]: ZHighStickOp — layout matches stored stickFormat.
   auto stick = dyn_cast<ZHighStickOp>(ops[idx++]);
   if (!stick) {
-    LLVM_DEBUG(llvm::dbgs() << "EMS verify: ops[4] not Stick\n");
+    LLVM_DEBUG(llvm::dbgs() << "EMS verify: ops[idx] not Stick\n");
     return false;
   }
   {

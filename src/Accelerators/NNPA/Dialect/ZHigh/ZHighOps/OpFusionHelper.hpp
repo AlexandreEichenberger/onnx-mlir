@@ -101,7 +101,8 @@ public:
 // Pattern:
 //   ONNXUnsqueezeOp  one axis P; innermost dim of result static mod 64 (required)
 //   ONNXExpandOp     dim P expands from 1 to N (N static, >= 2)         (required)
-//   ONNXMulOp        element-wise mul by scalar F32/I32/I64 const        (required)
+//   ONNXMulOp        element-wise mul by scalar F32/I32/I64 const        (optional;
+//                    when absent, mulScalar stays at its neutral 1.f default)
 //   ONNXReshapeOp    dims 0..P may collapse; dims after P unchanged      (required)
 //   ZHighStickOp     stick to 3D / 3DS / 4D                             (required)
 //

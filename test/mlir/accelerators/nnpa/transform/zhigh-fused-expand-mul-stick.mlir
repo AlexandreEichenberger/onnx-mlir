@@ -2,8 +2,10 @@
 
 // Tests for the zhigh.expand-mul-stick FusedOp pattern.
 // The pass wraps the chain:
-//   ONNXUnsqueezeOp -> ONNXExpandOp -> ONNXMulOp -> ONNXReshapeOp -> ZHighStickOp
-// into an onnx.Fused region with kind = "zhigh.expand-mul-stick".
+//   ONNXUnsqueezeOp -> ONNXExpandOp -> [ONNXMulOp] -> ONNXReshapeOp -> ZHighStickOp
+// into an onnx.Fused region with kind = "zhigh.expand-mul-stick".  The Mul
+// step is optional; when absent, mulScalar is stored as its neutral 1.0
+// default (see @expand_stick_no_mul below).
 //
 // Pattern under test:
 //   Input:  tensor<3x4x64xf32>
@@ -130,6 +132,46 @@ func.func @no_fuse_expand_changes_non_p_dim(%arg0: tensor<3x4x64xf32>)
 // CHECK:           "onnx.Reshape"
 // CHECK:           "zhigh.Stick"
 // CHECK:           return
+}
+
+// -----
+
+// Mul is optional: the chain also fuses when Expand feeds Reshape directly
+// (no scalar multiply in between).  mulScalar stays at its neutral 1.0
+// default and the fused body has only 4 ops (no onnx.Mul).
+
+func.func @expand_stick_no_mul(%arg0: tensor<3x4x64xf32>)
+    -> tensor<24x4x64xf16, #zhigh.layout<{dataLayout = "3DS"}>> {
+  %axes  = onnx.Constant dense<1>             : tensor<1xi64>
+  %shexp = onnx.Constant dense<[3, 8, 4, 64]> : tensor<4xi64>
+  %shre  = onnx.Constant dense<[24, 4, 64]>   : tensor<3xi64>
+  %unsq = "onnx.Unsqueeze"(%arg0, %axes)
+            : (tensor<3x4x64xf32>, tensor<1xi64>) -> tensor<3x1x4x64xf32>
+  %exp  = "onnx.Expand"(%unsq, %shexp)
+            : (tensor<3x1x4x64xf32>, tensor<4xi64>) -> tensor<3x8x4x64xf32>
+  %resh = "onnx.Reshape"(%exp, %shre) <{allowzero = 0 : si64}>
+            : (tensor<3x8x4x64xf32>, tensor<3xi64>) -> tensor<24x4x64xf32>
+  %out  = "zhigh.Stick"(%resh) {layout = "3DS"}
+            : (tensor<24x4x64xf32>) -> tensor<24x4x64xf16, #zhigh.layout<{dataLayout = "3DS"}>>
+  return %out : tensor<24x4x64xf16, #zhigh.layout<{dataLayout = "3DS"}>>
+
+// CHECK-LABEL:  func.func @expand_stick_no_mul
+// CHECK-SAME:   ([[PARAM_0_:%.+]]: tensor<3x4x64xf32>)
+// CHECK:           [[VAR_0_:%.+]] = "onnx.Fused"([[PARAM_0_]]) <{kind = "zhigh.expand-mul-stick"}>
+// CHECK-DAG:           onnx.Constant dense<1>
+// CHECK-DAG:           onnx.Constant{{.*}}[3, 8, 4, 64]
+// CHECK-DAG:           onnx.Constant{{.*}}[24, 4, 64]
+// Verify the four chain ops are inside the fused body, with no onnx.Mul:
+// CHECK:           "onnx.Unsqueeze"{{.*}}-> tensor<3x1x4x64xf32>
+// CHECK:           "onnx.Expand"{{.*}}-> tensor<3x8x4x64xf32>
+// CHECK-NOT:       "onnx.Mul"
+// CHECK:           "onnx.Reshape"{{.*}}-> tensor<24x4x64xf32>
+// CHECK:           "zhigh.Stick"{{.*}}-> tensor<24x4x64xf16, #zhigh.layout<{dataLayout = "3DS"}>>
+// CHECK:           onnx.Yield
+// mulScalar stays at its neutral default:
+// CHECK:           expansionN = 8{{.*}}mulScalar = 1.000000e+00{{.*}}reshapeCollapsedCount = 2{{.*}}reshapeFirstCollapsedDim = 0{{.*}}stickFormat = "3DS"{{.*}}unsqueezedPosition = 1
+// CHECK:           return [[VAR_0_]] : tensor<24x4x64xf16, #zhigh.layout<{dataLayout = "3DS"}>>
+// CHECK:           }
 }
 
 // -----

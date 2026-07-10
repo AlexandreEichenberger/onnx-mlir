@@ -36,7 +36,7 @@
 #include "src/Dialect/ONNX/ONNXOps/OpHelper.hpp"
 #include "src/Pass/Passes.hpp"
 
-#define DEBUG_TYPE "fusion-op-stick-unstick"
+#define DEBUG_TYPE "op-fusion"
 
 // If set to 1, enable multiple distinct layouts to elementwise compute
 // operations; 0 otherwise. We can support the "compiler supported" layouts

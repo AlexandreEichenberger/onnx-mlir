@@ -2857,8 +2857,15 @@ struct ZHighToZLowFusedExpandMulStickLowering
     }
     UnifiedStickSupportList uss(
         create.krnl, ussVals, ussMemRefs, isReads, isWrites, disableSaturation);
-    Value scalarConst =
-        create.math.constant(rewriter.getF32Type(), (double)mulScalar);
+    // A neutral (1.f) scalar means the source chain had no Mul op at all
+    // (ExpandMulStickFusion::detectIfBeneficial leaves mulScalar at its
+    // default when the Mul step is absent); skip the multiply entirely
+    // rather than emitting a multiply-by-one.
+    bool hasMulScalar = mulScalar != 1.0f;
+    Value scalarConst = hasMulScalar
+                             ? create.math.constant(
+                                   rewriter.getF32Type(), (double)mulScalar)
+                             : nullptr;
 
     create.krnl.iterateIE(loopDef, loopDef, lbs, ubs,
         [&](const KrnlBuilder &ck, ValueRange indices) {
@@ -2890,13 +2897,18 @@ struct ZHighToZLowFusedExpandMulStickLowering
                   Value highIn, lowIn;
                   uss.list[0].get4xF32Vals(highIn, lowIn);
 
-                  // Scale once and convert to dlf16 once, then reuse the same
-                  // converted vector for all N write slots — avoids redoing
-                  // the saturate+convert step N times for identical values.
+                  // Scale once (if there is a scalar to apply) and convert to
+                  // dlf16 once, then reuse the same converted vector for all
+                  // N write slots — avoids redoing the saturate+convert step
+                  // N times for identical values.
                   MultiDialectBuilder<MathBuilder, ZLowBuilder> mcreate(
                       create.krnl);
-                  Value highScaled = mcreate.math.mul(highIn, scalarConst);
-                  Value lowScaled = mcreate.math.mul(lowIn, scalarConst);
+                  Value highScaled = hasMulScalar
+                                          ? mcreate.math.mul(highIn, scalarConst)
+                                          : highIn;
+                  Value lowScaled = hasMulScalar
+                                         ? mcreate.math.mul(lowIn, scalarConst)
+                                         : lowIn;
                   Value dlf16 = mcreate.zlow.convertF32ToDLF16(
                       highScaled, lowScaled, disableSaturation);
 
