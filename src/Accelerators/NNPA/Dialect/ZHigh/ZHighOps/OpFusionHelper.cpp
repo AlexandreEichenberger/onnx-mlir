@@ -576,8 +576,7 @@ bool ExpandMulStickFusion::detectIfBeneficial(
     // Identify the scalar operand (accept either argument order).
     Value lhs = mulOp.getA();
     Value rhs = mulOp.getB();
-    Value scalarVal =
-        (lhs == current) ? rhs : (rhs == current) ? lhs : nullptr;
+    Value scalarVal = (lhs == current) ? rhs : (rhs == current) ? lhs : nullptr;
     if (!scalarVal)
       return returnFailure("mul: neither operand comes from the chain");
 
@@ -668,7 +667,8 @@ bool ExpandMulStickFusion::retrieveAttrs(ONNXFusedOp fusedOp) {
 }
 
 bool ExpandMulStickFusion::verify() const {
-  constexpr int expectedWithMul = 5;    // unsqueeze + expand + mul + reshape + stick
+  constexpr int expectedWithMul =
+      5; // unsqueeze + expand + mul + reshape + stick
   constexpr int expectedWithoutMul = 4; // unsqueeze + expand + reshape + stick
   bool hasMul;
   if ((int64_t)ops.size() == expectedWithMul) {

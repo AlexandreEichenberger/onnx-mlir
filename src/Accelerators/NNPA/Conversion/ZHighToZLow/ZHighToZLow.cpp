@@ -2768,8 +2768,8 @@ struct ZHighToZLowFusedExpandMulStickLowering
   using OpAdaptor = typename ONNXFusedOp::Adaptor;
   bool disableSaturation = false;
 
-  ZHighToZLowFusedExpandMulStickLowering(TypeConverter &typeConverter,
-      MLIRContext *ctx, bool disableSaturation)
+  ZHighToZLowFusedExpandMulStickLowering(
+      TypeConverter &typeConverter, MLIRContext *ctx, bool disableSaturation)
       : Base(typeConverter, ctx), disableSaturation(disableSaturation) {}
 
   FailureOr<Value> lowerVerified(ONNXFusedOp fusedOp, OpAdaptor adaptor,
@@ -2784,8 +2784,9 @@ struct ZHighToZLowFusedExpandMulStickLowering
     IndexExprScope funcScope(create.krnl);
 
     Operation *op = fusedOp.getOperation();
-    Value inputMemRef = adaptor.getInputs()[0];   // lowered memref, plain F32
-    Value inputTensor = fusedOp.getInputs()[0];   // tensor, for UnifiedStickSupport
+    Value inputMemRef = adaptor.getInputs()[0]; // lowered memref, plain F32
+    Value inputTensor =
+        fusedOp.getInputs()[0]; // tensor, for UnifiedStickSupport
     Value outputTensor = fusedOp.getOutputs()[0]; // tensor-typed zTensor result
 
     int64_t P = fusion.unsqueezedPosition;
@@ -2832,8 +2833,10 @@ struct ZHighToZLowFusedExpandMulStickLowering
 
     // Allocate the output buffer: always a ZTensor (the chain always ends in
     // ZHighStickOp).
-    ZMemRefType zMemRefType = convertZTensorToMemRefType(outputTensor.getType());
-    Value allocVal = insertAllocForZMemRef(zMemRefType, outputDims, op, rewriter);
+    ZMemRefType zMemRefType =
+        convertZTensorToMemRefType(outputTensor.getType());
+    Value allocVal =
+        insertAllocForZMemRef(zMemRefType, outputDims, op, rewriter);
 
     // Loop over the *original* input's iteration space (rank R), tiling only
     // the innermost dim by 64 (exact division, guaranteed by fusion
@@ -2862,10 +2865,10 @@ struct ZHighToZLowFusedExpandMulStickLowering
     // default when the Mul step is absent); skip the multiply entirely
     // rather than emitting a multiply-by-one.
     bool hasMulScalar = mulScalar != 1.0f;
-    Value scalarConst = hasMulScalar
-                             ? create.math.constant(
-                                   rewriter.getF32Type(), (double)mulScalar)
-                             : nullptr;
+    Value scalarConst =
+        hasMulScalar
+            ? create.math.constant(rewriter.getF32Type(), (double)mulScalar)
+            : nullptr;
 
     create.krnl.iterateIE(loopDef, loopDef, lbs, ubs,
         [&](const KrnlBuilder &ck, ValueRange indices) {
@@ -2904,11 +2907,11 @@ struct ZHighToZLowFusedExpandMulStickLowering
                   MultiDialectBuilder<MathBuilder, ZLowBuilder> mcreate(
                       create.krnl);
                   Value highScaled = hasMulScalar
-                                          ? mcreate.math.mul(highIn, scalarConst)
-                                          : highIn;
+                                         ? mcreate.math.mul(highIn, scalarConst)
+                                         : highIn;
                   Value lowScaled = hasMulScalar
-                                         ? mcreate.math.mul(lowIn, scalarConst)
-                                         : lowIn;
+                                        ? mcreate.math.mul(lowIn, scalarConst)
+                                        : lowIn;
                   Value dlf16 = mcreate.zlow.convertF32ToDLF16(
                       highScaled, lowScaled, disableSaturation);
 
