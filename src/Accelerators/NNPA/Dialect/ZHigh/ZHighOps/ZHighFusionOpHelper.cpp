@@ -2,13 +2,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//===-------- OpFusionHelper.cpp - ZHigh Fusion Helper Functions ----------===//
+//===-------- ZHighFusionOpHelper.cpp - ZHigh Fusion Helper Functions -----===//
 //
 // Copyright 2026 The IBM Research Authors.
 //
 // =============================================================================
 
-#include "src/Accelerators/NNPA/Dialect/ZHigh/ZHighOps/OpFusionHelper.hpp"
+#include "src/Accelerators/NNPA/Dialect/ZHigh/ZHighOps/ZHighFusionOpHelper.hpp"
 #include "src/Accelerators/NNPA/Dialect/ZHigh/ZHighOps/OpHelper.hpp"
 #include "src/Accelerators/NNPA/Support/LayoutHelper.hpp"
 #include "src/Dialect/ONNX/ONNXOps/OpHelper.hpp"

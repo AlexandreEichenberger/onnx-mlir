@@ -2,13 +2,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//===------------ FusionOpChain.cpp - ONNXFusedOp builder base -----------===//
+//===------------ FusionOpHelper.cpp - ONNXFusedOp builder base ----------===//
 //
 // Copyright 2026 The IBM Research Authors.
 //
 // =============================================================================
 
-#include "src/Dialect/ONNX/ONNXOps/FusionOpChain.hpp"
+#include "src/Dialect/ONNX/Transforms/FusionOpHelper.hpp"
 
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/IRMapping.h"
@@ -16,21 +16,21 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/Debug.h"
 
-#define DEBUG_TYPE "fusion-op-chain"
+#define DEBUG_TYPE "fusion-op-helper"
 
 using namespace mlir;
 
 namespace onnx_mlir {
 
 //===----------------------------------------------------------------------===//
-// FusionOpChain — non-virtual method implementations
+// FusionOpKindHelper — non-virtual method implementations
 //===----------------------------------------------------------------------===//
 
-bool FusionOpChain::isInsideFusedOp(Operation *op) {
+bool FusionOpKindHelper::isInsideFusedOp(Operation *op) {
   return mlir::isa<ONNXFusedOp>(op->getParentOp());
 }
 
-ONNXFusedOp FusionOpChain::createFusedOp(
+ONNXFusedOp FusionOpKindHelper::createFusedOp(
     PatternRewriter &rewriter, Location loc, StringRef kind) {
   // Build the set of values produced by the chain ops themselves; these
   // are visible inside the body via the clone mapping and never external.
@@ -123,7 +123,7 @@ ONNXFusedOp FusionOpChain::createFusedOp(
   return fusedOp;
 }
 
-ONNXFusedOp FusionOpChain::fuse(PatternRewriter &rewriter, Location loc) {
+ONNXFusedOp FusionOpKindHelper::fuse(PatternRewriter &rewriter, Location loc) {
   assert(!ops.empty() && "fuse() called with empty ops list");
   rewriter.setInsertionPoint(ops.back());
   ONNXFusedOp fusedOp = create(rewriter, loc);
@@ -131,13 +131,13 @@ ONNXFusedOp FusionOpChain::fuse(PatternRewriter &rewriter, Location loc) {
   return fusedOp;
 }
 
-ONNXFusedOp FusionOpChain::create(PatternRewriter &rewriter, Location loc) {
+ONNXFusedOp FusionOpKindHelper::create(PatternRewriter &rewriter, Location loc) {
   ONNXFusedOp fusedOp = createFusedOp(rewriter, loc, getKind());
   embedAttrs(fusedOp);
   return fusedOp;
 }
 
-void FusionOpChain::retrieveOpsAndOutputValues(ONNXFusedOp fusedOp) {
+void FusionOpKindHelper::retrieveOpsAndOutputValues(ONNXFusedOp fusedOp) {
   ops.clear();
   finalResults.clear();
   Block &body = fusedOp.getBody().front();
@@ -156,7 +156,7 @@ void FusionOpChain::retrieveOpsAndOutputValues(ONNXFusedOp fusedOp) {
   }
 }
 
-void FusionOpChain::replaceAndErase(
+void FusionOpKindHelper::replaceAndErase(
     PatternRewriter &rewriter, ONNXFusedOp fusedOp) {
   DenseMap<Value, unsigned> outputMap;
   for (auto [idx, v] : llvm::enumerate(finalResults))
@@ -171,23 +171,24 @@ void FusionOpChain::replaceAndErase(
   }
 }
 
-bool FusionOpChain::verifyAndRetrieveAttrs(ONNXFusedOp fusedOp) {
+bool FusionOpKindHelper::verifyAndRetrieveAttrs(ONNXFusedOp fusedOp) {
   if (!retrieveAttrs(fusedOp)) {
-    LLVM_DEBUG(llvm::dbgs() << "FusionOpChain: retrieveAttrs failed for kind '"
-                            << fusedOp.getKind() << "'\n");
+    LLVM_DEBUG(llvm::dbgs()
+               << "FusionOpKindHelper: retrieveAttrs failed for kind '"
+               << fusedOp.getKind() << "'\n");
     return false;
   }
   if (!verify()) {
-    LLVM_DEBUG(llvm::dbgs() << "FusionOpChain: verify failed for kind '"
+    LLVM_DEBUG(llvm::dbgs() << "FusionOpKindHelper: verify failed for kind '"
                             << fusedOp.getKind() << "'\n");
     return false;
   }
   return true;
 }
 
-LogicalResult FusionOpChain::inlineFallback(
+LogicalResult FusionOpKindHelper::unFuse(
     PatternRewriter &rewriter, ONNXFusedOp fusedOp) {
-  LLVM_DEBUG(llvm::dbgs() << "FusionOpChain::inlineFallback: inlining "
+  LLVM_DEBUG(llvm::dbgs() << "FusionOpKindHelper::unFuse: inlining "
                           << "onnx.Fused (kind='" << fusedOp.getKind()
                           << "') — no dedicated lowering or verify failed\n");
   Block &body = fusedOp.getBody().front();

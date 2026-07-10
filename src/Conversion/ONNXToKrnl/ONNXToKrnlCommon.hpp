@@ -43,7 +43,7 @@
 #include "src/Dialect/ONNX/DialectBuilder.hpp"
 #include "src/Dialect/ONNX/ONNXDimAnalysis.hpp"
 #include "src/Dialect/ONNX/ONNXOps.hpp"
-#include "src/Dialect/ONNX/ONNXOps/FusionOpChain.hpp"
+#include "src/Dialect/ONNX/Transforms/FusionOpHelper.hpp"
 #include "src/Dialect/ONNX/ONNXOps/OpHelper.hpp"
 #include "src/Pass/Passes.hpp"
 #include "src/Support/KrnlSupport.hpp"
@@ -662,7 +662,7 @@ struct FusedOpKindLowering
     if (!fusion.verifyAndRetrieveAttrs(fusedOp))
       // Failed, use the inline fallback to allow constituent ops to be
       // lowered on their own.
-      return FusionOpChain::inlineFallback(rewriter, fusedOp);
+      return FusionOpKindHelper::unFuse(rewriter, fusedOp);
 
     mlir::FailureOr<mlir::Value> replacement =
         lowerVerified(fusedOp, adaptor, rewriter, fusion);

@@ -2,14 +2,15 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//===-------- OpFusionHelper.hpp - ZHigh Fusion Helper Functions ----------===//
+//===-------- ZHighFusionOpHelper.hpp - ZHigh Fusion Helper Functions -----===//
 //
 // Copyright 2026 The IBM Research Authors.
 //
 // =============================================================================
 //
-// ZHigh-specific fusion subclass built on top of the generic FusionOpChain
-// base class (src/Dialect/ONNX/ONNXOps/FusionOpChain.hpp).
+// ZHigh-specific fusion subclass built on top of the generic
+// FusionOpKindHelper base class
+// (src/Dialect/ONNX/Transforms/FusionOpHelper.hpp).
 //
 // Convention: all zhigh related fusion should use a "zhigh." prefixed kind
 // name, to facilitate the lowering of fused ops.
@@ -32,8 +33,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef ONNX_MLIR_ZHIGH_OP_FUSION_HELPER_H
-#define ONNX_MLIR_ZHIGH_OP_FUSION_HELPER_H
+#ifndef ONNX_MLIR_ZHIGH_FUSION_OP_HELPER_H
+#define ONNX_MLIR_ZHIGH_FUSION_OP_HELPER_H
 
 #include <optional>
 #include <string>
@@ -43,7 +44,7 @@
 
 #include "src/Accelerators/NNPA/Dialect/ZHigh/ZHighOps.hpp"
 #include "src/Dialect/ONNX/ONNXDimAnalysis.hpp"
-#include "src/Dialect/ONNX/ONNXOps/FusionOpChain.hpp"
+#include "src/Dialect/ONNX/Transforms/FusionOpHelper.hpp"
 
 namespace onnx_mlir {
 namespace zhigh {
@@ -62,7 +63,7 @@ namespace zhigh {
 //     OR ZHighDLF16ToF32Op (opt.)   DLF16 => F32            (step 5b)
 //===----------------------------------------------------------------------===//
 
-class ExtLayoutTransformFusion : public onnx_mlir::FusionOpChain {
+class ExtLayoutTransformFusion : public onnx_mlir::FusionOpKindHelper {
 public:
   static constexpr llvm::StringLiteral kKind{"zhigh.extended_layout_transform"};
 
@@ -78,7 +79,7 @@ public:
 
   /// Detect and parameterize the extended layout transform chain.
   /// Resets ops, finalResults, and all param fields on entry.
-  /// Calls FusionOpChain::isInsideFusedOp() first to guard against infinite
+  /// Calls FusionOpKindHelper::isInsideFusedOp() first to guard against infinite
   /// rewrite loops (ops are moved, not erased, so patterns can re-match).
   /// \p dimAnalysis must be non-null.
   /// Returns true (and populates all fields) only when the chain passes all
@@ -113,7 +114,7 @@ public:
 // has exactly one use.  The stick result is not checked.
 //===----------------------------------------------------------------------===//
 
-class ExpandMulStickFusion : public onnx_mlir::FusionOpChain {
+class ExpandMulStickFusion : public onnx_mlir::FusionOpKindHelper {
 public:
   static constexpr llvm::StringLiteral kKind{"zhigh.expand-mul-stick"};
 
@@ -139,4 +140,4 @@ public:
 } // namespace zhigh
 } // namespace onnx_mlir
 
-#endif // ONNX_MLIR_ZHIGH_OP_FUSION_HELPER_H
+#endif // ONNX_MLIR_ZHIGH_FUSION_OP_HELPER_H

@@ -1122,7 +1122,7 @@ LogicalResult FusedOpInlineFallback::matchAndRewrite(
   fusedOp.emitWarning()
       << "no dedicated lowering for onnx.Fused (kind='" << fusedOp.getKind()
       << "'); inlining body as fallback — add a FusedOpKindLowering subclass";
-  return FusionOpChain::inlineFallback(rewriter, fusedOp);
+  return FusionOpKindHelper::unFuse(rewriter, fusedOp);
 }
 
 } // namespace onnx_mlir

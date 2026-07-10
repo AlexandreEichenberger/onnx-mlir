@@ -29,12 +29,12 @@
 #include "src/Accelerators/NNPA/Conversion/ONNXToZHigh/ONNXToZHighCommon.hpp"
 #include "src/Accelerators/NNPA/Conversion/ONNXToZHigh/RewriteONNXForZHigh.hpp"
 #include "src/Accelerators/NNPA/Dialect/ZHigh/ZHighOps.hpp"
-#include "src/Accelerators/NNPA/Dialect/ZHigh/ZHighOps/OpFusionHelper.hpp"
 #include "src/Accelerators/NNPA/Dialect/ZHigh/ZHighOps/OpHelper.hpp"
+#include "src/Accelerators/NNPA/Dialect/ZHigh/ZHighOps/ZHighFusionOpHelper.hpp"
 #include "src/Compiler/CompilerOptions.hpp"
 #include "src/Dialect/ONNX/ONNXOps.hpp"
-#include "src/Dialect/ONNX/ONNXOps/FusedOpPatternBase.hpp"
 #include "src/Dialect/ONNX/ONNXOps/OpHelper.hpp"
+#include "src/Dialect/ONNX/Transforms/FusionOpBasePattern.hpp"
 #include "src/Pass/Passes.hpp"
 
 #define DEBUG_TYPE "op-fusion"
@@ -840,19 +840,19 @@ public:
 //   tensor) are cloned inside the region rather than threaded as inputs.
 // - ONNXYieldOp terminates the body, yielding the final result value.
 //
-// FusedOpKindPattern is generic, non-accelerator infrastructure; see
-// src/Dialect/ONNX/ONNXOps/FusedOpPatternBase.hpp.
+// FusedPatternForOpKind is generic, non-accelerator infrastructure; see
+// src/Dialect/ONNX/Transforms/FusionOpBasePattern.hpp.
 //===----------------------------------------------------------------------===//
 
 // Anchors on ONNXLayoutTransformOp; ExtLayoutTransformFusion walks forward
 // through the optional Reshape/Transpose/Reshape/LayoutTransform chain.
 using FusedPatternsForExtendedLayoutTransform =
-    FusedOpKindPattern<ONNXLayoutTransformOp, ExtLayoutTransformFusion>;
+    FusedPatternForOpKind<ONNXLayoutTransformOp, ExtLayoutTransformFusion>;
 
 // Anchors on ONNXUnsqueezeOp (head of the chain); ExpandMulStickFusion walks
 // forward through Expand -> Mul -> Reshape -> ZHighStickOp.
 using FusedPatternsForExpandMulStick =
-    FusedOpKindPattern<ONNXUnsqueezeOp, ExpandMulStickFusion>;
+    FusedPatternForOpKind<ONNXUnsqueezeOp, ExpandMulStickFusion>;
 
 //===----------------------------------------------------------------------===//
 // Pass.
