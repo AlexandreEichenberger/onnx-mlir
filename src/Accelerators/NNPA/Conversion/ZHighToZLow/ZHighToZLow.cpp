@@ -35,7 +35,6 @@
 #include "src/Conversion/ONNXToKrnl/ONNXToKrnlCommon.hpp"
 #include "src/Conversion/ONNXToKrnl/Quantization/QuantizeHelper.hpp"
 #include "src/Dialect/Krnl/KrnlHelper.hpp"
-#include "src/Dialect/ONNX/ONNXOps/FusedOpLoweringBase.hpp"
 #include "src/Support/TypeUtilities.hpp"
 
 #define DEBUG_TYPE "zhigh-to-zlow"

@@ -33,6 +33,7 @@
 #include "src/Accelerators/NNPA/Dialect/ZHigh/ZHighOps/OpHelper.hpp"
 #include "src/Compiler/CompilerOptions.hpp"
 #include "src/Dialect/ONNX/ONNXOps.hpp"
+#include "src/Dialect/ONNX/ONNXOps/FusedOpPatternBase.hpp"
 #include "src/Dialect/ONNX/ONNXOps/OpHelper.hpp"
 #include "src/Pass/Passes.hpp"
 
@@ -831,66 +832,27 @@ public:
 };
 
 //===----------------------------------------------------------------------===//
-// FusedOp variant of PatternsForExtendedLayoutTransform.
-//
-// Creates an ONNXFusedOp(kind="zhigh.extended_layout_transform") in place of
-// ZHighExtendedLayoutTransformOp.  The body region is IsolatedFromAbove:
+// FusedOp patterns: match an anchor op, detect a fusible chain starting from
+// it, and replace the chain with an ONNXFusedOp of the corresponding kind.
+// The body region is IsolatedFromAbove:
 // - The source ZTensor is threaded in as block argument 0.
 // - Constant-producing ops needed by inner ops (e.g. ONNXReshapeOp's shape
 //   tensor) are cloned inside the region rather than threaded as inputs.
 // - ONNXYieldOp terminates the body, yielding the final result value.
 //
-// This class inherits from PatternsForExtendedLayoutTransform to reuse its
-// matching helpers (locateReshapeSplit, locateReshapeMerge, locatePattern).
+// FusedOpKindPattern is generic, non-accelerator infrastructure; see
+// src/Dialect/ONNX/ONNXOps/FusedOpPatternBase.hpp.
 //===----------------------------------------------------------------------===//
 
-// Walk the use-def chain from initialLT's output to finalResult, collecting
-// each single-use op in order.  locatePattern's usedOnlyBy<> checks already
-// guarantee exactly one use at each step.
+// Anchors on ONNXLayoutTransformOp; ExtLayoutTransformFusion walks forward
+// through the optional Reshape/Transpose/Reshape/LayoutTransform chain.
+using FusedPatternsForExtendedLayoutTransform =
+    FusedOpKindPattern<ONNXLayoutTransformOp, ExtLayoutTransformFusion>;
 
-class FusedPatternsForExtendedLayoutTransform
-    : public PatternsForExtendedLayoutTransform {
-public:
-  FusedPatternsForExtendedLayoutTransform(
-      MLIRContext *context, DimAnalysis *dimAnalysis)
-      : PatternsForExtendedLayoutTransform(context, dimAnalysis) {}
-
-  LogicalResult matchAndRewrite(ONNXLayoutTransformOp layoutTransformOp,
-      PatternRewriter &rewriter) const override {
-    ExtLayoutTransformFusion fusion;
-    if (!fusion.detectIfBeneficial(dimAnalysis, layoutTransformOp))
-      return failure();
-
-    Location loc = layoutTransformOp.getLoc();
-    fusion.fuse(rewriter, loc);
-    return success();
-  }
-};
-
-//===----------------------------------------------------------------------===//
-// FusedOp variant for the expand-mul-stick pattern.
-//
-// Anchors on ONNXUnsqueezeOp (head of the chain) and walks forward through
-// Expand -> Mul -> Reshape -> ZHighStickOp.
-//===----------------------------------------------------------------------===//
-
-class FusedPatternsForExpandMulStick
-    : public OpRewritePattern<ONNXUnsqueezeOp> {
-  DimAnalysis *dimAnalysis;
-
-public:
-  FusedPatternsForExpandMulStick(MLIRContext *context, DimAnalysis *dimAnalysis)
-      : OpRewritePattern(context), dimAnalysis(dimAnalysis) {}
-
-  LogicalResult matchAndRewrite(
-      ONNXUnsqueezeOp unsqueezeOp, PatternRewriter &rewriter) const override {
-    ExpandMulStickFusion fusion;
-    if (!fusion.detectIfBeneficial(dimAnalysis, unsqueezeOp))
-      return failure();
-    fusion.fuse(rewriter, unsqueezeOp.getLoc());
-    return success();
-  }
-};
+// Anchors on ONNXUnsqueezeOp (head of the chain); ExpandMulStickFusion walks
+// forward through Expand -> Mul -> Reshape -> ZHighStickOp.
+using FusedPatternsForExpandMulStick =
+    FusedOpKindPattern<ONNXUnsqueezeOp, ExpandMulStickFusion>;
 
 //===----------------------------------------------------------------------===//
 // Pass.

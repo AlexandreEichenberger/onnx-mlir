@@ -23,7 +23,6 @@
 #include "src/Compiler/OptionUtils.hpp"
 #include "src/Conversion/ONNXToKrnl/ONNXToKrnlCommon.hpp"
 #include "src/Dialect/Mlir/VectorMachineSupport.hpp"
-#include "src/Dialect/ONNX/ONNXOps/FusedOpLoweringBase.hpp"
 
 using namespace mlir;
 
