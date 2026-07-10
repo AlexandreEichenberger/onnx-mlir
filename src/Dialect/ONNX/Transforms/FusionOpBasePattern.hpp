@@ -48,8 +48,8 @@ public:
       : mlir::OpRewritePattern<AnchorOpType>(context, 1),
         dimAnalysis(dimAnalysis) {}
 
-  mlir::LogicalResult matchAndRewrite(AnchorOpType anchorOp,
-      mlir::PatternRewriter &rewriter) const override {
+  mlir::LogicalResult matchAndRewrite(
+      AnchorOpType anchorOp, mlir::PatternRewriter &rewriter) const override {
     FusionT fusion;
     if (!fusion.detectIfBeneficial(dimAnalysis, anchorOp))
       return mlir::failure();

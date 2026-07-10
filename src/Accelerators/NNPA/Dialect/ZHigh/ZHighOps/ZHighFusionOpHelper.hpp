@@ -79,11 +79,11 @@ public:
 
   /// Detect and parameterize the extended layout transform chain.
   /// Resets ops, finalResults, and all param fields on entry.
-  /// Calls FusionOpKindHelper::isInsideFusedOp() first to guard against infinite
-  /// rewrite loops (ops are moved, not erased, so patterns can re-match).
-  /// \p dimAnalysis must be non-null.
-  /// Returns true (and populates all fields) only when the chain passes all
-  /// validation and the beneficial threshold.
+  /// Calls FusionOpKindHelper::isInsideFusedOp() first to guard against
+  /// infinite rewrite loops (ops are moved, not erased, so patterns can
+  /// re-match). \p dimAnalysis must be non-null. Returns true (and populates
+  /// all fields) only when the chain passes all validation and the beneficial
+  /// threshold.
   bool detectIfBeneficial(
       const DimAnalysis *dimAnalysis, mlir::ONNXLayoutTransformOp startOp);
 

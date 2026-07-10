@@ -16,7 +16,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/Debug.h"
 
-#define DEBUG_TYPE "fusion-op-helper"
+#define DEBUG_TYPE "op-fusion"
 
 using namespace mlir;
 
@@ -131,7 +131,8 @@ ONNXFusedOp FusionOpKindHelper::fuse(PatternRewriter &rewriter, Location loc) {
   return fusedOp;
 }
 
-ONNXFusedOp FusionOpKindHelper::create(PatternRewriter &rewriter, Location loc) {
+ONNXFusedOp FusionOpKindHelper::create(
+    PatternRewriter &rewriter, Location loc) {
   ONNXFusedOp fusedOp = createFusedOp(rewriter, loc, getKind());
   embedAttrs(fusedOp);
   return fusedOp;
