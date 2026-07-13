@@ -53,7 +53,7 @@ class TestDecoderModel(TorchOMTestCase):
         om_options = {
             "compiler_image_name": COMPILER_IMAGE_NAME,
             "compiler_path": COMPILER_PATH,
-            "compile_options": "-O3 -march=z16 -maccel=NNPA --disable-fused-op",
+            "compile_options": "-O3 -march=z16 -maccel=NNPA",
         }
         model.forward = torch.compile(
             model.forward,
