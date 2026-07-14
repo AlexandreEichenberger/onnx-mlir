@@ -566,8 +566,7 @@ static bool exploreSameDimsUsingShapeInput(const DimAnalysis::DimT &dim,
       int64_t outRank = (int64_t)shapeVals.size();
       int64_t dataAxis = dataRank - (outRank - (int64_t)outputDimIndex);
       if (dataAxis >= 0 && dataAxis < dataRank &&
-          dataType.isDynamicDim(dataAxis) &&
-          shapeVals[outputDimIndex] == 1) {
+          dataType.isDynamicDim(dataAxis) && shapeVals[outputDimIndex] == 1) {
         if (auto d = insertDimWhenUseful(data, dataAxis, sameDims))
           LLVM_DEBUG(llvm::dbgs()
                      << "  - [Expand-passthrough] Added a new dim("
@@ -1575,7 +1574,8 @@ void DimAnalysis::visitDimForOffsets(DimT &dim) const {
     Value A = addOp.getA();
     Value B = addOp.getB();
 
-    if (auto constOp = resolveThroughFusedOp(B).getDefiningOp<ONNXConstantOp>()) {
+    if (auto constOp =
+            resolveThroughFusedOp(B).getDefiningOp<ONNXConstantOp>()) {
       int64_t offset = getScalarValue<int64_t>(constOp);
       DimT inputDim(A, dimIndex);
       dimRelations[inputDim].emplace_back(inputDim, offset, dim, 0);
@@ -1627,7 +1627,7 @@ void DimAnalysis::visitDimForOffsets(DimT &dim) const {
   // Special case: ONNXExpandOp with Add(Dim, Constant) in shape input.
   if (auto expandOp = mlir::dyn_cast<ONNXExpandOp>(op)) {
     if (auto concatOp = resolveThroughFusedOp(expandOp.getShape())
-                             .getDefiningOp<ONNXConcatOp>()) {
+                            .getDefiningOp<ONNXConcatOp>()) {
       int64_t currentIndex = 0;
       for (Value shapeInput : concatOp.getInputs()) {
         int64_t numElements =
