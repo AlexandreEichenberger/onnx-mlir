@@ -1145,9 +1145,20 @@ void DimAnalysis::visitDim(
   // operation semantics, by *exploring the defining operator*. We utilize the
   // operation's shape helper for this purpose as much as possible.
 
-  // Tensor is a block argument. There is no defining operator to explore.
-  if (mlir::isa<BlockArgument>(tensor))
+  // Tensor is a block argument. There is no defining operator to explore,
+  // except when it is an entry block argument of an ONNXFusedOp body: that
+  // argument is just an alias for the corresponding call-site operand at the
+  // same axis, so hook it up to that operand's dim.
+  if (auto arg = mlir::dyn_cast<BlockArgument>(tensor)) {
+    if (auto fusedOp = mlir::dyn_cast_or_null<ONNXFusedOp>(
+            arg.getOwner()->getParentOp())) {
+      Value input = fusedOp.getInputs()[arg.getArgNumber()];
+      if (auto d = insertDimWhenUseful(input, dimIndex, sameDims))
+        LLVM_DEBUG(llvm::dbgs() << "  - Added a new dim(" << d.value().first
+                                << ", " << d.value().second << ")\n");
+    }
     return;
+  }
 
   // Get the defining operator.
   Operation *op = tensor.getDefiningOp();
@@ -1155,6 +1166,22 @@ void DimAnalysis::visitDim(
   // Tensor is from a constant. Nothing to do further.
   if (isa<ONNXConstantOp>(op))
     return;
+
+  // FusedOp: the body is intentionally not re-inferred when this op is built
+  // (see ONNXFusedOp::inferShapes), so its result types are simply copied
+  // from the body's onnx.Yield operands and the generic ShapeHelper-based
+  // exploration below can't trace through it. Hook up the result dim
+  // directly to the corresponding onnx.Yield operand's dim instead.
+  if (auto fusedOp = mlir::dyn_cast<ONNXFusedOp>(op)) {
+    uint64_t resNum = mlir::cast<OpResult>(tensor).getResultNumber();
+    auto yieldOp =
+        mlir::cast<ONNXYieldOp>(fusedOp.getBody().front().getTerminator());
+    Value yieldOperand = yieldOp.getOperands()[resNum];
+    if (auto d = insertDimWhenUseful(yieldOperand, dimIndex, sameDims))
+      LLVM_DEBUG(llvm::dbgs() << "  - Added a new dim(" << d.value().first
+                              << ", " << d.value().second << ")\n");
+    return;
+  }
 
   // DimOp
   if (auto dimOp = mlir::dyn_cast<ONNXDimOp>(op)) {

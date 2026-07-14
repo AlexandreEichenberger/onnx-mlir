@@ -716,3 +716,60 @@ func.func @test_range_from_dim(%arg0: tensor<?x?xi64>) -> tensor<?xi64> {
 // CHECK:           return [[VAR_5_]] : tensor<?xi64>
 // CHECK:         }
 }
+
+// -----
+
+// COM: Check that dim groups propagate through the body of an onnx.Fused op:
+// COM: block arguments must be tied to the call-site operand's dim group
+// COM: (propagated in), and the op's result must be tied to the onnx.Yield
+// COM: operand's dim group inside the body (propagated out).
+func.func @test_fused_op_dim_propagation(%arg0: tensor<?x4x?x128xf32>) -> tensor<?x?x128xf32> {
+  %shape = onnx.Constant dense<[1, 4, 4, 1, 128]> : tensor<5xi64>
+  %reshape_shape = onnx.Constant dense<[0, -1, 128]> : tensor<3xi64>
+  %0 = "onnx.Fused"(%arg0, %shape, %reshape_shape) <{kind = "zhigh.expand-mul-stick"}> ({
+  ^bb0(%barg0: tensor<?x4x?x128xf32>, %barg1: tensor<5xi64>, %barg2: tensor<3xi64>):
+    %c0 = onnx.Constant dense<0.0879999995> : tensor<f32>
+    %ax = onnx.Constant dense<2> : tensor<1xi64>
+    %u = "onnx.Unsqueeze"(%barg0, %ax) : (tensor<?x4x?x128xf32>, tensor<1xi64>) -> tensor<?x4x1x?x128xf32>
+    %e = "onnx.Expand"(%u, %barg1) : (tensor<?x4x1x?x128xf32>, tensor<5xi64>) -> tensor<?x4x4x?x128xf32>
+    %m = "onnx.Mul"(%e, %c0) : (tensor<?x4x4x?x128xf32>, tensor<f32>) -> tensor<?x4x4x?x128xf32>
+    %r = "onnx.Reshape"(%m, %barg2) <{allowzero = 0 : si64}> : (tensor<?x4x4x?x128xf32>, tensor<3xi64>) -> tensor<?x?x128xf32>
+    onnx.Yield %r : tensor<?x?x128xf32>
+  }) {expansionN = 4 : i64, mulScalar = 0.0879999995 : f32, reshapeCollapsedCount = 3 : i64, reshapeFirstCollapsedDim = 0 : i64, stickFormat = "3DS", unsqueezedPosition = 2 : i64} : (tensor<?x4x?x128xf32>, tensor<5xi64>, tensor<3xi64>) -> tensor<?x?x128xf32>
+  %1 = "onnx.Add"(%0, %0) : (tensor<?x?x128xf32>, tensor<?x?x128xf32>) -> tensor<?x?x128xf32>
+  onnx.Return %1 : tensor<?x?x128xf32>
+
+// CHECK-LABEL:  func.func @test_fused_op_dim_propagation
+// CHECK-SAME:   ([[PARAM_0_:%.+]]: tensor<?x4x?x128xf32>) -> tensor<?x?x128xf32> {
+// CHECK-DAG:       [[VAR_0_:%.+]] = onnx.Constant dense<[0, -1, 128]> : tensor<3xi64>
+// CHECK-DAG:       [[VAR_1_:%.+]] = onnx.Constant dense<[1, 4, 4, 1, 128]> : tensor<5xi64>
+// CHECK:           "onnx.DimGroup"([[PARAM_0_]]) <{axis = 2 : si64, group_id = 1 : si64}> : (tensor<?x4x?x128xf32>) -> ()
+// CHECK:           "onnx.DimGroup"([[PARAM_0_]]) <{axis = 0 : si64, group_id = 0 : si64}> : (tensor<?x4x?x128xf32>) -> ()
+// CHECK:           [[VAR_2_:%.+]] = "onnx.Fused"([[PARAM_0_]], [[VAR_1_]], [[VAR_0_]]) <{kind = "zhigh.expand-mul-stick"}> ({
+// CHECK:           ^bb0([[BARG_0_:%.+]]: tensor<?x4x?x128xf32>, [[BARG_1_:%.+]]: tensor<5xi64>, [[BARG_2_:%.+]]: tensor<3xi64>):
+// CHECK-DAG:         [[VAR_4_:%.+]] = onnx.Constant dense<2> : tensor<1xi64>
+// CHECK-DAG:         [[VAR_5_:%.+]] = onnx.Constant dense<0.0879999995> : tensor<f32>
+// CHECK:             "onnx.DimGroup"([[BARG_0_]]) <{axis = 2 : si64, group_id = 1 : si64}> : (tensor<?x4x?x128xf32>) -> ()
+// CHECK:             "onnx.DimGroup"([[BARG_0_]]) <{axis = 0 : si64, group_id = 0 : si64}> : (tensor<?x4x?x128xf32>) -> ()
+// CHECK:             [[VAR_6_:%.+]] = "onnx.Unsqueeze"([[BARG_0_]], [[VAR_4_]]) : (tensor<?x4x?x128xf32>, tensor<1xi64>) -> tensor<?x4x1x?x128xf32>
+// CHECK:             "onnx.DimGroup"([[VAR_6_]]) <{axis = 3 : si64, group_id = 1 : si64}> : (tensor<?x4x1x?x128xf32>) -> ()
+// CHECK:             "onnx.DimGroup"([[VAR_6_]]) <{axis = 0 : si64, group_id = 0 : si64}> : (tensor<?x4x1x?x128xf32>) -> ()
+// CHECK:             [[VAR_7_:%.+]] = "onnx.Expand"([[VAR_6_]], [[BARG_1_]]) : (tensor<?x4x1x?x128xf32>, tensor<5xi64>) -> tensor<?x4x4x?x128xf32>
+// CHECK:             "onnx.DimGroup"([[VAR_7_]]) <{axis = 3 : si64, group_id = 5 : si64}> : (tensor<?x4x4x?x128xf32>) -> ()
+// CHECK:             "onnx.DimGroup"([[VAR_7_]]) <{axis = 0 : si64, group_id = 2 : si64}> : (tensor<?x4x4x?x128xf32>) -> ()
+// CHECK:             [[VAR_8_:%.+]] = "onnx.Mul"([[VAR_7_]], [[VAR_5_]]) : (tensor<?x4x4x?x128xf32>, tensor<f32>) -> tensor<?x4x4x?x128xf32>
+// CHECK:             "onnx.DimGroup"([[VAR_8_]]) <{axis = 3 : si64, group_id = 5 : si64}> : (tensor<?x4x4x?x128xf32>) -> ()
+// CHECK:             "onnx.DimGroup"([[VAR_8_]]) <{axis = 0 : si64, group_id = 2 : si64}> : (tensor<?x4x4x?x128xf32>) -> ()
+// CHECK:             [[VAR_9_:%.+]] = "onnx.Reshape"([[VAR_8_]], [[BARG_2_]]) <{allowzero = 0 : si64}> : (tensor<?x4x4x?x128xf32>, tensor<3xi64>) -> tensor<?x?x128xf32>
+// CHECK:             "onnx.DimGroup"([[VAR_9_]]) <{axis = 1 : si64, group_id = 11 : si64}> : (tensor<?x?x128xf32>) -> ()
+// CHECK:             "onnx.DimGroup"([[VAR_9_]]) <{axis = 0 : si64, group_id = 6 : si64}> : (tensor<?x?x128xf32>) -> ()
+// CHECK:             onnx.Yield [[VAR_9_]] : tensor<?x?x128xf32>
+// CHECK:           }) {expansionN = 4 : i64, mulScalar = 0.0879999995 : f32, reshapeCollapsedCount = 3 : i64, reshapeFirstCollapsedDim = 0 : i64, stickFormat = "3DS", unsqueezedPosition = 2 : i64} : (tensor<?x4x?x128xf32>, tensor<5xi64>, tensor<3xi64>) -> tensor<?x?x128xf32>
+// CHECK:           "onnx.DimGroup"([[VAR_2_]]) <{axis = 1 : si64, group_id = 11 : si64}> : (tensor<?x?x128xf32>) -> ()
+// CHECK:           "onnx.DimGroup"([[VAR_2_]]) <{axis = 0 : si64, group_id = 6 : si64}> : (tensor<?x?x128xf32>) -> ()
+// CHECK:           [[VAR_3_:%.+]] = "onnx.Add"([[VAR_2_]], [[VAR_2_]]) : (tensor<?x?x128xf32>, tensor<?x?x128xf32>) -> tensor<?x?x128xf32>
+// CHECK:           "onnx.DimGroup"([[VAR_3_]]) <{axis = 1 : si64, group_id = 11 : si64}> : (tensor<?x?x128xf32>) -> ()
+// CHECK:           "onnx.DimGroup"([[VAR_3_]]) <{axis = 0 : si64, group_id = 6 : si64}> : (tensor<?x?x128xf32>) -> ()
+// CHECK:           onnx.Return [[VAR_3_]] : tensor<?x?x128xf32>
+// CHECK:         }
+}
