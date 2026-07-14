@@ -77,6 +77,28 @@ static bool hasUnrankedInputOutput(Operation *op) {
   return false;
 }
 
+/// If `v` is (transitively) a block argument threaded into an ONNXFusedOp's
+/// isolated body, return the call-site operand that actually feeds it --
+/// the value whose provenance (constant-ness, Concat/Dim chain, etc.)
+/// exploration helpers below need to see past the region boundary in order
+/// to inspect via `getDefiningOp()`. Otherwise return `v` unchanged.
+///
+/// This is deliberately NOT baked into `insertDimWhenUseful`: callers that
+/// want the visible DimGroup annotation to still show up on the block
+/// argument itself (so the propagation is observable in the dumped IR) must
+/// keep inserting the raw block argument there and only resolve here, at
+/// the point where some *other* value's structure is being inspected.
+static Value resolveThroughFusedOp(Value v) {
+  while (auto arg = mlir::dyn_cast<BlockArgument>(v)) {
+    auto fusedOp =
+        mlir::dyn_cast_or_null<ONNXFusedOp>(arg.getOwner()->getParentOp());
+    if (!fusedOp)
+      break;
+    v = fusedOp.getInputs()[arg.getArgNumber()];
+  }
+  return v;
+}
+
 /// Insert a dynamic dimension into the analysis sets.
 /// It is expected that the shape-related operations were simplified by
 /// `simplify-shape-related-ops-onnx` pass before this analysis pass. Thus,
@@ -503,18 +525,59 @@ static bool exploreSameDimsUsingShapeInput(const DimAnalysis::DimT &dim,
   if (!shapeInput)
     return false;
 
-  // If it is not from Concat (e.g. shape operations are not simplified to
-  // Concat), we would not have enough information.
-  if (!areDimsFromConcat(shapeInput))
-    return false;
+  // See past an ONNXFusedOp body's block-argument boundary: the shape
+  // tensor is very often threaded in as an opaque call-site operand (it's
+  // not always a pure literal -- e.g. a Concat of onnx.Dim-derived values
+  // computed outside the fused region), so resolve it to what's actually
+  // feeding it before inspecting its structure below.
+  shapeInput = resolveThroughFusedOp(shapeInput);
 
-  SmallVector<Value, 4> dims;
-  getDims(shapeInput, dims);
-  if (auto d =
-          insertDimWhenUseful(dims[inputDimIndex], inputDimIndex, sameDims))
-    LLVM_DEBUG(llvm::dbgs() << "  - Added a new dim(" << d.value().first << ", "
-                            << d.value().second << ")\n");
-  return true;
+  // If it is from Concat (e.g. shape operations simplified to Concat by
+  // `simplify-shape-related-ops-onnx`), each element may trace back to a
+  // specific dynamic dim.
+  if (areDimsFromConcat(shapeInput)) {
+    SmallVector<Value, 4> dims;
+    getDims(shapeInput, dims);
+    if (auto d =
+            insertDimWhenUseful(dims[inputDimIndex], inputDimIndex, sameDims))
+      LLVM_DEBUG(llvm::dbgs() << "  - Added a new dim(" << d.value().first
+                              << ", " << d.value().second << ")\n");
+    return true;
+  }
+
+  // Special case for Expand: per ONNX broadcasting semantics, if the
+  // requested target size at this axis is literally 1, the output dim is
+  // unchanged from the data operand's own (dynamic) dim at that axis. The
+  // ShapeHelper-based exploration (`exploreSameDimsUsingShapeHelper`, tried
+  // before this function) already derives this generically via IndexExpr
+  // symbol passthrough when it can read the shape tensor's literal
+  // elements -- but that read happens through the generic IndexExprBuilder,
+  // which doesn't know how to see past an ONNXFusedOp's block argument, so
+  // it silently fails to confirm the target is 1 and falls back to
+  // synthesizing a brand-new, disconnected dim. Handle it explicitly here
+  // instead, using the already-resolved `shapeInput`.
+  if (auto expandOp = mlir::dyn_cast<ONNXExpandOp>(op)) {
+    SmallVector<int64_t, 4> shapeVals;
+    Value data = expandOp.getInput();
+    if (getI64ValuesFromONNXConstantOp(shapeInput, shapeVals) &&
+        hasShapeAndRank(data)) {
+      auto dataType = mlir::cast<ShapedType>(data.getType());
+      int64_t dataRank = dataType.getRank();
+      int64_t outRank = (int64_t)shapeVals.size();
+      int64_t dataAxis = dataRank - (outRank - (int64_t)outputDimIndex);
+      if (dataAxis >= 0 && dataAxis < dataRank &&
+          dataType.isDynamicDim(dataAxis) &&
+          shapeVals[outputDimIndex] == 1) {
+        if (auto d = insertDimWhenUseful(data, dataAxis, sameDims))
+          LLVM_DEBUG(llvm::dbgs()
+                     << "  - [Expand-passthrough] Added a new dim("
+                     << d.value().first << ", " << d.value().second << ")\n");
+        return true;
+      }
+    }
+  }
+
+  return false;
 }
 
 /// Collect all operations from ModuleOp.
@@ -1149,10 +1212,9 @@ void DimAnalysis::visitDim(
   // except when it is an entry block argument of an ONNXFusedOp body: that
   // argument is just an alias for the corresponding call-site operand at the
   // same axis, so hook it up to that operand's dim.
-  if (auto arg = mlir::dyn_cast<BlockArgument>(tensor)) {
-    if (auto fusedOp = mlir::dyn_cast_or_null<ONNXFusedOp>(
-            arg.getOwner()->getParentOp())) {
-      Value input = fusedOp.getInputs()[arg.getArgNumber()];
+  if (mlir::isa<BlockArgument>(tensor)) {
+    Value input = resolveThroughFusedOp(tensor);
+    if (input != tensor) {
       if (auto d = insertDimWhenUseful(input, dimIndex, sameDims))
         LLVM_DEBUG(llvm::dbgs() << "  - Added a new dim(" << d.value().first
                                 << ", " << d.value().second << ")\n");
@@ -1355,14 +1417,16 @@ void DimAnalysis::visitDim(
     Value limitVal = rangeOp.getLimit();
     Value deltaVal = rangeOp.getDelta();
 
-    auto startConstOp = startVal.getDefiningOp<ONNXConstantOp>();
-    auto deltaConstOp = deltaVal.getDefiningOp<ONNXConstantOp>();
+    auto startConstOp =
+        resolveThroughFusedOp(startVal).getDefiningOp<ONNXConstantOp>();
+    auto deltaConstOp =
+        resolveThroughFusedOp(deltaVal).getDefiningOp<ONNXConstantOp>();
     if (startConstOp && deltaConstOp &&
         getScalarValue<int64_t>(startConstOp) == 0 &&
         getScalarValue<int64_t>(deltaConstOp) == 1) {
-      Value v = limitVal;
+      Value v = resolveThroughFusedOp(limitVal);
       if (auto squeezeOp = v.getDefiningOp<ONNXSqueezeOp>())
-        v = squeezeOp.getData();
+        v = resolveThroughFusedOp(squeezeOp.getData());
       if (auto dimOp = v.getDefiningOp<ONNXDimOp>()) {
         if (auto d =
                 insertDimWhenUseful(dimOp.getData(), dimOp.getAxis(), sameDims))
@@ -1494,7 +1558,11 @@ void DimAnalysis::visitDimForOffsets(DimT &dim) const {
   LLVM_DEBUG(llvm::dbgs() << "\nVisiting dim for offsets(" << tensor << ", "
                           << dimIndex << ")\n");
 
-  // Early exit for block arguments and constants.
+  // A block argument of an ONNXFusedOp body aliases the call-site operand;
+  // resolve it so the offset-relation dispatch below can still see the
+  // defining op. A genuinely opaque block argument (e.g. a function
+  // argument) still has no defining op to explore.
+  tensor = resolveThroughFusedOp(tensor);
   if (mlir::isa<BlockArgument>(tensor))
     return;
 
@@ -1507,14 +1575,15 @@ void DimAnalysis::visitDimForOffsets(DimT &dim) const {
     Value A = addOp.getA();
     Value B = addOp.getB();
 
-    if (auto constOp = B.getDefiningOp<ONNXConstantOp>()) {
+    if (auto constOp = resolveThroughFusedOp(B).getDefiningOp<ONNXConstantOp>()) {
       int64_t offset = getScalarValue<int64_t>(constOp);
       DimT inputDim(A, dimIndex);
       dimRelations[inputDim].emplace_back(inputDim, offset, dim, 0);
       LLVM_DEBUG(llvm::dbgs() << "  - [Add] dim(" << A << ", " << dimIndex
                               << ") + " << offset << "\n");
       return;
-    } else if (auto constOp = A.getDefiningOp<ONNXConstantOp>()) {
+    } else if (auto constOp =
+                   resolveThroughFusedOp(A).getDefiningOp<ONNXConstantOp>()) {
       int64_t offset = getScalarValue<int64_t>(constOp);
       DimT inputDim(B, dimIndex);
       dimRelations[inputDim].emplace_back(inputDim, offset, dim, 0);
@@ -1557,7 +1626,8 @@ void DimAnalysis::visitDimForOffsets(DimT &dim) const {
 
   // Special case: ONNXExpandOp with Add(Dim, Constant) in shape input.
   if (auto expandOp = mlir::dyn_cast<ONNXExpandOp>(op)) {
-    if (auto concatOp = expandOp.getShape().getDefiningOp<ONNXConcatOp>()) {
+    if (auto concatOp = resolveThroughFusedOp(expandOp.getShape())
+                             .getDefiningOp<ONNXConcatOp>()) {
       int64_t currentIndex = 0;
       for (Value shapeInput : concatOp.getInputs()) {
         int64_t numElements =
