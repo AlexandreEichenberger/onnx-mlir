@@ -23,7 +23,14 @@
 // Expected stored params:
 //   concatAxis = 2, unsqueezedPosition = 2, expansionN = 3,
 //   noSaturation = false, reshapeFirstCollapsedDim = 0,
-//   reshapeCollapsedCount = 3, finalLayout = "3DS"
+//   reshapeCollapsedCount = 3, finalLayout = "3DS", yieldConcatResult = false
+//
+// The concat result is allowed extra uses beyond the Unsqueeze that starts
+// the rest of the chain (e.g. it may also be the KV-cache "present" output
+// threaded to the next layer). When that happens, yieldConcatResult is set
+// and the fused op gets a second result -- the concat's own result -- so
+// those extra uses keep a value to bind to (see
+// @concat_expand_stick_multi_use_concat below).
 
 // -----
 
@@ -63,9 +70,59 @@ func.func @concat_expand_stick_basic(
 // CHECK:           "onnx.Reshape"{{.*}}-> tensor<24x8x64xf16>
 // CHECK:           "onnx.LayoutTransform"{{.*}}-> tensor<24x8x64xf16, #zhigh.layout<{dataLayout = "3DS"}>>
 // CHECK:           onnx.Yield
-// Verify stored params (attrs printed alphabetically after the body closes):
-// CHECK:           concatAxis = 2{{.*}}expansionN = 3{{.*}}finalLayout = "3DS"{{.*}}noSaturation = false{{.*}}reshapeCollapsedCount = 3{{.*}}reshapeFirstCollapsedDim = 0{{.*}}unsqueezedPosition = 2
+// Verify stored params (attrs printed alphabetically after the body closes).
+// The concat result has no uses outside the chain here, so
+// yieldConcatResult is false and the fused op has a single result:
+// CHECK:           concatAxis = 2{{.*}}expansionN = 3{{.*}}finalLayout = "3DS"{{.*}}noSaturation = false{{.*}}reshapeCollapsedCount = 3{{.*}}reshapeFirstCollapsedDim = 0{{.*}}unsqueezedPosition = 2{{.*}}yieldConcatResult = false
 // CHECK:           return [[VAR_0_]] : tensor<24x8x64xf16, #zhigh.layout<{dataLayout = "3DS"}>>
+// CHECK:           }
+}
+
+// -----
+
+// The concat result may also be used outside the chain (e.g. as a KV-cache
+// "present" passthrough returned alongside the primary result): the concat
+// result is no longer required to have a single use, and yieldConcatResult
+// becomes true, giving the fused op a second result — the concat's own
+// output — so the extra use still has a value to bind to once Concat moves
+// into the FusedOp body.
+
+func.func @concat_expand_stick_multi_use_concat(
+    %arg0: tensor<2x4x3x64xf32>, %arg1: tensor<2x4x5x64xf32>)
+    -> (tensor<24x8x64xf16, #zhigh.layout<{dataLayout = "3DS"}>>, tensor<2x4x8x64xf32>) {
+  %axes  = onnx.Constant dense<2>               : tensor<1xi64>
+  %shexp = onnx.Constant dense<[2, 4, 3, 8, 64]> : tensor<5xi64>
+  %shre  = onnx.Constant dense<[24, 8, 64]>      : tensor<3xi64>
+  %cat  = "onnx.Concat"(%arg0, %arg1) <{axis = 2 : si64}>
+            : (tensor<2x4x3x64xf32>, tensor<2x4x5x64xf32>) -> tensor<2x4x8x64xf32>
+  %unsq = "onnx.Unsqueeze"(%cat, %axes)
+            : (tensor<2x4x8x64xf32>, tensor<1xi64>) -> tensor<2x4x1x8x64xf32>
+  %dlf  = "zhigh.F32ToDLF16"(%unsq)
+            : (tensor<2x4x1x8x64xf32>) -> tensor<2x4x1x8x64xf16>
+  %exp  = "onnx.Expand"(%dlf, %shexp)
+            : (tensor<2x4x1x8x64xf16>, tensor<5xi64>) -> tensor<2x4x3x8x64xf16>
+  %resh = "onnx.Reshape"(%exp, %shre) <{allowzero = 0 : si64}>
+            : (tensor<2x4x3x8x64xf16>, tensor<3xi64>) -> tensor<24x8x64xf16>
+  %out  = "onnx.LayoutTransform"(%resh) {target_layout = #zhigh.layout<{dataLayout = "3DS"}>}
+            : (tensor<24x8x64xf16>) -> tensor<24x8x64xf16, #zhigh.layout<{dataLayout = "3DS"}>>
+  return %out, %cat : tensor<24x8x64xf16, #zhigh.layout<{dataLayout = "3DS"}>>, tensor<2x4x8x64xf32>
+
+// CHECK-LABEL:  func.func @concat_expand_stick_multi_use_concat
+// CHECK-SAME:   ([[PARAM_0_:%.+]]: tensor<2x4x3x64xf32>, [[PARAM_1_:%.+]]: tensor<2x4x5x64xf32>)
+// The fused op now has two results: the primary layout-transform result and
+// the concat's own result (the extra use).
+// CHECK:           [[VAR_0_:%.+]]:2 = "onnx.Fused"([[PARAM_0_]], [[PARAM_1_]]) <{kind = "zhigh.concat-expand-stick"}>
+// CHECK:           [[VAR_4_:%.+]] = "onnx.Concat"{{.*}}-> tensor<2x4x8x64xf32>
+// CHECK:           "onnx.Unsqueeze"{{.*}}-> tensor<2x4x1x8x64xf32>
+// CHECK:           "zhigh.F32ToDLF16"{{.*}}-> tensor<2x4x1x8x64xf16>
+// CHECK:           "onnx.Expand"{{.*}}-> tensor<2x4x3x8x64xf16>
+// CHECK:           "onnx.Reshape"{{.*}}-> tensor<24x8x64xf16>
+// CHECK:           [[VAR_9_:%.+]] = "onnx.LayoutTransform"{{.*}}-> tensor<24x8x64xf16, #zhigh.layout<{dataLayout = "3DS"}>>
+// The yield now has two operands: the primary result first, the concat
+// result second.
+// CHECK:           onnx.Yield [[VAR_9_]], [[VAR_4_]] : tensor<24x8x64xf16, #zhigh.layout<{dataLayout = "3DS"}>>, tensor<2x4x8x64xf32>
+// CHECK:           yieldConcatResult = true
+// CHECK:           return [[VAR_0_]]#0, [[VAR_0_]]#1 : tensor<24x8x64xf16, #zhigh.layout<{dataLayout = "3DS"}>>, tensor<2x4x8x64xf32>
 // CHECK:           }
 }
 

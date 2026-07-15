@@ -156,10 +156,15 @@ public:
 //  ONNXLayoutTransformOp   CPU => ZTensor, target layout 3D / 3DS / 4D
 //                   (required)
 //
-// Unique-use invariant: every intermediate value (concat result through
-// reshape) has exactly one use.  The final layout-transform result is not
-// checked.
-//
+// Unique-use invariant: every intermediate value from the Unsqueeze through
+// the Reshape has exactly one use.  The final layout-transform result is not
+// checked.  The concat result is the one exception: it is allowed extra
+// uses beyond the Unsqueeze that starts the rest of the chain (e.g. it may
+// also be the KV-cache "present" output threaded to the next layer).  When
+// such extra uses exist, the ONNXFusedOp gets a second result -- the concat
+// result itself -- so those uses keep a value to bind to once the chain ops
+// move into the FusedOp body; see yieldConcatResult below.  Output 0 is
+// always the primary (layout-transform) result.
 //===----------------------------------------------------------------------===//
 
 class ConcatExpandStickFusionHelper : public onnx_mlir::FusionOpKindHelper {
@@ -174,6 +179,8 @@ public:
       -1; ///< first input dim in merge run (-1 = none)
   int64_t reshapeCollapsedCount = 0; ///< # consecutive input dims merged into 1
   std::optional<mlir::StringAttr> finalLayout; ///< "3D", "3DS", or "4D"
+  bool yieldConcatResult = false; ///< concat result used outside the chain
+                                   ///< too => it becomes FusedOp output 1
 
   /// Detect and parameterize the concat-expand-stick chain.
   /// \p dimAnalysis must be non-null.

@@ -51,6 +51,24 @@ static T singleUserOfType(Value val) {
   return dyn_cast<T>(*val.getUsers().begin());
 }
 
+/// Return the unique user of \p val that is of type \p T, or null if there
+/// isn't exactly one such user.  Unlike singleUserOfType, \p val is allowed
+/// to have other, non-T-typed uses as well (e.g. a value that also escapes
+/// to a function result); callers that need to know about those other uses
+/// should check val.hasOneUse() themselves after a successful match.
+template <typename T>
+static T uniqueUserOfType(Value val) {
+  T found = nullptr;
+  for (Operation *user : val.getUsers()) {
+    if (auto typed = dyn_cast<T>(user)) {
+      if (found)
+        return nullptr; // more than one T-typed user -- ambiguous
+      found = typed;
+    }
+  }
+  return found;
+}
+
 /// Return true if \p perm keeps the last dimension in place.
 static bool transposeKeepsLastDim(ArrayAttr perm) {
   int64_t rank = static_cast<int64_t>(perm.size());
@@ -777,6 +795,7 @@ bool ConcatExpandStickFusionHelper::detectIfBeneficial(
   reshapeFirstCollapsedDim = -1;
   reshapeCollapsedCount = 0;
   finalLayout = std::nullopt;
+  yieldConcatResult = false;
 
   if (isInsideFusedOp(startOp))
     return returnFailure("already inside a fused op body");
@@ -813,9 +832,16 @@ bool ConcatExpandStickFusionHelper::detectIfBeneficial(
   Value current = concatOut;
 
   // ---- Step 2: Unsqueeze ---------------------------------------------------
-  auto unsqOp = singleUserOfType<ONNXUnsqueezeOp>(current);
+  // The concat result may have other, non-chain uses (e.g. it also feeds a
+  // KV-cache passthrough output) -- allow that here, as long as exactly one
+  // of its users is the Unsqueeze that starts the rest of the chain.  When
+  // such other uses exist, the concat result is threaded through as a
+  // second FusedOp output (see yieldConcatResult below).
+  auto unsqOp = uniqueUserOfType<ONNXUnsqueezeOp>(current);
   if (!unsqOp)
-    return returnFailure("unsqueeze: not single user of type ONNXUnsqueezeOp");
+    return returnFailure(
+        "unsqueeze: not the unique user of type ONNXUnsqueezeOp");
+  yieldConcatResult = !current.hasOneUse();
 
   Value axesVal = unsqOp.getAxes();
   auto axesAttr = getElementAttributeFromONNXValue(axesVal);
@@ -888,6 +914,10 @@ bool ConcatExpandStickFusionHelper::detectIfBeneficial(
   finalLayout = layoutStrAttr;
   ops.push_back(ltOp.getOperation());
   finalResults.push_back(ltOp.getOutput());
+  // The primary result is always output 0; the concat result, when also
+  // needed outside the chain, is threaded through as output 1.
+  if (yieldConcatResult)
+    finalResults.push_back(concatOut);
 
   LLVM_DEBUG(llvm::dbgs() << "  concat-expand-stick: successful\n");
   return true;
@@ -905,6 +935,7 @@ void ConcatExpandStickFusionHelper::embedAttrs(ONNXFusedOp fusedOp) const {
   fusedOp->setAttr(
       "reshapeCollapsedCount", b.getI64IntegerAttr(reshapeCollapsedCount));
   fusedOp->setAttr("finalLayout", *finalLayout);
+  fusedOp->setAttr("yieldConcatResult", b.getBoolAttr(yieldConcatResult));
 }
 
 bool ConcatExpandStickFusionHelper::retrieveAttrs(ONNXFusedOp fusedOp) {
@@ -933,6 +964,10 @@ bool ConcatExpandStickFusionHelper::retrieveAttrs(ONNXFusedOp fusedOp) {
   if (!layoutAttr)
     return false;
   finalLayout = layoutAttr;
+  auto yieldAttr = fusedOp->getAttrOfType<BoolAttr>("yieldConcatResult");
+  if (!yieldAttr)
+    return false;
+  yieldConcatResult = yieldAttr.getValue();
   return true;
 }
 
@@ -1023,6 +1058,22 @@ bool ConcatExpandStickFusionHelper::verify() const {
       LLVM_DEBUG(llvm::dbgs() << "CES verify: layout mismatch\n");
       return false;
     }
+  }
+
+  // finalResults: output 0 is always the primary (layout-transform) result;
+  // output 1, when yieldConcatResult is set, must be the concat's own
+  // result (i.e. the chain's first op), matching how detectIfBeneficial
+  // populated it.
+  size_t expectedResults = yieldConcatResult ? 2 : 1;
+  if (finalResults.size() != expectedResults) {
+    LLVM_DEBUG(llvm::dbgs() << "CES verify: result count " << finalResults.size()
+                            << " != " << expectedResults << "\n");
+    return false;
+  }
+  if (yieldConcatResult && finalResults[1] != concat.getConcatResult()) {
+    LLVM_DEBUG(llvm::dbgs() << "CES verify: second result is not the "
+                               "concat result\n");
+    return false;
   }
 
   return true;
