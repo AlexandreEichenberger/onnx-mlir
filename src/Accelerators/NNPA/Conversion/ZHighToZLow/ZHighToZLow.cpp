@@ -2508,8 +2508,8 @@ struct ZHighToZLowFusedExtLayoutTransformLowering
             ONNXFusedOp::getOperationName());
   }
 
-  FailureOr<Value> lowerVerified(ONNXFusedOp fusedOp, OpAdaptor adaptor,
-      ConversionPatternRewriter &rewriter,
+  FailureOr<SmallVector<Value>> lowerVerified(ONNXFusedOp fusedOp,
+      OpAdaptor adaptor, ConversionPatternRewriter &rewriter,
       ExtLayoutTransformFusionHelper &fusion) const override {
     Location loc = fusedOp.getLoc();
     MDBuilder create(rewriter, loc);
@@ -2713,7 +2713,7 @@ struct ZHighToZLowFusedExtLayoutTransformLowering
           }
         });
 
-    return allocVal;
+    return SmallVector<Value>{allocVal};
   }
 };
 
@@ -2771,8 +2771,8 @@ struct ZHighToZLowFusedExpandMulStickLowering
       TypeConverter &typeConverter, MLIRContext *ctx, bool disableSaturation)
       : Base(typeConverter, ctx), disableSaturation(disableSaturation) {}
 
-  FailureOr<Value> lowerVerified(ONNXFusedOp fusedOp, OpAdaptor adaptor,
-      ConversionPatternRewriter &rewriter,
+  FailureOr<SmallVector<Value>> lowerVerified(ONNXFusedOp fusedOp,
+      OpAdaptor adaptor, ConversionPatternRewriter &rewriter,
       ExpandMulStickFusionHelper &fusion) const override {
     Location loc = fusedOp.getLoc();
     MDBuilder create(rewriter, loc);
@@ -2921,7 +2921,7 @@ struct ZHighToZLowFusedExpandMulStickLowering
               });
         });
 
-    return allocVal;
+    return SmallVector<Value>{allocVal};
   }
 };
 
@@ -2957,14 +2957,9 @@ struct ZHighToZLowFusedConcatExpandStickLowering
       TypeConverter &typeConverter, MLIRContext *ctx, bool disableSaturation)
       : Base(typeConverter, ctx), disableSaturation(disableSaturation) {}
 
-  FailureOr<Value> lowerVerified(ONNXFusedOp fusedOp, OpAdaptor adaptor,
-      ConversionPatternRewriter &rewriter,
+  FailureOr<SmallVector<Value>> lowerVerified(ONNXFusedOp fusedOp,
+      OpAdaptor adaptor, ConversionPatternRewriter &rewriter,
       ConcatExpandStickFusionHelper &fusion) const override {
-    // Multi-output variant (concat result also yielded) not yet
-    // implemented; defer to the generic inline fallback.
-    if (fusion.yieldConcatResult)
-      return failure();
-
     Location loc = fusedOp.getLoc();
     MDBuilder create(rewriter, loc);
     // Single function-level scope: all DimsExpr must outlive the nested
@@ -2975,7 +2970,8 @@ struct ZHighToZLowFusedConcatExpandStickLowering
     Operation *op = fusedOp.getOperation();
     Value input1MemRef = adaptor.getInputs()[0]; // lowered memref, plain F32
     Value input2MemRef = adaptor.getInputs()[1];
-    Value input1Tensor = fusedOp.getInputs()[0]; // tensor, for UnifiedStickSupport
+    Value input1Tensor =
+        fusedOp.getInputs()[0]; // tensor, for UnifiedStickSupport
     Value input2Tensor = fusedOp.getInputs()[1];
     Value outputTensor = fusedOp.getOutputs()[0]; // tensor-typed zTensor result
 
@@ -2986,7 +2982,7 @@ struct ZHighToZLowFusedConcatExpandStickLowering
     int64_t C = fusion.reshapeCollapsedCount;
     bool effectiveDisableSaturation = fusion.noSaturation || disableSaturation;
 
-    int64_t R = getRank(input1MemRef.getType());          // concat rank
+    int64_t R = getRank(input1MemRef.getType()); // concat rank
     int64_t outputRank = getRank(outputTensor.getType());
 
     // Step 0: source dims from the two lowered (plain, unstickified) inputs.
@@ -3013,8 +3009,8 @@ struct ZHighToZLowFusedConcatExpandStickLowering
 
     // Step 2: apply the reshape's head-collapse to get the final output
     // dims, used for allocation.
-    // TODO: maybe refactor this into a helper function, since it's identical to the
-    // one in ZHighToZLowFusedExpandMulStickLowering above.
+    // TODO: maybe refactor this into a helper function, since it's identical to
+    // the one in ZHighToZLowFusedExpandMulStickLowering above.
     DimsExpr outputDims;
     if (F == -1) {
       outputDims = midDims; // Rout == R + 1
@@ -3061,8 +3057,8 @@ struct ZHighToZLowFusedConcatExpandStickLowering
     // after operand 1's extent in the concatenated coordinate space).
     int64_t innerRank = R - A; // always >= 2, since A <= R - 2.
     auto emitOperandLoop = [&](const KrnlBuilder &ck, DimsExpr &outerIndices,
-                                int64_t readIdx, DimsExpr &operandDims,
-                                std::optional<IndexExpr> axisAShift) {
+                               int64_t readIdx, DimsExpr &operandDims,
+                               std::optional<IndexExpr> axisAShift) {
       MDBuilder create(ck);
       ValueRange innerLoopDef = create.krnl.defineLoops(innerRank);
       DimsExpr innerLbs(innerRank, LitIE(0));
@@ -3131,7 +3127,8 @@ struct ZHighToZLowFusedConcatExpandStickLowering
       DimsExpr outerUbs;
       for (int64_t d = 0; d < A; ++d)
         outerUbs.emplace_back(concatDims[d]);
-      // TODO: enable parallelization of the outer loop when A > 0 (currently disabled)
+      // TODO: enable parallelization of the outer loop when A > 0 (currently
+      // disabled)
       create.krnl.iterateIE(outerLoopDef, outerLoopDef, outerLbs, outerUbs,
           [&](const KrnlBuilder &ck, ValueRange indices) {
             MDBuilder create(ck);
@@ -3148,7 +3145,49 @@ struct ZHighToZLowFusedConcatExpandStickLowering
           create.krnl, emptyOuter, 1, input2Dims, DimIE(input1Dims[A]));
     }
 
-    return allocVal;
+    if (!fusion.yieldConcatResult)
+      return SmallVector<Value>{allocVal};
+
+    // TODO: integrate the two loops
+
+    // Second output: the concat's own (plain, unstickified) result, needed
+    // because it also has uses outside the chain. Materialize it with two
+    // ordinary copy loops -- one per operand -- exactly like the standalone
+    // ONNXConcatOpLowering (Tensor/Concat.cpp) does: copy the whole operand
+    // into the result at its own coordinates, shifting the axis-A slot by
+    // the first operand's extent for the second operand.
+    Value concatResultTensor = fusedOp.getOutputs()[1];
+    Type concatConvertedType =
+        this->typeConverter->convertType(concatResultTensor.getType());
+    assert(concatConvertedType && isa<MemRefType>(concatConvertedType) &&
+           "Failed to convert type to MemRefType");
+    int64_t concatAlignment = KrnlTypeConverter::getDefaultAllocAlignment(
+        concatResultTensor.getType());
+    Value concatAlloc = create.mem.alignedAlloc(
+        cast<MemRefType>(concatConvertedType), concatDims, concatAlignment);
+
+    auto emitConcatCopyLoop = [&](const KrnlBuilder &ck, Value inMemRef,
+                                  DimsExpr &operandDims,
+                                  std::optional<IndexExpr> axisAShift) {
+      MDBuilder create(ck);
+      ValueRange loopDef = create.krnl.defineLoops(R);
+      DimsExpr lbs(R, LitIE(0));
+      create.krnl.iterateIE(loopDef, loopDef, lbs, operandDims,
+          [&](const KrnlBuilder &ck2, ValueRange indices) {
+            MDBuilder create(ck2);
+            IndexExprScope copyScope(ck2);
+            DimsExpr writeIdx = DimListIE(indices);
+            if (axisAShift.has_value())
+              writeIdx[A] = writeIdx[A] + *axisAShift;
+            Value loaded = create.krnl.load(inMemRef, indices);
+            create.krnl.storeIE(loaded, concatAlloc, writeIdx);
+          });
+    };
+    emitConcatCopyLoop(create.krnl, input1MemRef, input1Dims, std::nullopt);
+    emitConcatCopyLoop(
+        create.krnl, input2MemRef, input2Dims, DimIE(input1Dims[A]));
+
+    return SmallVector<Value>{allocVal, concatAlloc};
   }
 };
 
