@@ -2941,10 +2941,9 @@ struct ZHighToZLowFusedExpandMulStickLowering
 // 2's sub-loop simply adds operand 1's axis-A extent as an offset to that
 // slot before calling it; operand 1 needs no shift (it occupies [0, S1)).
 //
-// yieldConcatResult (concat result also used outside the chain) is not yet
-// supported here; lowerVerified() returns failure() in that case and the
-// generic FusedOpInlineFallback takes over, exactly as for an unregistered
-// kind.
+// When yieldConcatResult is set (the concat result also has uses outside the
+// chain), a second output is materialized with two ordinary copy loops, one
+// per operand, exactly like the standalone ONNXConcatOpLowering.
 //===----------------------------------------------------------------------===//
 
 struct ZHighToZLowFusedConcatExpandStickLowering
@@ -2956,6 +2955,139 @@ struct ZHighToZLowFusedConcatExpandStickLowering
   ZHighToZLowFusedConcatExpandStickLowering(
       TypeConverter &typeConverter, MLIRContext *ctx, bool disableSaturation)
       : Base(typeConverter, ctx), disableSaturation(disableSaturation) {}
+
+  // Emit the vectorized read-convert-store chunk (64 elements, U=4 SIMD
+  // registers of archVL each) for one tile: load the operand's converted
+  // F32 halves, run the F32->DLF16 conversion once, and fan the result out
+  // to all N stickified output write instances.
+  void emitVectorizedConversion(const KrnlBuilder &ck2,
+      IndexExprScope &midScope, int64_t readIdx, int64_t N,
+      UnifiedStickSupportList &uss, bool effectiveDisableSaturation) const {
+    MDBuilder create(ck2);
+    int64_t U = 4;
+    int64_t totVL = U * UnifiedStickSupport::archVL;
+    create.krnl.forLoopIE(LitIE(0), LitIE(64), totVL, /*par*/ false,
+        [&](const KrnlBuilder kb, ValueRange loopInd) {
+          IndexExprScope innerScope(kb, &midScope);
+          MDBuilder create(ck2);
+          IndexExpr l = DimIE(loopInd[0]);
+          for (int64_t u = 0; u < U; ++u) {
+            uss.list[readIdx].beforeCompute(create.krnl, l, u);
+            Value highIn, lowIn;
+            uss.list[readIdx].get4xF32Vals(highIn, lowIn);
+            MultiDialectBuilder<MathBuilder, ZLowBuilder> mcreate(create.krnl);
+            Value dlf16 = mcreate.zlow.convertF32ToDLF16(
+                highIn, lowIn, effectiveDisableSaturation);
+            for (int64_t n = 0; n < N; ++n)
+              uss.list[2 + n].storeConvertedDLF16(create.krnl, dlf16, l, u);
+          }
+        });
+  }
+
+  // Body of one tile of an operand's inner loop nest: build the read access
+  // function (operand's own local coordinate) and the N output access
+  // functions (shifted at axis A for operand 2), then emit the vectorized
+  // conversion for this tile.
+  void emitOperandLoopBody(const KrnlBuilder &ck2, ValueRange indices,
+      DimsExpr &outerIndices, int64_t readIdx, int64_t innerRank, int64_t A,
+      int64_t R, int64_t N, int64_t P, int64_t F, int64_t C,
+      DimsExpr &midDims, std::optional<IndexExpr> axisAShift,
+      UnifiedStickSupportList &uss, bool effectiveDisableSaturation) const {
+    MDBuilder create(ck2);
+    IndexExprScope midScope(ck2);
+    // outerIndices are Dim-kind index exprs bound to the outer loop's own
+    // (now-enclosing) scope; Dim/Symbol/Affine-kind index exprs cannot cross
+    // a scope boundary as-is (only literals can, via isEnclosingScope()) --
+    // re-home them into this scope before combining with innerIndices,
+    // exactly as ProcessStickData.cpp does for the same reason.
+    DimsExpr rehomedOuterIndices =
+        DimListIE(llvm::ArrayRef<IndexExpr>(outerIndices));
+    DimsExpr innerIndices = DimListIE(indices);
+    innerIndices[innerRank - 1] = innerIndices[innerRank - 1] * 64;
+
+    // Read access function: operand's own local coordinate.
+    DimsExpr readAF = rehomedOuterIndices;
+    for (IndexExpr &e : innerIndices)
+      readAF.emplace_back(e);
+    uss.list[readIdx].beforeStickLoop(create.krnl, readAF);
+
+    // Output access function: shift axis A when requested. axisAShift is
+    // itself a Dim-kind expr bound to the enclosing (outer-loop) scope, so
+    // it must be re-homed into this (nested) scope too before combining --
+    // same rationale as outerIndices above; DimIE(...) re-homes a single
+    // IndexExpr the same way DimListIE(...) does for a list.
+    DimsExpr combinedIndices = readAF;
+    if (axisAShift.has_value())
+      combinedIndices[A] = combinedIndices[A] + DimIE(*axisAShift);
+    for (int64_t n = 0; n < N; ++n) {
+      DimsExpr outputAF =
+          buildExpandMulStickOutputAF(combinedIndices, n, P, F, C, R, midDims);
+      uss.list[2 + n].beforeStickLoop(create.krnl, outputAF);
+    }
+
+    emitVectorizedConversion(
+        ck2, midScope, readIdx, N, uss, effectiveDisableSaturation);
+  }
+
+  // Emit the tiled loop nest for one concat operand: iterate over its own
+  // dims [A, R), tiling only the innermost dim by 64 (exact division,
+  // guaranteed by fusion detection). readIdx selects which USS read entry
+  // (0 or 1) to use; axisAShift, when set, is added to the axis-A slot
+  // only when building the *output* access function (operand 2 sits
+  // after operand 1's extent in the concatenated coordinate space).
+  void emitOperandLoop(const KrnlBuilder &ck, DimsExpr &outerIndices,
+      int64_t readIdx, DimsExpr &operandDims,
+      std::optional<IndexExpr> axisAShift, int64_t A, int64_t R, int64_t N,
+      int64_t P, int64_t F, int64_t C, DimsExpr &midDims,
+      UnifiedStickSupportList &uss, bool effectiveDisableSaturation) const {
+    MDBuilder create(ck);
+    int64_t innerRank = R - A; // always >= 2, since A <= R - 2.
+    ValueRange innerLoopDef = create.krnl.defineLoops(innerRank);
+    DimsExpr innerLbs(innerRank, LitIE(0));
+    DimsExpr innerUbs;
+    for (int64_t d = A; d < R; ++d)
+      innerUbs.emplace_back(DimIE(operandDims[d]));
+    innerUbs[innerRank - 1] = innerUbs[innerRank - 1].ceilDiv(64);
+
+    create.krnl.iterateIE(innerLoopDef, innerLoopDef, innerLbs, innerUbs,
+        [&](const KrnlBuilder &ck2, ValueRange indices) {
+          emitOperandLoopBody(ck2, indices, outerIndices, readIdx, innerRank,
+              A, R, N, P, F, C, midDims, axisAShift, uss,
+              effectiveDisableSaturation);
+        });
+  }
+
+  // Body of one tile of the concat-result copy loop: write the loaded
+  // operand element at its own coordinate, shifted at axis A for operand 2.
+  void emitConcatCopyLoopBody(const KrnlBuilder &ck2, ValueRange indices,
+      Value inMemRef, std::optional<IndexExpr> axisAShift, int64_t A,
+      Value concatAlloc) const {
+    MDBuilder create(ck2);
+    IndexExprScope copyScope(ck2);
+    DimsExpr writeIdx = DimListIE(indices);
+    // axisAShift is a Dim-kind expr bound to the enclosing scope; re-home it
+    // into this scope before combining, same rationale as
+    // emitOperandLoopBody above.
+    if (axisAShift.has_value())
+      writeIdx[A] = writeIdx[A] + DimIE(*axisAShift);
+    Value loaded = create.krnl.load(inMemRef, indices);
+    create.krnl.storeIE(loaded, concatAlloc, writeIdx);
+  }
+
+  // Emit the copy loop nest for one concat operand into the materialized
+  // concat-result buffer, used only when yieldConcatResult is set.
+  void emitConcatCopyLoop(const KrnlBuilder &ck, Value inMemRef,
+      DimsExpr &operandDims, std::optional<IndexExpr> axisAShift, int64_t A,
+      int64_t R, Value concatAlloc) const {
+    MDBuilder create(ck);
+    ValueRange loopDef = create.krnl.defineLoops(R);
+    DimsExpr lbs(R, LitIE(0));
+    create.krnl.iterateIE(loopDef, loopDef, lbs, operandDims,
+        [&](const KrnlBuilder &ck2, ValueRange indices) {
+          emitConcatCopyLoopBody(ck2, indices, inMemRef, axisAShift, A,
+              concatAlloc);
+        });
+  }
 
   FailureOr<SmallVector<Value>> lowerVerified(ONNXFusedOp fusedOp,
       OpAdaptor adaptor, ConversionPatternRewriter &rewriter,
@@ -3049,78 +3181,6 @@ struct ZHighToZLowFusedConcatExpandStickLowering
     UnifiedStickSupportList uss(create.krnl, ussVals, ussMemRefs, isReads,
         isWrites, effectiveDisableSaturation);
 
-    // Emit the tiled loop nest for one concat operand: iterate over its own
-    // dims [A, R), tiling only the innermost dim by 64 (exact division,
-    // guaranteed by fusion detection). readIdx selects which USS read entry
-    // (0 or 1) to use; axisAShift, when set, is added to the axis-A slot
-    // only when building the *output* access function (operand 2 sits
-    // after operand 1's extent in the concatenated coordinate space).
-    int64_t innerRank = R - A; // always >= 2, since A <= R - 2.
-    auto emitOperandLoop = [&](const KrnlBuilder &ck, DimsExpr &outerIndices,
-                               int64_t readIdx, DimsExpr &operandDims,
-                               std::optional<IndexExpr> axisAShift) {
-      MDBuilder create(ck);
-      ValueRange innerLoopDef = create.krnl.defineLoops(innerRank);
-      DimsExpr innerLbs(innerRank, LitIE(0));
-      DimsExpr innerUbs;
-      for (int64_t d = A; d < R; ++d)
-        innerUbs.emplace_back(operandDims[d]);
-      innerUbs[innerRank - 1] = innerUbs[innerRank - 1].ceilDiv(64);
-
-      create.krnl.iterateIE(innerLoopDef, innerLoopDef, innerLbs, innerUbs,
-          [&](const KrnlBuilder &ck2, ValueRange indices) {
-            MDBuilder create(ck2);
-            IndexExprScope midScope(ck2);
-            // outerIndices are Dim-kind index exprs bound to the outer
-            // loop's own (now-enclosing) scope; Dim/Symbol/Affine-kind
-            // index exprs cannot cross a scope boundary as-is (only
-            // literals can, via isEnclosingScope()) -- re-home them into
-            // this scope before combining with innerIndices, exactly as
-            // ProcessStickData.cpp does for the same reason.
-            DimsExpr rehomedOuterIndices =
-                DimListIE(llvm::ArrayRef<IndexExpr>(outerIndices));
-            DimsExpr innerIndices = DimListIE(indices);
-            innerIndices[innerRank - 1] = innerIndices[innerRank - 1] * 64;
-
-            // Read access function: operand's own local coordinate.
-            DimsExpr readAF = rehomedOuterIndices;
-            for (IndexExpr &e : innerIndices)
-              readAF.emplace_back(e);
-            uss.list[readIdx].beforeStickLoop(create.krnl, readAF);
-
-            // Output access function: shift axis A when requested.
-            DimsExpr combinedIndices = readAF;
-            if (axisAShift.has_value())
-              combinedIndices[A] = combinedIndices[A] + *axisAShift;
-            for (int64_t n = 0; n < N; ++n) {
-              DimsExpr outputAF = buildExpandMulStickOutputAF(
-                  combinedIndices, n, P, F, C, R, midDims);
-              uss.list[2 + n].beforeStickLoop(create.krnl, outputAF);
-            }
-
-            int64_t U = 4;
-            int64_t totVL = U * UnifiedStickSupport::archVL;
-            create.krnl.forLoopIE(LitIE(0), LitIE(64), totVL, /*par*/ false,
-                [&](const KrnlBuilder kb, ValueRange loopInd) {
-                  IndexExprScope innerScope(kb, &midScope);
-                  MDBuilder create(ck2);
-                  IndexExpr l = DimIE(loopInd[0]);
-                  for (int64_t u = 0; u < U; ++u) {
-                    uss.list[readIdx].beforeCompute(create.krnl, l, u);
-                    Value highIn, lowIn;
-                    uss.list[readIdx].get4xF32Vals(highIn, lowIn);
-                    MultiDialectBuilder<MathBuilder, ZLowBuilder> mcreate(
-                        create.krnl);
-                    Value dlf16 = mcreate.zlow.convertF32ToDLF16(
-                        highIn, lowIn, effectiveDisableSaturation);
-                    for (int64_t n = 0; n < N; ++n)
-                      uss.list[2 + n].storeConvertedDLF16(
-                          create.krnl, dlf16, l, u);
-                  }
-                });
-          });
-    };
-
     if (A > 0) {
       ValueRange outerLoopDef = create.krnl.defineLoops(A);
       DimsExpr outerLbs(A, LitIE(0));
@@ -3134,15 +3194,19 @@ struct ZHighToZLowFusedConcatExpandStickLowering
             MDBuilder create(ck);
             IndexExprScope outerScope(ck);
             DimsExpr outerIndices = DimListIE(indices);
-            emitOperandLoop(ck, outerIndices, 0, input1Dims, std::nullopt);
-            emitOperandLoop(
-                ck, outerIndices, 1, input2Dims, DimIE(input1Dims[A]));
+            emitOperandLoop(ck, outerIndices, 0, input1Dims, std::nullopt, A,
+                R, N, P, F, C, midDims, uss, effectiveDisableSaturation);
+            emitOperandLoop(ck, outerIndices, 1, input2Dims,
+                DimIE(input1Dims[A]), A, R, N, P, F, C, midDims, uss,
+                effectiveDisableSaturation);
           });
     } else {
       DimsExpr emptyOuter;
-      emitOperandLoop(create.krnl, emptyOuter, 0, input1Dims, std::nullopt);
-      emitOperandLoop(
-          create.krnl, emptyOuter, 1, input2Dims, DimIE(input1Dims[A]));
+      emitOperandLoop(create.krnl, emptyOuter, 0, input1Dims, std::nullopt, A,
+          R, N, P, F, C, midDims, uss, effectiveDisableSaturation);
+      emitOperandLoop(create.krnl, emptyOuter, 1, input2Dims,
+          DimIE(input1Dims[A]), A, R, N, P, F, C, midDims, uss,
+          effectiveDisableSaturation);
     }
 
     if (!fusion.yieldConcatResult)
@@ -3166,26 +3230,10 @@ struct ZHighToZLowFusedConcatExpandStickLowering
     Value concatAlloc = create.mem.alignedAlloc(
         cast<MemRefType>(concatConvertedType), concatDims, concatAlignment);
 
-    auto emitConcatCopyLoop = [&](const KrnlBuilder &ck, Value inMemRef,
-                                  DimsExpr &operandDims,
-                                  std::optional<IndexExpr> axisAShift) {
-      MDBuilder create(ck);
-      ValueRange loopDef = create.krnl.defineLoops(R);
-      DimsExpr lbs(R, LitIE(0));
-      create.krnl.iterateIE(loopDef, loopDef, lbs, operandDims,
-          [&](const KrnlBuilder &ck2, ValueRange indices) {
-            MDBuilder create(ck2);
-            IndexExprScope copyScope(ck2);
-            DimsExpr writeIdx = DimListIE(indices);
-            if (axisAShift.has_value())
-              writeIdx[A] = writeIdx[A] + *axisAShift;
-            Value loaded = create.krnl.load(inMemRef, indices);
-            create.krnl.storeIE(loaded, concatAlloc, writeIdx);
-          });
-    };
-    emitConcatCopyLoop(create.krnl, input1MemRef, input1Dims, std::nullopt);
     emitConcatCopyLoop(
-        create.krnl, input2MemRef, input2Dims, DimIE(input1Dims[A]));
+        create.krnl, input1MemRef, input1Dims, std::nullopt, A, R, concatAlloc);
+    emitConcatCopyLoop(create.krnl, input2MemRef, input2Dims,
+        DimIE(input1Dims[A]), A, R, concatAlloc);
 
     return SmallVector<Value>{allocVal, concatAlloc};
   }
