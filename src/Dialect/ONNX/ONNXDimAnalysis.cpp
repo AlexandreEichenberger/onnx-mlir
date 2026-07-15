@@ -389,6 +389,7 @@ static void exploreSameDimsFromConsumingOperators(const DimAnalysis::DimT &dim,
       }
       continue;
     }
+    LLVM_DEBUG({ llvm::dbgs() << " - exploring - DONE\n"; });
   }
 }
 
@@ -404,9 +405,21 @@ static bool exploreSameDimsUsingShapeHelper(const DimAnalysis::DimT &dim,
   if (!shape_op)
     return false;
 
+  // Get resolved operands of static shape. It's because these operands are
+  // potentially for shape inputs. Hence get them outside subgraph to facilitate
+  // ShapeHelper.
+  SmallVector<Value, 4> resolvedOperands;
+  for (Value v : op->getOperands()) {
+    Value r = resolveThroughFusedOp(v);
+    if (r != v && hasStaticShape(r.getType()))
+      resolvedOperands.emplace_back(r);
+    else
+      resolvedOperands.emplace_back(v);
+  }
+
   // Get its shape interface.
   std::unique_ptr<ONNXOpShapeHelper> shapeHelper(
-      shape_op.getShapeHelper(op, {}, nullptr, nullptr));
+      shape_op.getShapeHelper(op, resolvedOperands, nullptr, nullptr));
   // If no shape helper, or unimplemented, just abort.
   if (!shapeHelper)
     return false;
@@ -543,37 +556,6 @@ static bool exploreSameDimsUsingShapeInput(const DimAnalysis::DimT &dim,
       LLVM_DEBUG(llvm::dbgs() << "  - Added a new dim(" << d.value().first
                               << ", " << d.value().second << ")\n");
     return true;
-  }
-
-  // Special case for Expand: per ONNX broadcasting semantics, if the
-  // requested target size at this axis is literally 1, the output dim is
-  // unchanged from the data operand's own (dynamic) dim at that axis. The
-  // ShapeHelper-based exploration (`exploreSameDimsUsingShapeHelper`, tried
-  // before this function) already derives this generically via IndexExpr
-  // symbol passthrough when it can read the shape tensor's literal
-  // elements -- but that read happens through the generic IndexExprBuilder,
-  // which doesn't know how to see past an ONNXFusedOp's block argument, so
-  // it silently fails to confirm the target is 1 and falls back to
-  // synthesizing a brand-new, disconnected dim. Handle it explicitly here
-  // instead, using the already-resolved `shapeInput`.
-  if (auto expandOp = mlir::dyn_cast<ONNXExpandOp>(op)) {
-    SmallVector<int64_t, 4> shapeVals;
-    Value data = expandOp.getInput();
-    if (getI64ValuesFromONNXConstantOp(shapeInput, shapeVals) &&
-        hasShapeAndRank(data)) {
-      auto dataType = mlir::cast<ShapedType>(data.getType());
-      int64_t dataRank = dataType.getRank();
-      int64_t outRank = (int64_t)shapeVals.size();
-      int64_t dataAxis = dataRank - (outRank - (int64_t)outputDimIndex);
-      if (dataAxis >= 0 && dataAxis < dataRank &&
-          dataType.isDynamicDim(dataAxis) && shapeVals[outputDimIndex] == 1) {
-        if (auto d = insertDimWhenUseful(data, dataAxis, sameDims))
-          LLVM_DEBUG(llvm::dbgs()
-                     << "  - [Expand-passthrough] Added a new dim("
-                     << d.value().first << ", " << d.value().second << ")\n");
-        return true;
-      }
-    }
   }
 
   return false;
@@ -725,6 +707,9 @@ DimAnalysis::DimAnalysis(ModuleOp moduleOp)
       // Build dimensions for function arguments and results.
       buildFunctionArgsRes(
           funcOp, /*buildForInputs*/ true, /*buildForOutputs*/ true);
+    } else if (auto fusedOp = mlir::dyn_cast<ONNXFusedOp>(op)) {
+      buildForONNXFusedOpArgsRes(
+          op, /*buildForInputs*/ true, /*buildForOutputs*/ true);
     } else {
       // Build dimensions for normal operation results.
       for (Value output : op->getResults())
@@ -854,6 +839,40 @@ void DimAnalysis::buildFunctionArgsRes(
     int64_t setID = -1;
     for (DimT d : dimSet)
       setID = build(d, setID);
+  }
+}
+
+void DimAnalysis::buildForONNXFusedOpArgsRes(
+    Operation *op, bool buildForInputs, bool buildForOutputs) {
+  auto fusedOp = mlir::dyn_cast<ONNXFusedOp>(op);
+  if (!fusedOp)
+    return;
+  auto buildFor = [this](ValueRange args) {
+    for (size_t argPos = 0; argPos < args.size(); ++argPos) {
+      Value arg = args[argPos];
+      auto tensorType = mlir::dyn_cast<RankedTensorType>(arg.getType());
+      if (!tensorType)
+        continue;
+      // Check and build each dynamic dimension.
+      for (int64_t dimPos = 0; dimPos < tensorType.getRank(); ++dimPos) {
+        if (!tensorType.isDynamicDim(dimPos))
+          continue;
+        DimT ti(arg, dimPos);
+        build(ti);
+      }
+    }
+  };
+  // Build internal mappings for arguments.
+  if (buildForInputs) {
+    ArrayRef<BlockArgument> args = fusedOp.getBody().front().getArguments();
+    buildFor(args);
+  }
+
+  // Build internal mappings for results.
+  if (buildForOutputs) {
+    auto yieldOp =
+        mlir::cast<ONNXYieldOp>(fusedOp.getBody().front().getTerminator());
+    buildFor(yieldOp.getOperands());
   }
 }
 
@@ -1215,8 +1234,9 @@ void DimAnalysis::visitDim(
     Value input = resolveThroughFusedOp(tensor);
     if (input != tensor) {
       if (auto d = insertDimWhenUseful(input, dimIndex, sameDims))
-        LLVM_DEBUG(llvm::dbgs() << "  - Added a new dim(" << d.value().first
-                                << ", " << d.value().second << ")\n");
+        LLVM_DEBUG(llvm::dbgs()
+                   << "  - [BlockArgument] Added a new dim(" << d.value().first
+                   << ", " << d.value().second << ")\n");
     }
     return;
   }
