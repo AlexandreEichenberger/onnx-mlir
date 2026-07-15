@@ -137,6 +137,55 @@ public:
   bool verify() const override;
 };
 
+//===----------------------------------------------------------------------===//
+// ConcatExpandStickFusionHelper
+//
+// Subclass for ONNXFusedOp(kind = "zhigh.concat-expand-stick").
+//
+// Pattern (the GQA/MQA "repeat KV heads after cache-concat" idiom):
+//  ONNXConcatOp     exactly 2 inputs; axis A is not the innermost dim; each
+//                   input's innermost dim static mod 64 (required)
+//  ONNXUnsqueezeOp  one axis P, normalized and strictly less than the
+//                   concat result's rank (so the new dim is inserted at or
+//                   before the concat axis, never appended after it)
+//                   (required)
+//  ZHighF32ToDLF16Op  F32 CPU tensor => DLF16 CPU tensor (required)
+//  ONNXExpandOp     dim P expands from 1 to N (N static, >= 2); every other
+//                   dim is provably unchanged (required)
+//  ONNXReshapeOp    dims 0..P may collapse; dims after P unchanged (required)
+//  ONNXLayoutTransformOp   CPU => ZTensor, target layout 3D / 3DS / 4D
+//                   (required)
+//
+// Unique-use invariant: every intermediate value (concat result through
+// reshape) has exactly one use.  The final layout-transform result is not
+// checked.
+//
+//===----------------------------------------------------------------------===//
+
+class ConcatExpandStickFusionHelper : public onnx_mlir::FusionOpKindHelper {
+public:
+  static constexpr llvm::StringLiteral kKind{"zhigh.concat-expand-stick"};
+
+  int64_t concatAxis = -1;         ///< A: onnx.Concat's axis (normalized)
+  int64_t unsqueezedPosition = -1; ///< P: axis inserted by unsqueeze
+  int64_t expansionN = -1;         ///< N: value dim P expands to
+  bool noSaturation = false;       ///< F32ToDLF16's no_saturation attr
+  int64_t reshapeFirstCollapsedDim =
+      -1; ///< first input dim in merge run (-1 = none)
+  int64_t reshapeCollapsedCount = 0; ///< # consecutive input dims merged into 1
+  std::optional<mlir::StringAttr> finalLayout; ///< "3D", "3DS", or "4D"
+
+  /// Detect and parameterize the concat-expand-stick chain.
+  /// \p dimAnalysis must be non-null.
+  bool detectIfBeneficial(
+      const DimAnalysis *dimAnalysis, mlir::ONNXConcatOp startOp);
+
+  llvm::StringRef getKind() const override { return kKind; }
+  void embedAttrs(mlir::ONNXFusedOp fusedOp) const override;
+  bool retrieveAttrs(mlir::ONNXFusedOp fusedOp) override;
+  bool verify() const override;
+};
+
 } // namespace zhigh
 } // namespace onnx_mlir
 
