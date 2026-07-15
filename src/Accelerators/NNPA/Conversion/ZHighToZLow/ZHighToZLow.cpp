@@ -2926,6 +2926,233 @@ struct ZHighToZLowFusedExpandMulStickLowering
 };
 
 //===----------------------------------------------------------------------===//
+// Lowering for kind "zhigh.concat-expand-stick":
+//   Concat(2 inputs, axis A) -> Unsqueeze(axis P) -> F32ToDLF16 ->
+//   Expand(dim P: 1->N) -> Reshape (collapses [0..P]) -> LayoutTransform
+//
+// Computed as an outer loop over dims [0,A) (shared by both concat inputs),
+// containing two back-to-back tiled inner loop nests over dims [A,R) -- one
+// per concat input -- each reading its own operand and fanning the
+// converted value out to the N stickified output locations it broadcasts
+// to, exactly like ZHighToZLowFusedExpandMulStickLowering above.
+//
+// buildExpandMulStickOutputAF is reused verbatim: it only needs a rank-R
+// index tuple ranging over the *concatenated* extent at axis A, so operand
+// 2's sub-loop simply adds operand 1's axis-A extent as an offset to that
+// slot before calling it; operand 1 needs no shift (it occupies [0, S1)).
+//
+// yieldConcatResult (concat result also used outside the chain) is not yet
+// supported here; lowerVerified() returns failure() in that case and the
+// generic FusedOpInlineFallback takes over, exactly as for an unregistered
+// kind.
+//===----------------------------------------------------------------------===//
+
+struct ZHighToZLowFusedConcatExpandStickLowering
+    : public FusedOpKindLowering<ConcatExpandStickFusionHelper> {
+  using Base = FusedOpKindLowering<ConcatExpandStickFusionHelper>;
+  using OpAdaptor = typename ONNXFusedOp::Adaptor;
+  bool disableSaturation = false;
+
+  ZHighToZLowFusedConcatExpandStickLowering(
+      TypeConverter &typeConverter, MLIRContext *ctx, bool disableSaturation)
+      : Base(typeConverter, ctx), disableSaturation(disableSaturation) {}
+
+  FailureOr<Value> lowerVerified(ONNXFusedOp fusedOp, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter,
+      ConcatExpandStickFusionHelper &fusion) const override {
+    // Multi-output variant (concat result also yielded) not yet
+    // implemented; defer to the generic inline fallback.
+    if (fusion.yieldConcatResult)
+      return failure();
+
+    Location loc = fusedOp.getLoc();
+    MDBuilder create(rewriter, loc);
+    // Single function-level scope: all DimsExpr must outlive the nested
+    // blocks and loop lambdas where they are used (same rationale as
+    // ZHighToZLowFusedExpandMulStickLowering above).
+    IndexExprScope funcScope(create.krnl);
+
+    Operation *op = fusedOp.getOperation();
+    Value input1MemRef = adaptor.getInputs()[0]; // lowered memref, plain F32
+    Value input2MemRef = adaptor.getInputs()[1];
+    Value input1Tensor = fusedOp.getInputs()[0]; // tensor, for UnifiedStickSupport
+    Value input2Tensor = fusedOp.getInputs()[1];
+    Value outputTensor = fusedOp.getOutputs()[0]; // tensor-typed zTensor result
+
+    int64_t A = fusion.concatAxis;
+    int64_t P = fusion.unsqueezedPosition;
+    int64_t N = fusion.expansionN;
+    int64_t F = fusion.reshapeFirstCollapsedDim;
+    int64_t C = fusion.reshapeCollapsedCount;
+    bool effectiveDisableSaturation = fusion.noSaturation || disableSaturation;
+
+    int64_t R = getRank(input1MemRef.getType());          // concat rank
+    int64_t outputRank = getRank(outputTensor.getType());
+
+    // Step 0: source dims from the two lowered (plain, unstickified) inputs.
+    DimsExpr input1Dims, input2Dims;
+    create.krnlIE.getShapeAsDims(input1MemRef, input1Dims);
+    create.krnlIE.getShapeAsDims(input2MemRef, input2Dims);
+
+    // Concatenated dims: identical everywhere except axis A, where the two
+    // extents add up.
+    DimsExpr concatDims = input1Dims;
+    concatDims[A] = input1Dims[A] + input2Dims[A];
+
+    // Step 1: conceptual unsqueeze+expand sizes (rank R+1): insert the
+    // expand axis (size N) at position P.
+    DimsExpr midDims;
+    for (int64_t d = 0; d <= R; ++d) {
+      if (d < P)
+        midDims.emplace_back(concatDims[d]);
+      else if (d == P)
+        midDims.emplace_back(LitIE(N));
+      else
+        midDims.emplace_back(concatDims[d - 1]);
+    }
+
+    // Step 2: apply the reshape's head-collapse to get the final output
+    // dims, used for allocation.
+    // TODO: maybe refactor this into a helper function, since it's identical to the
+    // one in ZHighToZLowFusedExpandMulStickLowering above.
+    DimsExpr outputDims;
+    if (F == -1) {
+      outputDims = midDims; // Rout == R + 1
+    } else {
+      for (int64_t d = 0; d < F; ++d)
+        outputDims.emplace_back(midDims[d]);
+      IndexExpr mergedSize = midDims[F];
+      for (int64_t k = 1; k < C; ++k)
+        mergedSize = mergedSize * midDims[F + k];
+      outputDims.emplace_back(mergedSize);
+      for (int64_t d = F + C; d <= R; ++d)
+        outputDims.emplace_back(midDims[d]);
+    }
+    assert((int64_t)outputDims.size() == outputRank && "output dims mismatch");
+
+    // Allocate the output buffer: always a ZTensor (the chain always ends in
+    // ONNXLayoutTransformOp targeting a ZTensor).
+    ZMemRefType zMemRefType =
+        convertZTensorToMemRefType(outputTensor.getType());
+    Value allocVal =
+        insertAllocForZMemRef(zMemRefType, outputDims, op, rewriter);
+
+    // USS list: 2 reads (one per concat input) + N writes (same output
+    // tensor/alloc, N distinct instances so each can carry its own
+    // beforeStickLoop offset).
+    SmallVector<Value, 8> ussVals{input1Tensor, input2Tensor},
+        ussMemRefs{input1MemRef, input2MemRef};
+    BitVector isReads(2 + N, false), isWrites(2 + N, false);
+    isReads[0] = true;
+    isReads[1] = true;
+    for (int64_t n = 0; n < N; ++n) {
+      ussVals.push_back(outputTensor);
+      ussMemRefs.push_back(allocVal);
+      isWrites[2 + n] = true;
+    }
+    UnifiedStickSupportList uss(create.krnl, ussVals, ussMemRefs, isReads,
+        isWrites, effectiveDisableSaturation);
+
+    // Emit the tiled loop nest for one concat operand: iterate over its own
+    // dims [A, R), tiling only the innermost dim by 64 (exact division,
+    // guaranteed by fusion detection). readIdx selects which USS read entry
+    // (0 or 1) to use; axisAShift, when set, is added to the axis-A slot
+    // only when building the *output* access function (operand 2 sits
+    // after operand 1's extent in the concatenated coordinate space).
+    int64_t innerRank = R - A; // always >= 2, since A <= R - 2.
+    auto emitOperandLoop = [&](const KrnlBuilder &ck, DimsExpr &outerIndices,
+                                int64_t readIdx, DimsExpr &operandDims,
+                                std::optional<IndexExpr> axisAShift) {
+      MDBuilder create(ck);
+      ValueRange innerLoopDef = create.krnl.defineLoops(innerRank);
+      DimsExpr innerLbs(innerRank, LitIE(0));
+      DimsExpr innerUbs;
+      for (int64_t d = A; d < R; ++d)
+        innerUbs.emplace_back(operandDims[d]);
+      innerUbs[innerRank - 1] = innerUbs[innerRank - 1].ceilDiv(64);
+
+      create.krnl.iterateIE(innerLoopDef, innerLoopDef, innerLbs, innerUbs,
+          [&](const KrnlBuilder &ck2, ValueRange indices) {
+            MDBuilder create(ck2);
+            IndexExprScope midScope(ck2);
+            // outerIndices are Dim-kind index exprs bound to the outer
+            // loop's own (now-enclosing) scope; Dim/Symbol/Affine-kind
+            // index exprs cannot cross a scope boundary as-is (only
+            // literals can, via isEnclosingScope()) -- re-home them into
+            // this scope before combining with innerIndices, exactly as
+            // ProcessStickData.cpp does for the same reason.
+            DimsExpr rehomedOuterIndices =
+                DimListIE(llvm::ArrayRef<IndexExpr>(outerIndices));
+            DimsExpr innerIndices = DimListIE(indices);
+            innerIndices[innerRank - 1] = innerIndices[innerRank - 1] * 64;
+
+            // Read access function: operand's own local coordinate.
+            DimsExpr readAF = rehomedOuterIndices;
+            for (IndexExpr &e : innerIndices)
+              readAF.emplace_back(e);
+            uss.list[readIdx].beforeStickLoop(create.krnl, readAF);
+
+            // Output access function: shift axis A when requested.
+            DimsExpr combinedIndices = readAF;
+            if (axisAShift.has_value())
+              combinedIndices[A] = combinedIndices[A] + *axisAShift;
+            for (int64_t n = 0; n < N; ++n) {
+              DimsExpr outputAF = buildExpandMulStickOutputAF(
+                  combinedIndices, n, P, F, C, R, midDims);
+              uss.list[2 + n].beforeStickLoop(create.krnl, outputAF);
+            }
+
+            int64_t U = 4;
+            int64_t totVL = U * UnifiedStickSupport::archVL;
+            create.krnl.forLoopIE(LitIE(0), LitIE(64), totVL, /*par*/ false,
+                [&](const KrnlBuilder kb, ValueRange loopInd) {
+                  IndexExprScope innerScope(kb, &midScope);
+                  MDBuilder create(ck2);
+                  IndexExpr l = DimIE(loopInd[0]);
+                  for (int64_t u = 0; u < U; ++u) {
+                    uss.list[readIdx].beforeCompute(create.krnl, l, u);
+                    Value highIn, lowIn;
+                    uss.list[readIdx].get4xF32Vals(highIn, lowIn);
+                    MultiDialectBuilder<MathBuilder, ZLowBuilder> mcreate(
+                        create.krnl);
+                    Value dlf16 = mcreate.zlow.convertF32ToDLF16(
+                        highIn, lowIn, effectiveDisableSaturation);
+                    for (int64_t n = 0; n < N; ++n)
+                      uss.list[2 + n].storeConvertedDLF16(
+                          create.krnl, dlf16, l, u);
+                  }
+                });
+          });
+    };
+
+    if (A > 0) {
+      ValueRange outerLoopDef = create.krnl.defineLoops(A);
+      DimsExpr outerLbs(A, LitIE(0));
+      DimsExpr outerUbs;
+      for (int64_t d = 0; d < A; ++d)
+        outerUbs.emplace_back(concatDims[d]);
+      // TODO: enable parallelization of the outer loop when A > 0 (currently disabled)
+      create.krnl.iterateIE(outerLoopDef, outerLoopDef, outerLbs, outerUbs,
+          [&](const KrnlBuilder &ck, ValueRange indices) {
+            MDBuilder create(ck);
+            IndexExprScope outerScope(ck);
+            DimsExpr outerIndices = DimListIE(indices);
+            emitOperandLoop(ck, outerIndices, 0, input1Dims, std::nullopt);
+            emitOperandLoop(
+                ck, outerIndices, 1, input2Dims, DimIE(input1Dims[A]));
+          });
+    } else {
+      DimsExpr emptyOuter;
+      emitOperandLoop(create.krnl, emptyOuter, 0, input1Dims, std::nullopt);
+      emitOperandLoop(
+          create.krnl, emptyOuter, 1, input2Dims, DimIE(input1Dims[A]));
+    }
+
+    return allocVal;
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // Populate all the patterns.
 //===----------------------------------------------------------------------===//
 void populateZHighToZLowConversionPattern(mlir::RewritePatternSet &patterns,
@@ -2996,6 +3223,8 @@ void populateZHighToZLowConversionPattern(mlir::RewritePatternSet &patterns,
   patterns.insert<ZHighToZLowFusedExtLayoutTransformLowering>(
       typeConverter, ctx, enableParallel, disableSaturation);
   patterns.insert<ZHighToZLowFusedExpandMulStickLowering>(
+      typeConverter, ctx, disableSaturation);
+  patterns.insert<ZHighToZLowFusedConcatExpandStickLowering>(
       typeConverter, ctx, disableSaturation);
 }
 
