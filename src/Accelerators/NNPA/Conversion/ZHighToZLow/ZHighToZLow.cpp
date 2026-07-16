@@ -2990,9 +2990,9 @@ struct ZHighToZLowFusedConcatExpandStickLowering
   // conversion for this tile.
   void emitOperandLoopBody(const KrnlBuilder &ck2, ValueRange indices,
       DimsExpr &outerIndices, int64_t readIdx, int64_t innerRank, int64_t A,
-      int64_t R, int64_t N, int64_t P, int64_t F, int64_t C,
-      DimsExpr &midDims, std::optional<IndexExpr> axisAShift,
-      UnifiedStickSupportList &uss, bool effectiveDisableSaturation) const {
+      int64_t R, int64_t N, int64_t P, int64_t F, int64_t C, DimsExpr &midDims,
+      std::optional<IndexExpr> axisAShift, UnifiedStickSupportList &uss,
+      bool effectiveDisableSaturation) const {
     MDBuilder create(ck2);
     IndexExprScope midScope(ck2);
     // outerIndices are Dim-kind index exprs bound to the outer loop's own
@@ -3002,6 +3002,7 @@ struct ZHighToZLowFusedConcatExpandStickLowering
     // exactly as ProcessStickData.cpp does for the same reason.
     DimsExpr rehomedOuterIndices =
         DimListIE(llvm::ArrayRef<IndexExpr>(outerIndices));
+    DimsExpr rehomedMidDims = DimListIE(llvm::ArrayRef<IndexExpr>(midDims));
     DimsExpr innerIndices = DimListIE(indices);
     innerIndices[innerRank - 1] = innerIndices[innerRank - 1] * 64;
 
@@ -3020,8 +3021,8 @@ struct ZHighToZLowFusedConcatExpandStickLowering
     if (axisAShift.has_value())
       combinedIndices[A] = combinedIndices[A] + DimIE(*axisAShift);
     for (int64_t n = 0; n < N; ++n) {
-      DimsExpr outputAF =
-          buildExpandMulStickOutputAF(combinedIndices, n, P, F, C, R, midDims);
+      DimsExpr outputAF = buildExpandMulStickOutputAF(
+          combinedIndices, n, P, F, C, R, rehomedMidDims);
       uss.list[2 + n].beforeStickLoop(create.krnl, outputAF);
     }
 
@@ -3051,8 +3052,8 @@ struct ZHighToZLowFusedConcatExpandStickLowering
 
     create.krnl.iterateIE(innerLoopDef, innerLoopDef, innerLbs, innerUbs,
         [&](const KrnlBuilder &ck2, ValueRange indices) {
-          emitOperandLoopBody(ck2, indices, outerIndices, readIdx, innerRank,
-              A, R, N, P, F, C, midDims, axisAShift, uss,
+          emitOperandLoopBody(ck2, indices, outerIndices, readIdx, innerRank, A,
+              R, N, P, F, C, midDims, axisAShift, uss,
               effectiveDisableSaturation);
         });
   }
@@ -3084,8 +3085,8 @@ struct ZHighToZLowFusedConcatExpandStickLowering
     DimsExpr lbs(R, LitIE(0));
     create.krnl.iterateIE(loopDef, loopDef, lbs, operandDims,
         [&](const KrnlBuilder &ck2, ValueRange indices) {
-          emitConcatCopyLoopBody(ck2, indices, inMemRef, axisAShift, A,
-              concatAlloc);
+          emitConcatCopyLoopBody(
+              ck2, indices, inMemRef, axisAShift, A, concatAlloc);
         });
   }
 
@@ -3194,8 +3195,8 @@ struct ZHighToZLowFusedConcatExpandStickLowering
             MDBuilder create(ck);
             IndexExprScope outerScope(ck);
             DimsExpr outerIndices = DimListIE(indices);
-            emitOperandLoop(ck, outerIndices, 0, input1Dims, std::nullopt, A,
-                R, N, P, F, C, midDims, uss, effectiveDisableSaturation);
+            emitOperandLoop(ck, outerIndices, 0, input1Dims, std::nullopt, A, R,
+                N, P, F, C, midDims, uss, effectiveDisableSaturation);
             emitOperandLoop(ck, outerIndices, 1, input2Dims,
                 DimIE(input1Dims[A]), A, R, N, P, F, C, midDims, uss,
                 effectiveDisableSaturation);
