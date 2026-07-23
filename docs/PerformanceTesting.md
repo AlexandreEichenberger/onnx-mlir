@@ -25,9 +25,8 @@ warmup/timed iteration counts and `--write-runtime-log` to capture the
 instrumentation output:
 
 ```bash
-utils/RunONNXModel.py --model mymodel.onnx \
+utils/RunONNXModel.py --model mymodel.onnx -w 2 -n 10  \
   --compile-args="-O3 --profile-ir=Onnx" \
-  -w 2 -n 10 \
   --write-runtime-log run.log
 ```
 

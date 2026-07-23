@@ -12,6 +12,7 @@ In onnx-mlir, there are three types of tests to ensure correctness of implementa
 ## ONNX Backend Tests
 
 Backend tests are end-to-end tests for onnx-mlir based on onnx node and model tests. They are available for testing both the C/C++ .so library and the JNI .jar archive. For each C/C++ test target, adding the `-jni` suffix gives the corresponding JNI test target.
+
 To invoke the test, use the following command:
 
 ```
