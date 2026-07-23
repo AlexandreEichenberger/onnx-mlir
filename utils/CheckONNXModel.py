@@ -92,9 +92,15 @@ parser.add_argument(
     "-r",
     "--ref-compile-args",
     type=str,
-    default="-O0",
+    default="",
     help="Reference arguments passed directly to onnx-mlir command."
-    " See bin/onnx-mlir --help.",
+    " See bin/onnx-mlir --help."
+    " Default is empty (no --compile-args forwarded), so that with"
+    " --cache-ref-model, a cache hit is loaded as-is regardless of the"
+    " options it was originally built with. Passing any value here"
+    " (including '-O0') is checked for an exact match against the"
+    " cached model's saved options and aborts on mismatch"
+    " (see RunONNXModel.py's --cache-model/--load-model handling).",
 )
 test_group = parser.add_mutually_exclusive_group()
 test_group.add_argument(
@@ -306,8 +312,11 @@ def main():
 
     # Reference command.
     ref_cmd = [cmd]
-    # Compile options for reference.
-    ref_cmd += ["--compile-args=" + args.ref_compile_args]
+    # Compile options for reference. Omit entirely when empty (default) so
+    # that, combined with --cache-ref-model, a cache hit is loaded as-is
+    # instead of tripping RunONNXModel.py's saved-options mismatch check.
+    if args.ref_compile_args:
+        ref_cmd += ["--compile-args=" + args.ref_compile_args]
     # Where to load the ref.
     if args.load_ref:
         ref_cmd += ["--load-ref=" + args.load_ref]
