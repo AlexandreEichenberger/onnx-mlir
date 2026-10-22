@@ -17,10 +17,21 @@
 //   nested     : team sizes of the zDNNx 3-level matmul nest and collapse
 //   stress     : many regions with sleep/wake races (POMP_SPIN=0 helps)
 //   cycles     : open / enter / run / close, repeated (the per-inference
-//   pattern) bench      : fork/join and barrier latency
+//                pattern)
+//   bench      : fork/join and barrier latency
+//   loop       : one parallel loop region on a small array
+//   nestbench N1 N2 : nested region, N1 outer threads each forking N2
+//
+// POMP_TEST_CPUS=0-7 (Linux) pins thread t of the run to the t-th CPU listed:
+// the pool threads under pomp, and libomp's threads, in tid order, under
+// libomp, so that both runtimes can be compared with the same placement.
 //
 //===----------------------------------------------------------------------===//
 
+#ifdef __linux__
+#define _GNU_SOURCE
+#include <sched.h>
+#endif
 #include <inttypes.h>
 #include <omp.h>
 #include <pthread.h>
@@ -38,6 +49,41 @@
 static int num_threads = 4;
 
 // -----------------------------------------------------------------------------
+// Optional pinning (POMP_TEST_CPUS), the same for both runtimes
+// -----------------------------------------------------------------------------
+
+static int test_cpus[256], test_ncpus;
+
+static void parse_cpus(void) {
+  const char *s = getenv("POMP_TEST_CPUS");
+  while (s && *s && test_ncpus < 256) {
+    char *e;
+    long a = strtol(s, &e, 10), b = a;
+    if (e == s)
+      break;
+    if (*e == '-')
+      b = strtol(e + 1, &e, 10);
+    for (long c = a; c <= b && test_ncpus < 256; ++c)
+      test_cpus[test_ncpus++] = (int)c;
+    s = *e == ',' ? e + 1 : e;
+  }
+}
+
+// Pin the calling thread to the i-th listed CPU, if any.
+static void pin_self(int i) {
+#ifdef __linux__
+  cpu_set_t set;
+  if (i < 0 || i >= test_ncpus)
+    return;
+  CPU_ZERO(&set);
+  CPU_SET(test_cpus[i], &set);
+  pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+#else
+  (void)i;
+#endif
+}
+
+// -----------------------------------------------------------------------------
 // Host side: threads entering the pool (stands for the Java layer)
 // -----------------------------------------------------------------------------
 
@@ -45,7 +91,9 @@ static int num_threads = 4;
 static pthread_t members[POMP_MAX_THREADS];
 
 static void *member(void *arg) {
-  int rc = pomp_enter_pool((int)(intptr_t)arg);
+  int rc;
+  pin_self((int)(intptr_t)arg);
+  rc = pomp_enter_pool((int)(intptr_t)arg);
   if (rc != POMP_OK) {
     fprintf(stderr, "enter failed: %d\n", rc);
     exit(1);
@@ -84,7 +132,17 @@ static void start(void) {
   }
 #endif
   num_threads = omp_get_thread_limit();
+  parse_cpus();
+  pin_self(0);
   enter_all();
+#ifndef POMP
+  // libomp: pin each thread of a full team, which libomp keeps for later
+  // teams, so tid t stays on the t-th CPU as pomp's slot t does.
+  if (test_ncpus) {
+#pragma omp parallel num_threads(num_threads)
+    pin_self(omp_get_thread_num());
+  }
+#endif
 }
 
 static double now(void) {
@@ -362,8 +420,46 @@ static void test_loop(long iters) {
   t0 = now();
   for (i = 0; i < iters; ++i)
     scale(loop_data, n, 1.0f);
-  printf("loop: %d threads, %.2f us per region\n", num_threads,
+  printf("loop: %d threads, region %.2f us\n", num_threads,
       (now() - t0) / iters * 1e6);
+}
+
+// -----------------------------------------------------------------------------
+// nestbench: the zDNNx shape, an outer team of n1 whose members each fork an
+// inner team of n2, then an inner loop and barrier. Needs
+// OMP_MAX_ACTIVE_LEVELS=2 and a limit of at least n1 * n2.
+// -----------------------------------------------------------------------------
+
+static float nest_data[64][1024];
+
+static void test_nestbench(long iters, int n1, int n2) {
+  long i;
+  double t0 = now();
+  int got1 = 0, got2 = 0;
+  // Each outer member scales its own row by s, which is 1 but unknown to the
+  // compiler, so the loop is not removed.
+  volatile float vs = 1.0f;
+  float s = vs;
+  for (i = 0; i < 1000 + iters; ++i) {
+    if (i == 1000)
+      t0 = now();
+#pragma omp parallel num_threads(n1)
+    {
+      float *a = nest_data[omp_get_thread_num() & 63];
+#pragma omp parallel num_threads(n2)
+      {
+#pragma omp for
+        for (long k = 0; k < 1024; ++k)
+          a[k] *= s;
+        if (i == 0 && omp_get_thread_num() == 0)
+          __atomic_store_n(&got2, omp_get_num_threads(), __ATOMIC_RELAXED);
+      }
+      if (i == 0 && omp_get_thread_num() == 0)
+        got1 = omp_get_num_threads();
+    }
+  }
+  printf("nestbench: %dx%d threads (got %dx%d), region %.2f us\n", n1, n2, got1,
+      got2, (now() - t0) / iters * 1e6);
 }
 
 int main(int argc, char **argv) {
@@ -384,6 +480,9 @@ int main(int argc, char **argv) {
     test_loop(n ? n : 100000);
   else if (!strcmp(test, "bench"))
     test_bench(n ? n : 100000);
+  else if (!strcmp(test, "nestbench"))
+    test_nestbench(n ? n : 100000, argc > 3 ? atoi(argv[3]) : 4,
+        argc > 4 ? atoi(argv[4]) : 4);
   else {
     fprintf(stderr, "unknown test %s\n", test);
     return 1;

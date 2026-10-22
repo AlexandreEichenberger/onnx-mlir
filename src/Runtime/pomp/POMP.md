@@ -302,6 +302,12 @@ The pool starts closed, entries return `POMP_ERR_CLOSED` and regions run on one 
 `pomp_open_pool(limit)` sets the limit. The limit is then fixed: a later open with another value
 is clamped to it, with one warning, and opens the pool.
 
+**S13. Inner teams taking each other's workers** (`steal`, with `OMP_MAX_ACTIVE_LEVELS=2`).
+
+Level-1 and level-2 teams change size every cycle, so inner teams take workers outside their
+group, and workers move from one inner team to another. Every member must run the right work
+with a distinct tid.
+
 ### Rules for the host
 
 1. Call close and open from the leader, outside parallel regions. A close from another
@@ -706,7 +712,8 @@ entering the pool standing in for the host) and libomp, so their outputs can be 
 | `pomp_test stress N` | Many regions of varying size with a barrier | 200000 regions, no errors, at `POMP_SPIN` 200000, 50 and 0 |
 | `pomp_test barriers N` | 1–5 barrier pairs per region, team sizes 1 to the limit: after each barrier, every thread must see every other thread's write from before it | No errors at limits 1, 2, 3, 4, 5, 8, 16 and 17, with `POMP_TREE_BARRIER` 0, 2, 5 and 65; also under ThreadSanitizer |
 | `pomp_test cycles N` | Enter, run 10 regions, close: the per-inference pattern | 20000 cycles, no errors; about 200 µs per cycle at limit 8, mostly `pthread_create`/`join` in the test host |
-| `pomp_host_test <scenario>` | Host protocol scenarios S1–S12 above, and `latency` (leader time in `pomp_close_pool`) | All pass at limits 2, 3, 4, 8, 16 and 17, `POMP_SPIN` 0, 30 and 200000, both barrier kinds, with 1500-cycle soak runs; no ThreadSanitizer reports. Limit 1 is not a supported test configuration: `late` and `swap` assume a slot 1 exists |
+| `pomp_test bench`, `loop`, `nestbench N n1 n2` | Timings: empty fork/join and barrier; one loop region; an outer team of n1 whose members each fork n2 threads for a loop. `POMP_TEST_CPUS` pins thread t to the t-th CPU listed, for pomp and libomp alike | See `test/run_z.sh`, which runs them against libomp |
+| `pomp_host_test <scenario>` | Host protocol scenarios S1–S13 above, and `latency` (leader time in `pomp_close_pool`) | All pass at limits 2, 3, 4, 8, 16 and 17, `POMP_SPIN` 0, 30 and 200000, both barrier kinds, with 1500-cycle soak runs; no ThreadSanitizer reports. Limit 1 is not a supported test configuration: `late` and `swap` assume a slot 1 exists |
 | `pomp_irbuilder_test` | Code from `-fopenmp-enable-irbuilder`, the OpenMPIRBuilder path MLIR uses, which calls `__kmpc_global_thread_num` on workers | Correct at limits 1, 4, 18; also with `POMP_USE_PTHREAD_KEY` |
 | ThreadSanitizer | `static`, `nested` (both nesting modes), `stress`, `barriers`, `cycles`, and all of `pomp_host_test`, with both barrier kinds and `POMP_SPIN` 0 and 30 | No reports |
 
@@ -725,6 +732,31 @@ OMP_THREAD_LIMIT=8 ./pomp_host_test reuse
 
 On macOS with Apple clang, use `-Xclang -fopenmp -I$(brew --prefix libomp)/include` for
 `-fopenmp`; no libomp is linked.
+
+## Tried and not kept: team reuse from the Blue Gene/Q runtime
+
+Branch `pomp-bgq-attempt` applied two ideas from Eichenberger and O'Brien, "Experimenting with
+low-overhead OpenMP runtime on IBM Blue Gene/Q" (IBM J. Res. & Dev. 57(1/2), 2013), to the fork:
+
+- when a leader forks the same workers as last time, it skips writing their assignments (team,
+  tid), with a per-team counter to detect workers taken by another team meanwhile;
+- it wakes the whole team with one atomic XOR on a shared word, instead of one epoch per worker.
+
+On macOS this made a 16-thread fork/join 5× faster (3.4 to 0.66 µs). On z17 it made no
+difference at 2 to 16 threads, the team sizes onnx-mlir uses, and helped only at 64:
+
+| Loop region, µs, z17 | 4 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|
+| pomp (this branch) | 1.38 | 1.83 | 2.48 | 2.84 | 4.67 |
+| pomp-bgq | 1.46 | 1.84 | 2.38 | 2.60 | 3.80 |
+| libomp | 0.89 | 1.66 | 2.49 | 3.21 | 5.18 |
+
+The shared wake-up word is the reason: on z, a line that one thread writes and many read is
+expensive, as for the barrier's broadcast release above. `pomp_zbench` shows it: design F
+(pomp's wake-up) beats C (the XOR word) up to 16 threads, 0.48 against 0.67 µs at 16. Skipping
+the assignment writes helps a little, but not enough for its extra state, so the simpler fork is
+kept. The libomp column used `OMP_PROC_BIND=close` with pomp unpinned; `test/run_z.sh` now
+times both runtimes with the same placement.
 
 ## Open items
 

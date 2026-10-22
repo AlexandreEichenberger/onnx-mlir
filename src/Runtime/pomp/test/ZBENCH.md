@@ -1,5 +1,26 @@
 # Running `pomp_zbench` on Linux on Z
 
+To build pomp itself and time it against libomp on the machine, outside onnx-mlir, use
+`test/run_z.sh` instead. From the pomp directory:
+
+```sh
+test/run_z.sh 2>&1 | tee pomp-test.log
+# if libomp is not on the linker's path, name it, e.g. onnx-mlir's copy:
+OMPLIBS="$PWD/../../../build/Debug/lib/libompruntime.a -ldl" test/run_z.sh 2>&1 | tee pomp-test.log
+```
+
+It needs a clang with `-fopenmp`, and takes about 20–40 minutes (`QUICK=1` for shorter
+correctness runs). It checks the digests against libomp, runs every stress and host scenario at
+limits 2–17, then times pomp and libomp (`KMP_BLOCKTIME=200`, hot inner teams) with threads
+free and pinned the same way (`CPUS`, default those allowed to the process):
+
+- one level, team sizes `LIMITS` (default 2 4 8 16): empty fork/join, barrier, loop region;
+- nested, shapes `NESTS` (default 4x4 4x8 8x4 8x8): an outer team whose members each fork an
+  inner team that runs a loop;
+- `pomp_zbench` section 4.
+
+Please send the whole output with `lscpu -e`.
+
 `pomp_zbench.c` is self-contained: C11 and pthreads, with no OpenMP and no other files needed.
 It measures the costs that decide pomp's fork/join design on a given machine.
 
@@ -59,11 +80,12 @@ Fork/join designs in section 4, all with spinning workers and an empty body unle
 
 | | Wake-up | Join | Note |
 |---|---|---|---|
-| A | one epoch per worker + per-worker assignment | one shared counter | pomp today |
-| B | one XOR on a shared activate word | one shared counter | the proposed cache-hit path |
-| C | one XOR on a shared activate word | per-worker done flags, polled by the leader | |
+| A | one epoch per worker + per-worker assignment | one shared counter | the first pomp |
+| B | one XOR on a shared activate word | one shared counter | |
+| C | one XOR on a shared activate word | per-worker done flags, polled by the leader | the `pomp-bgq-attempt` fork |
 | D | one XOR on a shared activate word | 4-ary tree | |
 | E | 4-ary tree | 4-ary tree | close to libomp's default |
+| F | one epoch per worker + per-worker assignment | per-worker done flags, polled by the leader | pomp today |
 
 ## Reference: macOS, 18-core Apple Silicon (not pinned)
 
