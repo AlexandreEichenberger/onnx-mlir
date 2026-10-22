@@ -4,16 +4,23 @@ To build pomp itself and run its tests and timings on the machine, outside onnx-
 `test/run_z.sh` instead; it also runs `pomp_zbench` section 4. From the pomp directory:
 
 ```sh
-git show 6e2d4e906:src/Runtime/pomp/pomp.c > /tmp/pomp-before.c   # pomp before team reuse
-BASE=/tmp/pomp-before.c test/run_z.sh                             # CC=clang by default
+git fetch origin
+git checkout pomp-bgq-attempt          # pomp after team reuse
+cd src/Runtime/pomp && test/run_z.sh   # CC=clang by default
 ```
 
-It needs a clang with `-fopenmp` and libomp, and takes about 15–30 minutes (`QUICK=1` for
-shorter correctness runs). It builds pomp as is, with `-DPOMP_EPOCH_WAKE` and with
-`-DPOMP_USE_PTHREAD_KEY`; checks the digests against libomp; runs every stress and host
-scenario at limits 2–17; then times fork/join, barrier and the loop region for pomp before, both
-pomp builds and libomp (`KMP_BLOCKTIME=200`) at `LIMITS` (default 4 8 16 32 64). Please send
-the whole output with `lscpu -e`.
+It needs a clang with `-fopenmp` and libomp, and takes about 30–60 minutes (`QUICK=1` for
+shorter correctness runs). It compares two versions of `pomp.c`:
+
+- *before*: pomp before team reuse, read with `git show` from `origin/pomp-first-attempt`
+  (`BASE_REF=` another ref, or `BASE=` a file, outside a git clone);
+- *after*: the checked-out `pomp.c`, built as is, with `-DPOMP_EPOCH_WAKE` and with
+  `-DPOMP_USE_PTHREAD_KEY`.
+
+Every build runs the tests of the checkout, which include S13 (`steal`): digests against libomp,
+then every stress and host scenario at limits 2–17. Then it times fork/join, barrier and the
+loop region for *before*, both *after* builds and libomp (`KMP_BLOCKTIME=200`) at `LIMITS`
+(default 4 8 16 32 64). Please send the whole output with `lscpu -e`.
 
 `pomp_zbench.c` is self-contained: C11 and pthreads, with no OpenMP and no other files needed.
 It measures the costs that decide pomp's fork/join design on a given machine.

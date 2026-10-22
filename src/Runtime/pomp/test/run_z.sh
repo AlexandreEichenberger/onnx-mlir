@@ -12,14 +12,16 @@
 #   OMPLIBS=                            # link flags for libomp, if not found
 #   LIMITS="4 8 16 32 64"               # thread limits for the benchmarks
 #   QUICK=1                             # shorter correctness runs
-#   BASE=old/pomp.c                     # also time this older pomp.c, e.g.
-#     git show 6e2d4e906:src/Runtime/pomp/pomp.c > /tmp/pomp-before.c
+#   BASE_REF=origin/pomp-first-attempt  # git ref of pomp before team reuse
+#   BASE=old/pomp.c                     # or that pomp.c as a file, if this
+#                                       # copy of pomp is not in a git clone
+#   BASE_REF= BASE=                     # both empty: skip the "before" pomp
 #
-# Builds three runtimes and the same tests against each, plus libomp:
+# Builds four runtimes and the same tests against each, plus libomp:
 #   pomp-xor    pomp as is: team reuse and one XOR wake-up
 #   pomp-epoch  -DPOMP_EPOCH_WAKE: team reuse, one epoch per worker
 #   pomp-key    -DPOMP_USE_PTHREAD_KEY: as pomp-xor, with a pthread key
-#   pomp-before BASE, if given: timed only
+#   pomp-before pomp before team reuse (BASE_REF or BASE), tested and timed
 #   libomp      the compiler's libomp, for the digests and the reference timings
 # Please send back the whole output, with `lscpu` and `lscpu -e`.
 
@@ -30,6 +32,7 @@ OMPLIBS=${OMPLIBS:-}
 B=${1:-build-z}
 LIMITS=${LIMITS:-"4 8 16 32 64"}
 BASE=${BASE:-}
+BASE_REF=${BASE_REF-origin/pomp-first-attempt}
 N=$([ "${QUICK:-0}" = 1 ] && echo 2000 || echo 20000)
 mkdir -p "$B"
 fail=0
@@ -53,15 +56,35 @@ for v in xor epoch key; do
     $CC $OPT test/pomp_host_test.c "$B/$v/pomp.o" -pthread -o "$B/$v/pomp_host_test" ||
     { echo "build of pomp-$v failed"; exit 1; }
 done
+# pomp before team reuse: from BASE if given, else from BASE_REF. It has the
+# same interface, so it runs today's tests, the new S13 included.
 TIMED="xor epoch"
+TESTED="xor epoch"
+mkdir -p "$B/before"
 if [ -n "$BASE" ]; then
-  mkdir -p "$B/before"
-  cp "$BASE" "$B/before/pomp.c" && cp pomp.h "$B/before/" &&
+  cp "$BASE" "$B/before/pomp.c" || exit 1
+  echo "before: $BASE"
+elif [ -n "$BASE_REF" ] &&
+  git show "$BASE_REF:./pomp.c" >"$B/before/pomp.c" 2>/dev/null; then
+  echo "before: $BASE_REF ($(git rev-parse --short "$BASE_REF"))"
+else
+  rm -f "$B/before/pomp.c"
+  echo "before: skipped (no BASE, and BASE_REF '$BASE_REF' not found; try" \
+    "git fetch origin)"
+fi
+if [ -f "$B/before/pomp.c" ]; then
+  cp pomp.h "$B/before/" &&
     $CC $OPT -c "$B/before/pomp.c" -o "$B/before/pomp.o" &&
     $CC "$B/xor/pomp_test.o" "$B/before/pomp.o" -pthread \
-      -o "$B/before/pomp_test" || { echo "build of BASE failed"; exit 1; }
+      -o "$B/before/pomp_test" &&
+    $CC $OPT test/pomp_host_test.c "$B/before/pomp.o" -pthread \
+      -o "$B/before/pomp_host_test" || { echo "build of before failed"; exit 1; }
   TIMED="before $TIMED"
+  TESTED="before $TESTED"
 fi
+echo "after:  $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo this copy)" \
+  "($(git rev-parse --short HEAD 2>/dev/null || echo no git))" \
+  "$(git diff --quiet -- . 2>/dev/null || echo "+ local changes")"
 $CC $OPT $OMPFLAGS test/pomp_test.c $OMPLIBS -o "$B/pomp_test_libomp" || exit 1
 $CC $OPT $OMPFLAGS -fopenmp-enable-irbuilder -c test/pomp_irbuilder_test.c \
   -o "$B/irb.o" && for v in xor key; do
@@ -74,16 +97,19 @@ if command -v objdump >/dev/null && [ "$(uname -m)" = s390x ]; then
 fi
 
 note "digests against libomp"
-for L in 1 2 3 4 5 8 16; do
-  a=$(OMP_THREAD_LIMIT=$L "$B/xor/pomp_test" static)
-  b=$(OMP_THREAD_LIMIT=$L "$B/pomp_test_libomp" static 2>/dev/null)
-  [ "$a" = "$b" ] || bad "static at limit $L differs from libomp"
-done
-for E in OMP_DUMMY=1 OMP_NUM_THREADS=4,4 OMP_MAX_ACTIVE_LEVELS=2; do
-  for L in 4 8 16; do
-    a=$(env $E OMP_THREAD_LIMIT=$L "$B/xor/pomp_test" nested)
-    b=$(env $E OMP_THREAD_LIMIT=$L "$B/pomp_test_libomp" nested 2>/dev/null)
-    [ "$a" = "$b" ] || bad "nested with $E at limit $L differs from libomp"
+for v in $TESTED; do
+  for L in 1 2 3 4 5 8 16; do
+    a=$(OMP_THREAD_LIMIT=$L "$B/$v/pomp_test" static)
+    b=$(OMP_THREAD_LIMIT=$L "$B/pomp_test_libomp" static 2>/dev/null)
+    [ "$a" = "$b" ] || bad "pomp-$v static at limit $L differs from libomp"
+  done
+  for E in OMP_DUMMY=1 OMP_NUM_THREADS=4,4 OMP_MAX_ACTIVE_LEVELS=2; do
+    for L in 4 8 16; do
+      a=$(env $E OMP_THREAD_LIMIT=$L "$B/$v/pomp_test" nested)
+      b=$(env $E OMP_THREAD_LIMIT=$L "$B/pomp_test_libomp" nested 2>/dev/null)
+      [ "$a" = "$b" ] ||
+        bad "pomp-$v nested with $E at limit $L differs from libomp"
+    done
   done
 done
 for v in xor key; do
@@ -100,7 +126,7 @@ run() {
   out=$("$@" 2>&1) || { bad "$*"; echo "$out" | tail -5; return; }
   echo "$out" | grep -qE 'bad [1-9]|errors [1-9]' && { bad "$*"; echo "$out"; }
 }
-for v in xor epoch; do
+for v in $TESTED; do
   T="$B/$v"
   for L in 2 3 4 8 16 17; do
     for S in 0 30 200000; do
@@ -120,8 +146,8 @@ for v in xor epoch; do
       done
     done
   done
+  echo "pomp-$v: $runs runs, $fail failures so far"
 done
-echo "$runs runs, $fail failures so far"
 
 note "fork/join, barrier and loop, us (median of 3 runs of 100000)"
 med() { sort -n | sed -n 2p; }
