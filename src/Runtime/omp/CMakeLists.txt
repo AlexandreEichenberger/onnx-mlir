@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
-if(OMP_SUPPORTED)
+if(OMP_SUPPORTED AND ONNX_MLIR_USE_POMP)
+  # libompruntime.a is pomp (src/Runtime/pomp), built there.
+  message(STATUS "OpenMP support           : ON (pomp)")
+elseif(OMP_SUPPORTED)
   set(OMP_TOPDIR ${CMAKE_CURRENT_BINARY_DIR})
   set_directory_properties(PROPERTIES EP_BASE ${OMP_TOPDIR})
   set(OPENMP_SOURCE_DIR ${LLVM_BUILD_MAIN_SRC_DIR}/../runtimes)

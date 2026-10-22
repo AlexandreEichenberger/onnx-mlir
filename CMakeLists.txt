@@ -93,6 +93,7 @@ choose_build_target()
 
 option(ONNX_MLIR_ENABLE_STABLEHLO "Enable StableHLO support." ON)
 option(ONNX_MLIR_ENABLE_JAVA "Set to ON for building the Java runtime, tools, and tests" ON)
+option(ONNX_MLIR_USE_POMP "Use pomp, the minimal pool-based OpenMP runtime, as libompruntime.a instead of LLVM's libomp" OFF)
 
 # Disable StableHLO in standalone mode to reduce dependencies
 # Note: Java/JNI support is compatible with standalone builds as it uses static libraries

@@ -6,6 +6,7 @@ choose_build_target()
 
 add_subdirectory(jni)
 add_subdirectory(omp)
+add_subdirectory(pomp)
 add_subdirectory(python)
 
 # TODO: should add for each accelerator its subdirectory that implements InitAccel##name
