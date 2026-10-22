@@ -10,7 +10,9 @@
 #   CC=clang                            # needs -fopenmp and omp.h
 #   OMPFLAGS=-fopenmp                   # compile flags for OpenMP code
 #   OMPLIBS=                            # link flags for libomp; by default,
-#                                       # found next to $CC, or none
+#                                       # found next to $CC, or none. May name
+#                                       # the archive itself, e.g. onnx-mlir's:
+#     OMPLIBS="$PWD/../../../build/Debug/lib/libompruntime.a -ldl"
 #   LIMITS="4 8 16 32 64"               # thread limits for the benchmarks
 #   QUICK=1                             # shorter correctness runs
 #   BASE_REF=origin/pomp-first-attempt  # git ref of pomp before team reuse
@@ -101,11 +103,28 @@ if [ -z "$OMPLIBS" ] &&
     fi
   done
 fi
+# With OMPLIBS, link without -fopenmp, which would add -lomp: OMPLIBS may
+# then name an archive of another name, such as onnx-mlir's libompruntime.a.
 HAVE_LIBOMP=1
-$CC $OPT $OMPFLAGS test/pomp_test.c $OMPLIBS -o "$B/pomp_test_libomp" ||
-  { HAVE_LIBOMP=0; echo "libomp not found (set OMPLIBS=-L<dir>):" \
-    "skipping the digests and the libomp timings"; }
-[ $HAVE_LIBOMP = 1 ] && [ -n "$OMPLIBS" ] && echo "libomp: $OMPLIBS"
+$CC $OPT $OMPFLAGS -c test/pomp_test.c -o "$B/pomp_test_libomp.o" &&
+  if [ -n "$OMPLIBS" ]; then
+    $CC "$B/pomp_test_libomp.o" $OMPLIBS -pthread -lm -o "$B/pomp_test_libomp"
+  else
+    $CC $OMPFLAGS "$B/pomp_test_libomp.o" -o "$B/pomp_test_libomp"
+  fi || HAVE_LIBOMP=0
+# An onnx-mlir built with ONNX_MLIR_USE_POMP=ON has pomp as libompruntime.a:
+# comparing with it would compare pomp with itself.
+if [ $HAVE_LIBOMP = 1 ] && command -v nm >/dev/null &&
+  nm "$B/pomp_test_libomp" 2>/dev/null | grep -q pomp_open_pool; then
+  echo "OMPLIBS ($OMPLIBS) is pomp, not libomp"
+  HAVE_LIBOMP=0
+fi
+if [ $HAVE_LIBOMP = 1 ]; then
+  [ -n "$OMPLIBS" ] && echo "libomp: $OMPLIBS"
+else
+  echo "libomp not found (set OMPLIBS=-L<dir>, or to the archive):" \
+    "skipping the digests and the libomp timings"
+fi
 $CC $OPT $OMPFLAGS -fopenmp-enable-irbuilder -c test/pomp_irbuilder_test.c \
   -o "$B/irb.o" && for v in xor key; do
   $CC "$B/irb.o" "$B/$v/pomp.o" -pthread -o "$B/$v/irb"
