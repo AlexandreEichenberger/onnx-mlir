@@ -433,9 +433,8 @@ static void test_loop(long iters) {
 static float nest_data[64][1024];
 
 static void test_nestbench(long iters, int n1, int n2) {
-  long i;
+  long i, short1 = 0, short2 = 0;
   double t0 = now();
-  int got1 = 0, got2 = 0;
   // Each outer member scales its own row by s, which is 1 but unknown to the
   // compiler, so the loop is not removed.
   volatile float vs = 1.0f;
@@ -446,20 +445,23 @@ static void test_nestbench(long iters, int n1, int n2) {
 #pragma omp parallel num_threads(n1)
     {
       float *a = nest_data[omp_get_thread_num() & 63];
+      if (omp_get_thread_num() == 0 && omp_get_num_threads() != n1)
+        __atomic_fetch_add(&short1, 1, __ATOMIC_RELAXED);
 #pragma omp parallel num_threads(n2)
       {
 #pragma omp for
         for (long k = 0; k < 1024; ++k)
           a[k] *= s;
-        if (i == 0 && omp_get_thread_num() == 0)
-          __atomic_store_n(&got2, omp_get_num_threads(), __ATOMIC_RELAXED);
+        if (omp_get_thread_num() == 0 && omp_get_num_threads() != n2)
+          __atomic_fetch_add(&short2, 1, __ATOMIC_RELAXED);
       }
-      if (i == 0 && omp_get_thread_num() == 0)
-        got1 = omp_get_num_threads();
     }
   }
-  printf("nestbench: %dx%d threads (got %dx%d), region %.2f us\n", n1, n2, got1,
-      got2, (now() - t0) / iters * 1e6);
+  // A runtime that gives smaller teams than asked does less work: report it,
+  // as a timing is then not comparable.
+  printf("nestbench: %dx%d threads, short teams %ld outer %ld inner, region "
+         "%.2f us\n",
+      n1, n2, short1, short2, (now() - t0) / iters * 1e6);
 }
 
 int main(int argc, char **argv) {

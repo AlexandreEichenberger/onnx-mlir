@@ -167,9 +167,7 @@ done
 echo "$runs runs, $fail failures"
 
 # Timings: median of 5 runs. libomp spins 200 ms before sleeping, as pomp
-# spins POMP_SPIN iterations, and keeps its inner teams from one region to the
-# next (KMP_HOT_TEAMS_MAX_LEVEL=2), as pomp does; by default it creates every
-# inner team again.
+# spins POMP_SPIN iterations.
 med() { sort -n | sed -n 3p; }
 field() { sed -n "s/.*$1 \([0-9.]*\) us.*/\1/p"; }
 time5() { # field cmd...
@@ -179,7 +177,7 @@ time5() { # field cmd...
 }
 RUNTIMES="pomp $([ $HAVE_LIBOMP = 1 ] && echo libomp)"
 exe() { [ $1 = pomp ] && echo "$B/tls/pomp_test" || echo "$B/pomp_test_libomp"; }
-LIBENV="KMP_BLOCKTIME=200 KMP_HOT_TEAMS_MAX_LEVEL=2 KMP_HOT_TEAMS_MODE=1"
+LIBENV="KMP_BLOCKTIME=200"
 
 note "one level, us per region (median of 5 runs of 100000)"
 printf '%-4s %-7s %-7s %10s %10s %10s\n' T runtime place fork/join barrier loop
@@ -199,19 +197,37 @@ done
 
 note "nested, outer x inner threads, us per outer region (median of 5 runs of 50000)"
 echo "Each outer member forks an inner team that runs one loop and its barrier."
-printf '%-6s %-7s %-7s %10s\n' shape runtime place region
+echo "libomp runs twice: by default, which creates every inner team again, and"
+echo "with hot inner teams, which it keeps as pomp does. Hot teams get full inner"
+echo "teams only without OMP_THREAD_LIMIT (else libomp gives them 1 thread), so"
+echo "libomp runs without it. Any short team is flagged: that timing is invalid."
+printf '%-6s %-12s %-7s %10s\n' shape runtime place region
+short=0
 for s in $NESTS; do
   n1=${s%x*}
   n2=${s#*x}
-  for rt in $RUNTIMES; do
+  for rt in $RUNTIMES $([ $HAVE_LIBOMP = 1 ] && echo libomp-hot); do
+    case $rt in
+    pomp) RE="OMP_THREAD_LIMIT=$((n1 * n2))" ;;
+    libomp) RE= ;;
+    libomp-hot) RE="KMP_HOT_TEAMS_MAX_LEVEL=2 KMP_HOT_TEAMS_MODE=1" ;;
+    esac
+    X=$(exe ${rt%-hot})
     for place in free pinned; do
       P=$([ $place = pinned ] && echo "POMP_TEST_CPUS=$CPUS")
-      E="env $LIBENV OMP_MAX_ACTIVE_LEVELS=2 OMP_THREAD_LIMIT=$((n1 * n2)) $P"
-      r=$(time5 region $E "$(exe $rt)" nestbench 50000 $n1 $n2)
-      printf '%-6s %-7s %-7s %10s\n' $s $rt $place "$r"
+      E="env $LIBENV OMP_MAX_ACTIVE_LEVELS=2 $RE $P"
+      v=$(for r in 1 2 3 4 5; do $E "$X" nestbench 50000 $n1 $n2 2>/dev/null; done)
+      r=$(echo "$v" | field region | med)
+      flag=
+      if echo "$v" | grep -qE 'short teams ([1-9][0-9]* outer|[0-9]+ outer [1-9])'; then
+        flag="  SHORT TEAMS: invalid"
+        short=$((short + 1))
+      fi
+      printf '%-6s %-12s %-7s %10s%s\n' $s $rt $place "$r" "$flag"
     done
   done
 done
+[ $short = 0 ] || echo "$short nested timings had short teams and are invalid"
 
 note "pomp_zbench, section 4 (fork/join designs; F is pomp today)"
 "$B/pomp_zbench" $(echo $LIMITS | tr ' ' ',') 2>&1 | sed -n '/^4\./,/^5\./p'
