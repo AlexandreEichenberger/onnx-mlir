@@ -9,15 +9,15 @@
 // =============================================================================
 //
 // Tests for pomp. Built with -fopenmp and linked either with pomp (-DPOMP,
-// worker threads donated by the test as a host would) or with libomp, so that
-// the printed results of the two can be compared line by line.
+// worker threads lent through the pool by the test, as a host would) or with
+// libomp, so that the printed results of the two can be compared line by line.
 //
 // Usage: pomp_test <test> [args]
 //   static     : static loop partitioning, many bounds/steps/types/teams
 //   nested     : team sizes of the zDNNx 3-level matmul nest and collapse
 //   stress     : many regions with sleep/wake races (POMP_SPIN=0 helps)
-//   cycles     : donate / run / release, repeated (the per-inference pattern)
-//   bench      : fork/join and barrier latency
+//   cycles     : open / enter / run / close, repeated (the per-inference
+//   pattern) bench      : fork/join and barrier latency
 //
 //===----------------------------------------------------------------------===//
 
@@ -38,53 +38,53 @@
 static int num_threads = 4;
 
 // -----------------------------------------------------------------------------
-// Host side: donate threads (stands for the Java layer)
+// Host side: threads entering the pool (stands for the Java layer)
 // -----------------------------------------------------------------------------
 
 #ifdef POMP
-static pthread_t donors[POMP_MAX_THREADS];
+static pthread_t members[POMP_MAX_THREADS];
 
-static void *donor(void *arg) {
-  int rc = pomp_donate_thread((int)(intptr_t)arg);
+static void *member(void *arg) {
+  int rc = pomp_enter_pool((int)(intptr_t)arg);
   if (rc != POMP_OK) {
-    fprintf(stderr, "donate failed: %d\n", rc);
+    fprintf(stderr, "enter failed: %d\n", rc);
     exit(1);
   }
   return NULL;
 }
 
-static void donate_all(void) {
+static void enter_all(void) {
   int i, n = pomp_get_thread_limit();
-  pomp_open_workers();
+  pomp_open_pool(0);
   for (i = 1; i < n; ++i)
-    pthread_create(&donors[i], NULL, donor, (void *)(intptr_t)i);
-  while (pomp_num_donated() != n - 1)
+    pthread_create(&members[i], NULL, member, (void *)(intptr_t)i);
+  while (pomp_pool_size() != n - 1)
     sched_yield();
 }
 
 static void release_all(void) {
   int i, n = pomp_get_thread_limit();
-  if (pomp_release_workers() != POMP_OK) {
+  if (pomp_close_pool() != POMP_OK) {
     fprintf(stderr, "release failed\n");
     exit(1);
   }
   for (i = 1; i < n; ++i)
-    pthread_join(donors[i], NULL);
+    pthread_join(members[i], NULL);
 }
 #else
-static void donate_all(void) {}
+static void enter_all(void) {}
 static void release_all(void) {}
 #endif
 
 static void start(void) {
 #ifdef POMP
-  if (pomp_init() != POMP_OK) {
-    fprintf(stderr, "pomp_init failed: OMP_THREAD_LIMIT\n");
+  if (pomp_get_thread_limit() == 0) {
+    fprintf(stderr, "no thread limit: set OMP_THREAD_LIMIT\n");
     exit(1);
   }
 #endif
   num_threads = omp_get_thread_limit();
-  donate_all();
+  enter_all();
 }
 
 static double now(void) {
@@ -256,7 +256,33 @@ static void test_stress(long iters) {
 }
 
 // -----------------------------------------------------------------------------
-// cycles: donate, run a few regions, release (once per "inference")
+// barriers: several barriers per region, varying team sizes; each phase must
+// see every write of the previous one.
+// -----------------------------------------------------------------------------
+
+static void test_barriers(long iters) {
+  static long cell[64];
+  long it, bad = 0;
+  for (it = 0; it < iters; ++it) {
+    int nth = 1 + (int)(it % num_threads), nbar = 1 + (int)(it % 5);
+#pragma omp parallel num_threads(nth)
+    {
+      int t = omp_get_thread_num(), n = omp_get_num_threads();
+      for (int b = 0; b < nbar; ++b) {
+        __atomic_store_n(&cell[t], it * 8 + b, __ATOMIC_RELAXED);
+#pragma omp barrier
+        for (int i = 0; i < n; ++i)
+          if (__atomic_load_n(&cell[i], __ATOMIC_RELAXED) != it * 8 + b)
+            __atomic_fetch_add(&bad, 1, __ATOMIC_RELAXED);
+#pragma omp barrier
+      }
+    }
+  }
+  printf("barriers: %ld regions, bad %ld\n", iters, bad);
+}
+
+// -----------------------------------------------------------------------------
+// cycles: enter, run a few regions, close (once per "inference")
 // -----------------------------------------------------------------------------
 
 static void test_cycles(long cycles) {
@@ -266,7 +292,7 @@ static void test_cycles(long cycles) {
   t0 = now();
   for (c = 0; c < cycles; ++c) {
     int r;
-    donate_all();
+    enter_all();
     for (r = 0; r < 10; ++r) {
       long s = 0;
 #pragma omp parallel for
@@ -279,7 +305,7 @@ static void test_cycles(long cycles) {
   }
   printf("cycles: %ld, bad %ld, %.1f us/cycle\n", cycles, bad,
       (now() - t0) / cycles * 1e6);
-  donate_all();
+  enter_all();
 }
 
 // -----------------------------------------------------------------------------
@@ -350,6 +376,8 @@ int main(int argc, char **argv) {
     test_nested();
   else if (!strcmp(test, "stress"))
     test_stress(n ? n : 100000);
+  else if (!strcmp(test, "barriers"))
+    test_barriers(n ? n : 20000);
   else if (!strcmp(test, "cycles"))
     test_cycles(n ? n : 1000);
   else if (!strcmp(test, "loop"))

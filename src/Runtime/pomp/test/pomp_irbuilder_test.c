@@ -30,21 +30,21 @@ void kernel(long n) {
       owner[i] += 1 + i % 7;
   }
 }
-static void *donor(void *a) {
-  pomp_donate_thread((int)(intptr_t)a);
+static void *member(void *a) {
+  pomp_enter_pool((int)(intptr_t)a);
   return 0;
 }
 int main(void) {
   pthread_t th[64];
   long n = 100000, sum = 0;
-  if (pomp_init()) {
-    fprintf(stderr, "init\n");
+  int L = pomp_get_thread_limit();
+  if (L == 0) {
+    fprintf(stderr, "no thread limit: set OMP_THREAD_LIMIT\n");
     return 1;
   }
-  int L = pomp_get_thread_limit();
   for (int i = 1; i < L; ++i)
-    pthread_create(&th[i], 0, donor, (void *)(intptr_t)i);
-  while (pomp_num_donated() != L - 1)
+    pthread_create(&th[i], 0, member, (void *)(intptr_t)i);
+  while (pomp_pool_size() != L - 1)
     sched_yield();
   for (int r = 0; r < 1000; ++r)
     kernel(n);
@@ -54,7 +54,7 @@ int main(void) {
   for (long i = 0; i < n; ++i)
     expect += 1000L * (1 + i % 7);
   printf("irbuilder: sum %ld %s\n", sum, sum == expect ? "ok" : "BAD");
-  pomp_release_workers();
+  pomp_close_pool();
   for (int i = 1; i < L; ++i)
     pthread_join(th[i], 0);
   return 0;

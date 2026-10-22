@@ -11,7 +11,6 @@ add_library(ompruntime STATIC pomp.c)
 set_target_properties(ompruntime
   PROPERTIES
   LANGUAGE C
-  C_STANDARD 11
   POSITION_INDEPENDENT_CODE TRUE
   ARCHIVE_OUTPUT_DIRECTORY ${ONNX_MLIR_LIBRARY_PATH}
   )
