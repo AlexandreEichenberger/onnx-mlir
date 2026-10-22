@@ -22,10 +22,14 @@
 // lent by the host through the pool (slots 1..limit-1). One 64-bit word,
 // `busy`, holds one bit per slot; a bit is clear iff that slot is an idle
 // worker in the pool. A
-// leader recruits a team with a single CAS on `busy`, hands each worker the
-// work through its descriptor, wakes it by bumping its private epoch, and
-// clears the team's bits again after the join. At most two levels are active;
-// deeper or empty forks run inline as a team of one.
+// leader recruits a team with a single CAS on `busy`, describes the work in
+// its team descriptor, wakes the whole team with one XOR on `activate`, and
+// clears the team's bits again after the join. When it recruits the same
+// workers as last time, it writes nothing in their descriptors: their (team,
+// tid) assignment is still valid. This follows Eichenberger and O'Brien,
+// "Experimenting with low-overhead OpenMP runtime on IBM Blue Gene/Q", IBM J.
+// Res. & Dev. 57(1/2), 2013. At most two levels are active; deeper or empty
+// forks run inline as a team of one.
 //
 // The join polls one done flag per member, and barriers of more than four
 // threads use a 4-ary tree; see POMP.md for the measurements behind both.
@@ -108,19 +112,28 @@ typedef struct pomp_sync {
 // A team descriptor: written by its leader before waking the members, read
 // by the members, and owned by the leader again after the join.
 typedef struct pomp_team {
-  // Work, written before the wake-up of the members.
+  // Work, written before the wake-up of the members. What every member reads
+  // comes first, so that with few arguments it fits in one cache line.
   pomp_microtask_t fn;
   int32_t argc;
-  void *argv[POMP_MAX_ARGS];
   int32_t nth;      /* Team size, leader included. */
   int32_t level;    /* Active level of this team: 1 or 2. */
   int32_t depth;    /* Leader's nesting depth before this region. */
   uint64_t region;  /* Number of this region, for the members' done flags. */
   uint64_t bar_seq; /* Barrier count before this region, for the tree. */
+  void *argv[POMP_MAX_ARGS];
   uint8_t slot_of_tid[POMP_MAX_THREADS];
-  // Reuse cache: the last request and the workers it got.
-  int32_t cached_req;
+  // Reuse cache: the workers that the last assignment of this team gave tids
+  // 1, 2, ... in slot order, and the value of `stolen` then. A request no
+  // larger than the cache, whose workers are all idle, takes the lowest of
+  // them, which keep their tids: if `stolen` is unchanged, nothing has to be
+  // assigned again.
   uint64_t cached_mask;
+  uint64_t cached_stolen;
+  // Bumped by any other leader that assigns a worker whose assignment was this
+  // team. It does so before it returns the worker, so a leader that recruits
+  // it again after that sees the bump.
+  atomic_uint_fast64_t stolen;
   // For a level-1 team: preferred workers for the level-2 team of each tid.
   uint64_t sub_mask[POMP_MAX_THREADS];
   // Central barrier, for small teams: arrival count and generation.
@@ -148,13 +161,18 @@ typedef struct pomp_level {
 
 // A thread descriptor, one per slot.
 typedef struct pomp_thread {
+#ifdef POMP_EPOCH_WAKE
   // Wake-up, on its own line: the epoch the worker waits on.
   _Alignas(POMP_CACHE_LINE) atomic_uint_fast64_t go;
-  // Assignment for the next wake-up, written by the recruiter before `go`.
+#endif
+  // Assignment for the next wake-up, written by the recruiter before the
+  // wake-up, and only if it changes. On its own line, which nobody else
+  // writes: a leader that recruits the same workers again finds it unchanged
+  // in its own cache, and the worker keeps it in its own.
   _Alignas(POMP_CACHE_LINE) pomp_team_t *team;
   int32_t tid;
   // Owned by the thread itself.
-  int32_t depth;  /* Nesting level; past POMP_MAX_DEPTH, only counted. */
+  _Alignas(POMP_CACHE_LINE) int32_t depth; /* Past POMP_MAX_DEPTH, counted. */
   int32_t active; /* Number of active levels, enclosing teams included. */
   pomp_level_t stack[POMP_MAX_DEPTH];
   // Sleep: a binary "posted" flag with its mutex and condition.
@@ -174,6 +192,11 @@ static pomp_team_t pomp_slot_team[POMP_MAX_THREADS];
 
 // Bit i is clear iff slot i is an idle worker in the pool.
 static _Alignas(POMP_CACHE_LINE) atomic_uint_fast64_t pomp_busy = UINT64_MAX;
+#ifndef POMP_EPOCH_WAKE
+// Bit i flips each time worker i is given work: a leader wakes its whole team
+// with one XOR. Each worker remembers the last value of its bit.
+static _Alignas(POMP_CACHE_LINE) atomic_uint_fast64_t pomp_activate;
+#endif
 // Bit i is set while worker i sleeps, or is about to.
 static _Alignas(POMP_CACHE_LINE) atomic_uint_fast64_t pomp_sleeping;
 // Bit i is set from the release that claimed worker i until it leaves.
@@ -442,9 +465,10 @@ int pomp_get_thread_limit(void) {
 // -----------------------------------------------------------------------------
 // Wake-up and sleep
 //
-// An idle worker spins on its `go` epoch and on its bit in `released`, then
-// sleeps. To sleep, it sets its bit in `sleeping`, re-reads both, and waits for
-// a post. A waker first publishes (bumps `go`, or sets the `released` bit),
+// An idle worker spins on its bit in `activate` (its `go` epoch with
+// POMP_EPOCH_WAKE) and on its bit in `released`, then sleeps. To sleep, it
+// sets its bit in `sleeping`, re-reads both, and waits for a post. A waker
+// first publishes (flips the `activate` bits, or sets the `released` bit),
 // then reads `sleeping`, and posts only to workers whose bit it clears itself.
 // All these accesses are sequentially consistent, so either the worker sees
 // the new value or the waker sees the bit: no wake-up is lost. Exactly one of
@@ -496,14 +520,24 @@ static void pomp_wake_released(int n) {
   }
 }
 
+// The wake-up signal of worker `t`, whose bit is `bit`: it changes each time
+// the worker is given work. A bit of `activate` cannot flip twice before the
+// worker sees the first flip: nobody can recruit it again before its done
+// flag says it ran that work.
+#ifdef POMP_EPOCH_WAKE
+#define POMP_GO(t, bit, mo) atomic_load_explicit(&(t)->go, mo)
+#else
+#define POMP_GO(t, bit, mo) (atomic_load_explicit(&pomp_activate, mo) & (bit))
+#endif
+
 // Wait for work or for release. Return true for work, with `*last` updated to
-// the new epoch, and false when a release has claimed this worker.
+// the new signal, and false when a release has claimed this worker.
 static bool pomp_wait(pomp_thread_t *t, uint64_t bit, uint64_t *last) {
   uint64_t g;
   bool rel;
   long i;
   for (i = 0; i < pomp_spin; ++i) {
-    g = atomic_load_explicit(&t->go, memory_order_acquire);
+    g = POMP_GO(t, bit, memory_order_acquire);
     if (g != *last)
       goto work;
     if (atomic_load_explicit(&pomp_released, memory_order_relaxed) & bit)
@@ -512,7 +546,7 @@ static bool pomp_wait(pomp_thread_t *t, uint64_t bit, uint64_t *last) {
   }
   for (;;) {
     atomic_fetch_or(&pomp_sleeping, bit);
-    g = atomic_load(&t->go);
+    g = POMP_GO(t, bit, memory_order_seq_cst);
     rel = (atomic_load(&pomp_released) & bit) != 0;
     if (g != *last || rel) {
       // A waker that cleared the bit has posted, or will: consume it.
@@ -521,7 +555,7 @@ static bool pomp_wait(pomp_thread_t *t, uint64_t bit, uint64_t *last) {
       break;
     }
     pomp_wait_post(t);
-    g = atomic_load(&t->go);
+    g = POMP_GO(t, bit, memory_order_seq_cst);
     rel = (atomic_load(&pomp_released) & bit) != 0;
     if (g != *last || rel)
       break;
@@ -811,15 +845,23 @@ static inline pomp_level_t *pomp_current_level(void) {
 // Fork / join
 // -----------------------------------------------------------------------------
 
-// Recruit up to `want` idle workers, preferring `prefer`. Return their mask.
-static uint64_t pomp_recruit(pomp_team_t *team, int want, uint64_t prefer) {
+// Recruit up to `want` idle workers, preferring `prefer`. Return their mask,
+// and in `*hit` whether they are the lowest of the team's cached workers,
+// whose assignments may then still be valid.
+static uint64_t pomp_recruit(
+    pomp_team_t *team, int want, uint64_t prefer, bool *hit) {
   uint64_t old = atomic_load_explicit(&pomp_busy, memory_order_relaxed);
+  uint64_t cached = team->cached_mask;
+  bool fits;
+  if (pomp_popcount(cached) > want)
+    cached = pomp_lowest_bits(cached, want);
+  fits = pomp_popcount(cached) == want;
   for (;;) {
     uint64_t pick;
     uint64_t idle = ~old & POMP_LIMIT_MASK();
-    if (team->cached_req == want && team->cached_mask &&
-        (team->cached_mask & ~idle) == 0) {
-      pick = team->cached_mask; // Same request, same workers all idle: O(1).
+    *hit = fits && (cached & ~idle) == 0;
+    if (*hit) {
+      pick = cached; // Cached workers, all idle: O(1).
     } else {
       // Take what is idle now, preferred workers first; fewer is fine.
       pick = pomp_lowest_bits(idle & prefer, want);
@@ -827,15 +869,37 @@ static uint64_t pomp_recruit(pomp_team_t *team, int want, uint64_t prefer) {
     }
     if (pick == 0)
       return 0;
+    // Acquire: see the assignments, and any bump of `stolen`, of the leaders
+    // that last returned these workers.
     if (atomic_compare_exchange_weak_explicit(&pomp_busy, &old, old | pick,
-            memory_order_acquire, memory_order_relaxed)) {
-      if (pomp_popcount(pick) == want) {
-        team->cached_req = want;
-        team->cached_mask = pick;
-      }
+            memory_order_acquire, memory_order_relaxed))
       return pick;
+  }
+}
+
+// Make `mask`, recruited by `team`, its tids 1, 2, ... in slot order. Write
+// only what changed, so that the workers' lines stay in their caches. Before
+// taking a worker from another team's assignment, invalidate that team's
+// cache.
+static void pomp_assign(pomp_team_t *team, uint64_t mask) {
+  int32_t tid;
+  uint64_t m;
+  for (tid = 1, m = mask; m; ++tid, m &= m - 1) {
+    int32_t slot = __builtin_ctzll(m);
+    pomp_thread_t *t = &pomp_threads[slot];
+    team->slot_of_tid[tid] = (uint8_t)slot;
+    if (t->team != team) {
+      if (t->team)
+        atomic_fetch_add_explicit(&t->team->stolen, 1, memory_order_relaxed);
+      t->team = team;
+      t->tid = tid;
+    } else if (t->tid != tid) {
+      t->tid = tid;
     }
   }
+  team->cached_mask = mask;
+  team->cached_stolen =
+      atomic_load_explicit(&team->stolen, memory_order_relaxed);
 }
 
 // For a level-1 team, split the remaining idle workers into one contiguous
@@ -852,6 +916,20 @@ static void pomp_partition(pomp_team_t *team) {
   }
 }
 
+// Wake the workers in `mask`, assigned to `team`: one XOR flips all their
+// activate bits (with POMP_EPOCH_WAKE, one epoch per worker). Then post to
+// those that sleep.
+static inline void pomp_wake_team(pomp_team_t *team, uint64_t mask) {
+#ifdef POMP_EPOCH_WAKE
+  for (int32_t tid = 1; tid <= pomp_popcount(mask); ++tid)
+    atomic_fetch_add(&pomp_threads[team->slot_of_tid[tid]].go, 1);
+#else
+  (void)team;
+  atomic_fetch_xor(&pomp_activate, mask);
+#endif
+  pomp_wake_sleepers(atomic_load(&pomp_sleeping) & mask);
+}
+
 static void pomp_release_idle(void);
 
 // The slot of the leader of `team`.
@@ -865,9 +943,9 @@ void __kmpc_fork_call(void *loc, int32_t argc, pomp_microtask_t fn, ...) {
   pomp_level_t *top;
   pomp_team_t *team;
   void *argv[POMP_MAX_ARGS];
-  uint64_t mask, prefer, m, bar;
+  uint64_t mask, prefer, bar;
   va_list ap;
-  bool outermost = false;
+  bool outermost = false, hit = false;
   (void)loc;
 
   pomp_ensure_init();
@@ -919,7 +997,7 @@ void __kmpc_fork_call(void *loc, int32_t argc, pomp_microtask_t fn, ...) {
       top = pomp_top(self);
       prefer = top->team ? top->team->sub_mask[top->tid] : 0;
     }
-    mask = pomp_recruit(team, want - 1, prefer);
+    mask = pomp_recruit(team, want - 1, prefer, &hit);
   }
   if (mask == 0) {
     pomp_push(self, NULL, 0, 1);
@@ -939,22 +1017,23 @@ void __kmpc_fork_call(void *loc, int32_t argc, pomp_microtask_t fn, ...) {
   team->level = self->active + 1;
   team->depth = self->depth;
   team->region++;
-  team->slot_of_tid[0] = (uint8_t)gtid;
-  atomic_store_explicit(&team->bar_count, 0, memory_order_relaxed);
+  // The central barrier's count needs no reset: the last thread out of each
+  // barrier resets it, and every barrier ends before the join.
   if (team->level == 1 && pomp_max_active > 1)
     pomp_partition(team);
 
-  // Assign and wake the members; post only to those that sleep. The whole
-  // map is written first: members use it to wake each other.
-  for (tid = 1, m = mask; m; ++tid, m &= m - 1)
-    team->slot_of_tid[tid] = (uint8_t)__builtin_ctzll(m);
-  for (tid = 1; tid < nth; ++tid) {
-    pomp_thread_t *t = &pomp_threads[team->slot_of_tid[tid]];
-    t->team = team;
-    t->tid = tid;
-    atomic_fetch_add(&t->go, 1);
-  }
-  pomp_wake_sleepers(atomic_load(&pomp_sleeping) & mask);
+  // Assign the members, unless their assignments are still those of the
+  // team's cache: same workers, same tids, and no other team took any of
+  // them since. The whole tid map is written before the wake-up: members use
+  // it to wake each other.
+  if (team->slot_of_tid[0] != (uint8_t)gtid)
+    team->slot_of_tid[0] = (uint8_t)gtid;
+  if (!hit || atomic_load_explicit(&team->stolen, memory_order_relaxed) !=
+                  team->cached_stolen)
+    pomp_assign(team, mask);
+
+  // Wake the members; post only to those that sleep.
+  pomp_wake_team(team, mask);
 
   // Run as tid 0, then join: poll each member's done flag. Plain loads of
   // distinct lines overlap, where increments of one shared counter serialize.
@@ -1027,7 +1106,7 @@ int pomp_enter_pool(int slot) {
   POMP_PT(pthread_mutex_lock(&self->mutex));
   self->posted = false;
   POMP_PT(pthread_mutex_unlock(&self->mutex));
-  epoch = atomic_load(&self->go);
+  epoch = POMP_GO(self, bit, memory_order_seq_cst);
 
   // Become idle, hence recruitable, then check the gate. Release closes the
   // gate before it claims idle workers, so either this thread sees it closed

@@ -24,6 +24,7 @@
 //   tworoots : S9, two host threads run regions at once
 //   nest     : S10, nesting levels seen by members of inner teams
 //   sleepjoin: S11, join and barriers that sleep (POMP_SPIN=0)
+//   steal    : S13, level-2 teams of varying sizes take each other's workers
 //   nolimit  : S12, no OMP_THREAD_LIMIT; the limit comes from open
 //   latency  : leader time in release, and to the next region
 //
@@ -598,6 +599,71 @@ static void test_nest(long cycles) {
 }
 
 // -----------------------------------------------------------------------------
+// S13: with OMP_MAX_ACTIVE_LEVELS=2, level-1 and level-2 teams of sizes that
+// change every cycle, so that inner teams take workers from each other's
+// preferred groups and from each other's cached teams. Every member of every
+// team must see the right work and a distinct tid in [0, nth).
+// -----------------------------------------------------------------------------
+
+typedef struct {
+  atomic_ullong tids; /* Bit t: tid t ran. */
+  atomic_int count;
+  atomic_int nth;
+  long cycle;
+} steal_team_t;
+
+static atomic_int steal_bad;
+
+static void steal_l2(int32_t *gtid, int32_t *tid, steal_team_t *st) {
+  int n = omp_get_num_threads();
+  (void)gtid;
+  if (*tid != omp_get_thread_num() || *tid >= n || omp_get_level() != 2)
+    atomic_fetch_add(&steal_bad, 1);
+  if (atomic_fetch_or(&st->tids, 1ull << *tid) & (1ull << *tid))
+    atomic_fetch_add(&steal_bad, 1); // Two members with the same tid.
+  atomic_fetch_add(&st->count, 1);
+  if (*tid == 0)
+    atomic_store(&st->nth, n);
+}
+
+static void steal_l1(int32_t *gtid, int32_t *tid, long *cycle) {
+  int32_t g = __kmpc_global_thread_num(NULL);
+  steal_team_t st = {0};
+  int n1 = omp_get_num_threads(), want;
+  (void)gtid;
+  st.cycle = *cycle;
+  // Sizes that change with the cycle and differ between members: from 1 to
+  // more than this member's share, so that some teams must take workers
+  // outside their group.
+  want = 1 + (int)((*cycle * 7 + *tid * 3) % (limit - n1 + 2));
+  __kmpc_push_num_threads(NULL, g, want);
+  __kmpc_fork_call(NULL, 1, (void *)steal_l2, &st);
+  {
+    int n = atomic_load(&st.nth);
+    if (n < 1 || n > want || atomic_load(&st.count) != n ||
+        atomic_load(&st.tids) != (n >= 64 ? ~0ull : (1ull << n) - 1))
+      atomic_fetch_add(&steal_bad, 1);
+  }
+}
+
+static void test_steal(long cycles) {
+  host_start();
+  CHECK(pomp_open_pool(0) == POMP_OK);
+  host_enter_all();
+  wait_pool_size(limit - 1);
+  for (long c = 0; c < cycles; ++c) {
+    __kmpc_push_num_threads(NULL, 0, 1 + (int)(c % (limit < 4 ? limit : 4)));
+    __kmpc_fork_call(NULL, 1, (void *)steal_l1, &c);
+    // A plain region in between: the root's team must see the right workers.
+    run_region();
+  }
+  CHECK(atomic_load(&steal_bad) == 0);
+  CHECK(pomp_close_pool() == POMP_OK);
+  host_stop();
+  printf("steal: %ld cycles, errors %ld\n", cycles, errors);
+}
+
+// -----------------------------------------------------------------------------
 // S11: one member is slow, so the leader at the join and the others at the
 // barriers sleep instead of spinning (POMP_SPIN=0 makes them sleep at once).
 // -----------------------------------------------------------------------------
@@ -705,6 +771,8 @@ int main(int argc, char **argv) {
     test_nest(n);
   else if (!strcmp(test, "sleepjoin"))
     test_sleepjoin(n);
+  else if (!strcmp(test, "steal"))
+    test_steal(n);
   else if (!strcmp(test, "latency"))
     test_latency(n);
   else {

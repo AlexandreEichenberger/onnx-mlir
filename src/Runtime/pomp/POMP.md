@@ -51,6 +51,10 @@ other than the two above aborts at run time.
 | `POMP_SPIN` | Spin iterations of any wait before it sleeps: an idle worker, the leader at the join, a thread in a barrier (default 200000; 0 sleeps immediately). Team waits yield after 4096 iterations of the spin |
 | `POMP_TREE_BARRIER` | Smallest team that uses the tree barrier instead of the central one. Default 5 on s390x, never elsewhere; 0 or 2 forces the tree, 65 forces central |
 
+Build options: `-DPOMP_USE_PTHREAD_KEY` (see "Thread identity"), and `-DPOMP_EPOCH_WAKE`, which
+wakes each worker through its own epoch, as before the activate word, for comparison on a new
+machine (see "Fork with team reuse").
+
 ## Host interface (`pomp.h`)
 
 ```c
@@ -302,6 +306,14 @@ The pool starts closed, entries return `POMP_ERR_CLOSED` and regions run on one 
 `pomp_open_pool(limit)` sets the limit. The limit is then fixed: a later open with another value
 is clamped to it, with one warning, and opens the pool.
 
+**S13. Inner teams taking each other's workers** (`steal`, with `OMP_MAX_ACTIVE_LEVELS=2`).
+
+Level-1 and level-2 teams change size every cycle, so inner teams take workers outside their
+group and from each other's cached teams. Every member must run the right work with a distinct
+tid. This is the case where a team's cache is invalidated (see "Fork with team reuse"): at
+limit 16, 20000 cycles reassign workers about 46000 times, against once for the whole of
+`server`.
+
 ### Rules for the host
 
 1. Call close and open from the leader, outside parallel regions. A close from another
@@ -361,9 +373,9 @@ is the number of those workers that are asleep rather than spinning:
 
 | Step | Who | Cost | What it does |
 |---|---|---|---|
-| `__kmpc_fork_call`: recruit | leader | **O(1)** when the same team as last time is free (one CAS on `busy`); O(T) bit scan otherwise | Cached mask hit in the steady state |
-| `__kmpc_fork_call`: describe | leader | O(T) | Writes the tid→slot map and copies `argc` pointers (plus an O(T) split of spare workers, only when 2 levels are enabled) |
-| `__kmpc_fork_call`: wake | leader | **O(T)** atomic increments (one `go` epoch per worker) + 1 load of `sleeping`; + O(W) posts (system calls) | No system call when every worker spins |
+| `__kmpc_fork_call`: recruit | leader | **O(1)** when the team's cached workers are free (one CAS on `busy`); O(T) bit scan otherwise | Cache hit in the steady state, also for a smaller request |
+| `__kmpc_fork_call`: describe | leader | O(argc) on a hit: the team descriptor only, in lines the leader owns. O(T) on a miss: the tid→slot map and each worker's assignment (plus an O(T) split of spare workers, only when 2 levels are enabled) | See "Fork with team reuse" |
+| `__kmpc_fork_call`: wake | leader | **O(1)**: one atomic XOR on `activate` + 1 load of `sleeping`; + O(W) posts (system calls) | No system call when every worker spins |
 | `__kmpc_global_thread_num` | each thread | O(1) | One `__thread` load (or `pthread_getspecific`) |
 | `__kmpc_for_static_init_8u` | each thread | O(1) | A division and a few multiplies; no shared memory touched |
 | loop body | each thread | O(n/T) | The work |
@@ -376,16 +388,68 @@ So, per region:
 
 - **Each worker does O(1) runtime work** besides its share of the loop: about five calls and no
   system call while everyone spins.
-- **The leader does O(T) work**: it bumps one epoch per worker, and it reads one done flag per
-  worker at the join. Neither involves a contended line, and the reads overlap. Everything else
-  on the leader's side is O(1), including recruitment in the steady state.
+- **The leader does O(T) work only at the join**, where it reads one done flag per worker. The
+  reads touch no contended line, and they overlap. In the steady state, everything else on the
+  leader's side is O(1): recruitment, the description of the work, and the wake-up.
 - **The barrier** is O(log T) deep on s390x from 5 threads, and a central counter otherwise.
   The choice of each and its threshold come from the z17 measurements below.
+
+### Fork with team reuse
+
+This follows Eichenberger and O'Brien, "Experimenting with low-overhead OpenMP runtime on IBM
+Blue Gene/Q" (IBM J. Res. & Dev. 57(1/2), 2013). Most programs fork the same team over and over,
+so the leader keeps the last assignment, and on a hit sends nothing per worker:
+
+- **Cache.** Each team descriptor (`pomp_root_team`, `pomp_slot_team[s]`) keeps `cached_mask`,
+  the workers its last assignment gave tids 1, 2, ... in slot order. A request for *k* workers
+  hits if the *k* lowest of them are all idle, and recruits them with the usual CAS on `busy`.
+  They keep their tids, so a smaller request also hits.
+- **Assignments are written only when they change.** A worker's `team` and `tid` sit on a line
+  that only recruiters write. On a hit, the leader writes neither them nor the tid map: they
+  stay in the workers' caches, and the members find the work in the team descriptor, whose
+  fields read by every member (`fn`, `argc`, `nth`, ...) share one line.
+- **Validity: the paper's generation counter, per team.** Each team has a `stolen` counter. A
+  leader that assigns a worker last assigned to another team bumps that team's counter before
+  it returns the worker. The team's own leader can recruit the worker again only after that
+  return (it needs the busy bit, and its CAS acquires it), so it sees the bump, which makes it
+  assign again. This happens only with two active levels, when an inner team takes workers
+  outside its own group. With one level, only the root team forks, and it never misses in the
+  steady state.
+- **Wake-up: one XOR.** `pomp_activate` has one bit per slot. The leader flips its team's bits
+  with one atomic XOR, and each worker waits for its own bit to change. A bit cannot flip
+  twice before its worker sees the first flip: no leader can recruit the worker again before
+  its done flag. Concurrent inner leaders flip disjoint bits. The sleep protocol is unchanged,
+  with `activate` in place of the per-worker `go` epoch.
+- **No reset of the central barrier.** The last thread out of each barrier already resets its
+  count, so the fork no longer writes that line.
+
+Measured on macOS (18-core Apple Silicon), `pomp_test bench` and `loop`, median of 3 runs of
+100000 regions, µs. *Before* is the previous pomp, *epoch* is this one built with
+`-DPOMP_EPOCH_WAKE` (assignments skipped, but one epoch per worker), *now* is the default:
+
+| Threads | fork/join before · epoch · **now** | loop before · epoch · **now** | libomp `KMP_BLOCKTIME=200` fork/join · loop |
+|---|---|---|---|
+| 2 | 0.26 · 0.16 · **0.17** | 0.42 · 0.38 · **0.37** | 0.27 · 0.60 |
+| 4 | 0.41 · 0.24 · **0.20** | 0.60 · 0.49 · **0.49** | 0.40 · 0.76 |
+| 8 | 1.44 · 0.81 · **0.53** | 2.05 · 1.53 · **1.34** | 1.19 · 2.36 |
+| 16 | 3.43 · 1.54 · **0.66** | 4.87 · 2.84 · **1.76** | 1.66 · 3.36 |
+
+At 16 threads fork/join is 5.2× faster than before and 2.5× faster than spinning libomp, and the
+loop region 2.8× and 1.9×. Both changes count: skipping the assignments halves fork/join, and
+the XOR halves it again. Barriers are unchanged; at 16 threads, single runs of both the old and
+the new pomp range from 0.7 to over 3 µs, so only medians of many runs compare. `pomp_zbench`
+design F reproduces the old fork and C the new one on a hit: 2.38 against 0.61 µs at 16
+threads.
+
+**On z**, the earlier microbenchmarks found the wake-up cheap and the join dominant, so the
+gain may be smaller there. `pomp_zbench` now has design F, and `-DPOMP_EPOCH_WAKE` builds the
+epoch wake-up, so that both can be compared on the machine (`test/ZBENCH.md`).
 
 ### Cost compared with libomp (macOS)
 
 These numbers predate the done-flag join and tree barrier described in "Measurements on z17"
-below. On macOS that change is neutral for fork/join, and the central barrier is kept.
+below, and the team reuse above. On macOS the done-flag change is neutral for fork/join, and
+the central barrier is kept.
 
 Measured on an 18-core Apple Silicon laptop (macOS, arm64), with Homebrew libomp 22.1.4 and
 LLVM clang. Times are µs per region, with the median of 3 runs of 100000 regions; 32 threads
@@ -460,13 +524,13 @@ need the threads' topology, which z/OS may not expose, so it is on hold.
 |---|---|---|---|---|
 | A: epoch per worker + shared counter join (previous pomp) | 0.41 | 0.97 | 1.77 | 3.50 |
 | B: one XOR activate word + counter join | 0.38 | 1.04 | 1.88 | 3.70 |
-| **C: epoch or XOR wake-up + per-worker done flags (pomp now)** | **0.23** | **0.70** | **0.97** | 1.71 |
+| **C: XOR wake-up + per-worker done flags (pomp now, on a cache hit)** | **0.23** | **0.70** | **0.97** | 1.71 |
 | D: XOR wake-up + 4-ary tree join | 0.27 | 0.78 | 1.06 | 1.67 |
 | E: tree wake-up + tree join (libomp-like) | 0.26 | 0.74 | 1.01 | 1.65 |
 
-pomp now combines its existing per-worker epoch wake-up with the done-flag join. That exact
-pair was not in the benchmark. It is expected to match C because the two wake-ups, A and B,
-cost the same on z; `pomp_zbench` on the new pomp would confirm it.
+On a cache hit, pomp's fork is now C (see "Fork with team reuse"). Before, it combined the
+per-worker epoch wake-up with the done-flag join, which this run did not measure; it is now
+design F in `pomp_zbench`.
 
 On z, the join dominates and the wake-up does not. Replacing the counter join with done flags
 (A or B → C) saves 28% at 16 threads, 45% at 32 and 51% at 64. An XOR activate word alone (B)
@@ -526,8 +590,8 @@ idle worker in the pool. All slots start busy:
   they are entered again.
 
 **Static descriptors.** Nothing is allocated after start-up:
-- `pomp_threads[64]`: per-slot wake-up epoch and state, each on its own cache line; the
-  current assignment; the region stack; and the sleep mutex and condition variable.
+- `pomp_threads[64]`: per-slot current assignment, on its own cache line; the region stack and
+  state; and the sleep mutex and condition variable.
 - `pomp_root_team`: the team the root leads at level 1.
 - `pomp_slot_team[64]`: the team that slot *i* leads at level 2.
 
@@ -535,7 +599,7 @@ A team descriptor holds:
 - the outlined function and arguments;
 - the team size, and the leader's depth and level, which members start from;
 - the tid-to-slot map;
-- the reuse cache and the level-2 preferred sets;
+- the reuse cache, its `stolen` counter, and the level-2 preferred sets;
 - the central barrier, and the `sleepers` mask of members asleep in a team wait;
 - one sync line per member (done flag, tree barrier flags).
 
@@ -552,11 +616,11 @@ A team descriptor holds:
    - no worker is idle.
 
    This matches libomp's default for the zDNNx matmul nest.
-4. Otherwise recruit. If the request matches the team's cached one and those same workers are
-   all idle, the pick is O(1). Otherwise take the lowest idle bits, preferring the team's
-   preferred set.
-5. Write the descriptor and the whole tid-to-slot map. Then set each member's `team` and
-   `tid`, and bump its `go` epoch.
+4. Otherwise recruit. If the lowest cached workers of the team are all idle, the pick is O(1).
+   Otherwise take the lowest idle bits, preferring the team's preferred set.
+5. Write the descriptor. On a cache miss, or if another team took one of the cached workers
+   since, also write the tid-to-slot map and each member's `team` and `tid`. Then flip the
+   team's bits in `activate` with one XOR.
 6. Run as tid 0, and join: wait for each member's `done` flag. Then clear the team's bits, and
    if the pool was closed meanwhile, release the workers.
 
@@ -567,13 +631,14 @@ valid from one region to the next. For example, with 16 threads, a 4×4 split gi
 4 + 4×3 assignment every time.
 
 **Wake-up without losing a signal.** An idle worker spins for `POMP_SPIN` iterations on two
-things: its own `go` epoch (work) and its bit in the global `released` word (release). The
+things: its bit in the global `activate` word (work) and its bit in the global `released` word
+(release). The
 `released` word is written only by release and by leaving workers, so it stays shared in every
 cache and costs the spin nothing. To sleep, the worker sets its bit in the global `sleeping`
 word, re-reads `go` and `released`, and waits on its condition variable.
 
-A waker (a fork, a release, or a leaving worker) first publishes: it bumps `go`, or sets the
-`released` bit. It then reads `sleeping`, clears with one atomic AND the bits of the workers it
+A waker (a fork, a release, or a leaving worker) first publishes: it flips the `activate` bits,
+or sets the `released` bit. It then reads `sleeping`, clears with one atomic AND the bits of the workers it
 is waking, and posts only to those whose bit it cleared. All of these accesses are sequentially
 consistent, so either the worker sees the new value or the waker sees the bit. No wake-up is
 lost, and exactly one side clears each bit. A waker of spinning workers makes one load and no
@@ -706,7 +771,7 @@ entering the pool standing in for the host) and libomp, so their outputs can be 
 | `pomp_test stress N` | Many regions of varying size with a barrier | 200000 regions, no errors, at `POMP_SPIN` 200000, 50 and 0 |
 | `pomp_test barriers N` | 1–5 barrier pairs per region, team sizes 1 to the limit: after each barrier, every thread must see every other thread's write from before it | No errors at limits 1, 2, 3, 4, 5, 8, 16 and 17, with `POMP_TREE_BARRIER` 0, 2, 5 and 65; also under ThreadSanitizer |
 | `pomp_test cycles N` | Enter, run 10 regions, close: the per-inference pattern | 20000 cycles, no errors; about 200 µs per cycle at limit 8, mostly `pthread_create`/`join` in the test host |
-| `pomp_host_test <scenario>` | Host protocol scenarios S1–S12 above, and `latency` (leader time in `pomp_close_pool`) | All pass at limits 2, 3, 4, 8, 16 and 17, `POMP_SPIN` 0, 30 and 200000, both barrier kinds, with 1500-cycle soak runs; no ThreadSanitizer reports. Limit 1 is not a supported test configuration: `late` and `swap` assume a slot 1 exists |
+| `pomp_host_test <scenario>` | Host protocol scenarios S1–S13 above, and `latency` (leader time in `pomp_close_pool`) | All pass at limits 2, 3, 4, 8, 16 and 17, `POMP_SPIN` 0, 30 and 200000, both barrier kinds, with 1500-cycle soak runs; no ThreadSanitizer reports. Limit 1 is not a supported test configuration: `late` and `swap` assume a slot 1 exists |
 | `pomp_irbuilder_test` | Code from `-fopenmp-enable-irbuilder`, the OpenMPIRBuilder path MLIR uses, which calls `__kmpc_global_thread_num` on workers | Correct at limits 1, 4, 18; also with `POMP_USE_PTHREAD_KEY` |
 | ThreadSanitizer | `static`, `nested` (both nesting modes), `stress`, `barriers`, `cycles`, and all of `pomp_host_test`, with both barrier kinds and `POMP_SPIN` 0 and 30 | No reports |
 

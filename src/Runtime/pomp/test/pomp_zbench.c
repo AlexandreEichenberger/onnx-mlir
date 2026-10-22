@@ -36,11 +36,14 @@
 //   3. Throughput of T threads incrementing one shared counter.
 //   4. Fork/join designs, with spinning workers, per region:
 //        A  per-worker epoch wake + per-worker assignment + counter join
-//           (pomp today)
+//           (first pomp)
 //        B  one XOR activate word + counter join
 //        C  one XOR activate word + per-worker done flags polled by leader
 //        D  one XOR activate word + 4-ary tree join
 //        E  4-ary tree wake + 4-ary tree join (similar to libomp)
+//        F  per-worker epoch wake + per-worker assignment + done flags
+//           (pomp before team reuse)
+//      C is pomp's fork on a team-cache hit: one XOR, no per-worker write.
 //   5. Barrier designs, per barrier, with T threads:
 //        central  counter + epoch word (pomp today)
 //        tree+bc  4-ary tree gather + broadcast epoch word
@@ -373,13 +376,22 @@ static void bench_contention(const int *ts, int nts) {
 // 4. Fork/join designs
 // -----------------------------------------------------------------------------
 
-enum { M_EPOCH, M_XOR_CTR, M_XOR_FLAGS, M_XOR_TREE, M_TREE_TREE, NMODELS };
+enum {
+  M_EPOCH,
+  M_XOR_CTR,
+  M_XOR_FLAGS,
+  M_XOR_TREE,
+  M_TREE_TREE,
+  M_EPOCH_FLAGS,
+  NMODELS
+};
 static const char *model_name[NMODELS] = {
-    "A epoch/worker + counter join (pomp today)",
+    "A epoch/worker + counter join (first pomp)",
     "B xor word + counter join",
-    "C xor word + per-worker done flags",
+    "C xor word + done flags (pomp, cache hit)",
     "D xor word + 4-ary tree join",
     "E 4-ary tree wake + tree join (libomp-like)",
+    "F epoch/worker + done flags (pomp before)",
 };
 
 static line_t go_[MAXT], done_[MAXT], wake_[MAXT];
@@ -422,6 +434,7 @@ static void *fj_worker(void *arg) {
     // Wait for the next region.
     switch (model) {
     case M_EPOCH:
+    case M_EPOCH_FLAGS:
       while (atomic_load_explicit(&go_[w].v, memory_order_acquire) == r) {
         if (STOPPED())
           return NULL;
@@ -447,8 +460,8 @@ static void *fj_worker(void *arg) {
       expect ^= bit;
     }
     ++r;
-    fn = model == M_EPOCH ? asg[w].fn : team.fn;
-    tid = model == M_EPOCH ? asg[w].tid : w;
+    fn = model == M_EPOCH || model == M_EPOCH_FLAGS ? asg[w].fn : team.fn;
+    tid = model == M_EPOCH || model == M_EPOCH_FLAGS ? asg[w].tid : w;
     fn(tid);
     // Signal the end of the region.
     switch (model) {
@@ -457,6 +470,7 @@ static void *fj_worker(void *arg) {
       atomic_fetch_add_explicit(&arrived.v, 1, memory_order_release);
       break;
     case M_XOR_FLAGS:
+    case M_EPOCH_FLAGS:
       atomic_store_explicit(&done_[w].v, r, memory_order_release);
       break;
     default:
@@ -469,6 +483,7 @@ static void *fj_worker(void *arg) {
 static void fj_region(uint64_t r) {
   switch (model) {
   case M_EPOCH:
+  case M_EPOCH_FLAGS:
     for (int w = 1; w < T; ++w) {
       asg[w].fn = body;
       asg[w].tid = w;
@@ -493,6 +508,7 @@ static void fj_region(uint64_t r) {
       relax();
     break;
   case M_XOR_FLAGS:
+  case M_EPOCH_FLAGS:
     for (int w = 1; w < T; ++w)
       while (atomic_load_explicit(&done_[w].v, memory_order_acquire) != r)
         relax();

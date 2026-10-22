@@ -1,5 +1,20 @@
 # Running `pomp_zbench` on Linux on Z
 
+To build pomp itself and run its tests and timings on the machine, outside onnx-mlir, use
+`test/run_z.sh` instead; it also runs `pomp_zbench` section 4. From the pomp directory:
+
+```sh
+git show 6e2d4e906:src/Runtime/pomp/pomp.c > /tmp/pomp-before.c   # pomp before team reuse
+BASE=/tmp/pomp-before.c test/run_z.sh                             # CC=clang by default
+```
+
+It needs a clang with `-fopenmp` and libomp, and takes about 15–30 minutes (`QUICK=1` for
+shorter correctness runs). It builds pomp as is, with `-DPOMP_EPOCH_WAKE` and with
+`-DPOMP_USE_PTHREAD_KEY`; checks the digests against libomp; runs every stress and host
+scenario at limits 2–17; then times fork/join, barrier and the loop region for pomp before, both
+pomp builds and libomp (`KMP_BLOCKTIME=200`) at `LIMITS` (default 4 8 16 32 64). Please send
+the whole output with `lscpu -e`.
+
 `pomp_zbench.c` is self-contained: C11 and pthreads, with no OpenMP and no other files needed.
 It measures the costs that decide pomp's fork/join design on a given machine.
 
@@ -59,11 +74,12 @@ Fork/join designs in section 4, all with spinning workers and an empty body unle
 
 | | Wake-up | Join | Note |
 |---|---|---|---|
-| A | one epoch per worker + per-worker assignment | one shared counter | pomp today |
-| B | one XOR on a shared activate word | one shared counter | the proposed cache-hit path |
-| C | one XOR on a shared activate word | per-worker done flags, polled by the leader | |
+| A | one epoch per worker + per-worker assignment | one shared counter | the first pomp |
+| B | one XOR on a shared activate word | one shared counter | |
+| C | one XOR on a shared activate word | per-worker done flags, polled by the leader | pomp now, on a team-cache hit |
 | D | one XOR on a shared activate word | 4-ary tree | |
 | E | 4-ary tree | 4-ary tree | close to libomp's default |
+| F | one epoch per worker + per-worker assignment | per-worker done flags, polled by the leader | pomp before team reuse |
 
 ## Reference: macOS, 18-core Apple Silicon (not pinned)
 
