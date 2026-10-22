@@ -9,7 +9,8 @@
 # Environment:
 #   CC=clang                            # needs -fopenmp and omp.h
 #   OMPFLAGS=-fopenmp                   # compile flags for OpenMP code
-#   OMPLIBS=                            # link flags for libomp, if not found
+#   OMPLIBS=                            # link flags for libomp; by default,
+#                                       # found next to $CC, or none
 #   LIMITS="4 8 16 32 64"               # thread limits for the benchmarks
 #   QUICK=1                             # shorter correctness runs
 #   BASE_REF=origin/pomp-first-attempt  # git ref of pomp before team reuse
@@ -85,7 +86,26 @@ fi
 echo "after:  $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo this copy)" \
   "($(git rev-parse --short HEAD 2>/dev/null || echo no git))" \
   "$(git diff --quiet -- . 2>/dev/null || echo "+ local changes")"
-$CC $OPT $OMPFLAGS test/pomp_test.c $OMPLIBS -o "$B/pomp_test_libomp" || exit 1
+# libomp, for the digests and the reference timings. If it is not on the
+# linker's path, look in the lib directories of $CC's installation. Without
+# it, only the comparisons with libomp are skipped.
+if [ -z "$OMPLIBS" ] &&
+  ! echo 'int main(void){return 0;}' |
+  $CC $OMPFLAGS -x c - -o "$B/omp_probe" 2>/dev/null; then
+  R=$(dirname "$(dirname "$(command -v "$CC")")")
+  for d in "$R"/lib "$R"/lib/*-linux-gnu "$R"/lib64 \
+    $($CC -print-resource-dir 2>/dev/null)/../..; do
+    if ls "$d"/libomp.so* "$d"/libomp.a >/dev/null 2>&1; then
+      OMPLIBS="-L$d -Wl,-rpath,$d"
+      break
+    fi
+  done
+fi
+HAVE_LIBOMP=1
+$CC $OPT $OMPFLAGS test/pomp_test.c $OMPLIBS -o "$B/pomp_test_libomp" ||
+  { HAVE_LIBOMP=0; echo "libomp not found (set OMPLIBS=-L<dir>):" \
+    "skipping the digests and the libomp timings"; }
+[ $HAVE_LIBOMP = 1 ] && [ -n "$OMPLIBS" ] && echo "libomp: $OMPLIBS"
 $CC $OPT $OMPFLAGS -fopenmp-enable-irbuilder -c test/pomp_irbuilder_test.c \
   -o "$B/irb.o" && for v in xor key; do
   $CC "$B/irb.o" "$B/$v/pomp.o" -pthread -o "$B/$v/irb"
@@ -97,7 +117,7 @@ if command -v objdump >/dev/null && [ "$(uname -m)" = s390x ]; then
 fi
 
 note "digests against libomp"
-for v in $TESTED; do
+[ $HAVE_LIBOMP = 1 ] && for v in $TESTED; do
   for L in 1 2 3 4 5 8 16; do
     a=$(OMP_THREAD_LIMIT=$L "$B/$v/pomp_test" static)
     b=$(OMP_THREAD_LIMIT=$L "$B/pomp_test_libomp" static 2>/dev/null)
@@ -154,7 +174,7 @@ med() { sort -n | sed -n 2p; }
 field() { sed -n "s/.*$1 \([0-9.]*\).*/\1/p"; }
 printf '%-8s %-12s %10s %10s %10s\n' T runtime fork/join barrier loop
 for L in $LIMITS; do
-  for v in $TIMED libomp; do
+  for v in $TIMED $([ $HAVE_LIBOMP = 1 ] && echo libomp); do
     if [ $v = libomp ]; then
       X="$B/pomp_test_libomp"
       E="env KMP_BLOCKTIME=200 OMP_NUM_THREADS=$L OMP_PROC_BIND=close"
