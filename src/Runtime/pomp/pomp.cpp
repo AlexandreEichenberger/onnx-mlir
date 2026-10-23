@@ -75,6 +75,8 @@ namespace {
 
 constexpr int kMaxThreads = POMP_MAX_THREADS;
 static_assert(kMaxThreads <= 64, "slots are bits of one 64-bit word");
+// Teams: one led by each slot at level 2, and the root's at level 1.
+constexpr int kTeams = kMaxThreads + 1;
 
 #if defined(__s390x__) || defined(__MVS__)
 constexpr int kCacheLine = 256;
@@ -473,11 +475,18 @@ struct Level {
   uint64_t bar = 0; // Barriers this thread passed in this team, all regions.
 };
 
-// Synchronization words of one member of a team, on their own cache line.
-// `done` is written by the member and polled by the leader at the join;
+// Synchronization words of a thread as a member of a team, on their own cache
+// line. `done` is written by the member and polled by the leader at the join;
 // `arrive` is written by the member and polled by its parent in the barrier
 // tree, and `release` the other way, so a line is shared by two threads at a
-// time. All three only grow, so they never need to be reset.
+// time. Only members other than the leader use their line: the leader of a
+// team stores no `done`, has no parent in the tree, and only reads and writes
+// the lines of other members. A thread is such a member of at most one team at
+// a time, as it leads any team it forks, and a level-1 member cannot be
+// recruited at level 2. So each thread has one line, which it takes from team
+// to team. The values stored are tagged with the team (see Team::tag), and
+// waits test for equality, so that a value left by a previous team never
+// matches; nothing needs to be reset.
 struct alignas(kCacheLine) MemberSync {
   Atomic<uint64_t> done;
   Atomic<uint64_t> arrive;
@@ -525,6 +534,16 @@ private:
   int32_t leaderSlot() const;
   void partition();
   void treeBarrier(Thread &self, int32_t tid, int32_t nth, uint64_t k);
+  // The sync line of member `tid` in this team.
+  MemberSync &syncOf(int32_t tid) const;
+  // Value `n` of one of this team's counters, as stored in sync lines: n
+  // teams apart, plus the team's index, so that the values of two teams
+  // never meet. Counters start at 0 and are bumped before use, so a value is
+  // never 0, which a line holds at first.
+  uint64_t tag(uint64_t n) const { return n * kTeams + uint64_t(index()); }
+  // Index of this team, 0..kTeams-1: the leader's slot for a level-2 team,
+  // kMaxThreads for the root's.
+  int32_t index() const;
 
   // Work, written before the wake-up of the members.
   Microtask fn_ = nullptr;
@@ -547,8 +566,6 @@ private:
   // Bit t is set while member t sleeps in a join or barrier wait, or is about
   // to. Written only by sleepers and their wakers, so it stays shared.
   alignas(kCacheLine) Atomic<uint64_t> sleepers_;
-  // Join and tree barrier: one line per member, indexed by tid.
-  MemberSync sync_[kMaxThreads];
 };
 
 // A thread descriptor, one per slot.
@@ -608,6 +625,9 @@ public:
   int presence(Order o) const { return present_.load(o); }
   void setPresence(int p, Order o = Order::SeqCst) { present_.store(p, o); }
 
+  // Sync line of this thread as a member, other than the leader, of a team.
+  MemberSync &sync() { return sync_; }
+
 private:
   // Wake-up, on its own line: the epoch the worker waits on.
   alignas(kCacheLine) Atomic<uint64_t> go_;
@@ -621,6 +641,8 @@ private:
   Post post_;
   // kFree, kInPool or kLeaving.
   Atomic<int> present_;
+  // Join and tree barrier.
+  MemberSync sync_;
 };
 
 // The pool: which workers are in it and idle, sleeping or released, and the
@@ -940,18 +962,6 @@ private:
   uint64_t value_;
 };
 
-// The flag has reached `value`.
-class FlagReaches {
-public:
-  FlagReaches(const Atomic<uint64_t> &flag, uint64_t value)
-      : flag_(flag), value_(value) {}
-  bool operator()() const { return flag_.load(Order::Acquire) >= value_; }
-
-private:
-  const Atomic<uint64_t> &flag_;
-  uint64_t value_;
-};
-
 // The flag no longer holds `value`.
 class FlagLeaves {
 public:
@@ -1027,6 +1037,15 @@ inline void Team::wakeLeader() {
 // The slot of the leader of this team.
 inline int32_t Team::leaderSlot() const {
   return this == &rootTeam ? 0 : int32_t(this - slotTeams);
+}
+
+inline int32_t Team::index() const {
+  return this == &rootTeam ? kMaxThreads : int32_t(this - slotTeams);
+}
+
+// The member's slot comes from the map, written before the wake-up.
+inline MemberSync &Team::syncOf(int32_t tid) const {
+  return threads[slotOfTid_[tid]].sync();
 }
 
 // Spin on a condition outside of any team (reclaim), yielding when long.
@@ -1226,22 +1245,25 @@ void Team::launch(int32_t leader, uint64_t mask, int32_t level, int32_t depth,
 // wakes the leader after its done flag.
 void Team::join(Thread &leader, uint64_t bar) {
   for (int32_t tid = 1; tid < nth_; ++tid)
-    wait(leader, 0, FlagIs(sync_[tid].done, region_));
+    wait(leader, 0, FlagIs(syncOf(tid).done, tag(region_)));
   // Every member passed the same barriers: the leader's count is the team's
   // for the next region. Written after the join, as members read it on entry.
   barSeq_ = bar;
 }
 
 void Team::runMember(Thread &self, int32_t slot, int32_t tid) {
-  uint64_t region = region_;
+  uint64_t done = tag(region_);
+  MemberSync &sync = self.sync();
   // Continue the leader's nesting: same depth, same active levels.
   self.setNesting(depth_, level_ - 1);
   self.push(this, tid, nth_);
   invoke(fn_, slot, tid, argc_, argv_);
   self.pop();
   // After this store, the leader may reuse the team; only the wake-up of
-  // the leader follows, which allows it.
-  sync_[tid].done.store(region, Order::Release);
+  // the leader follows, which allows it. The line keeps `done` until the
+  // leader reads it: the thread joins no other team before the leader returns
+  // it to the pool, after the join.
+  sync.done.store(done, Order::Release);
   wakeLeader();
 }
 
@@ -1436,23 +1458,30 @@ int Pool::open(int threadLimit) {
 // parent and waits for the parent's release, then releases its children.
 // Every flag is written by one thread and read by one other, so no line is
 // contended; the depth is log_ARITY(nth).
+//
+// Waits test for equality, as lines move from team to team (see MemberSync).
+// No flag can pass the value its reader waits for: a child publishes the next
+// `arrive` only after this barrier's `release`, which its parent sets only
+// after this barrier's `arrive`.
 void Team::treeBarrier(Thread &self, int32_t tid, int32_t nth, uint64_t k) {
   int32_t first = kTreeArity * tid + 1;
   int32_t last = first + kTreeArity;
   uint64_t children = 0;
+  uint64_t v = tag(k);
   if (last > nth)
     last = nth;
   for (int32_t c = first; c < last; ++c) {
-    wait(self, tid, FlagReaches(sync_[c].arrive, k));
+    wait(self, tid, FlagIs(syncOf(c).arrive, v));
     children |= bit(c);
   }
   if (tid != 0) {
-    sync_[tid].arrive.store(k, Order::Release);
+    MemberSync &sync = self.sync();
+    sync.arrive.store(v, Order::Release);
     wakeMembers(bit((tid - 1) / kTreeArity));
-    wait(self, tid, FlagReaches(sync_[tid].release, k));
+    wait(self, tid, FlagIs(sync.release, v));
   }
   for (int32_t c = first; c < last; ++c)
-    sync_[c].release.store(k, Order::Release);
+    syncOf(c).release.store(v, Order::Release);
   if (children)
     wakeMembers(children);
 }

@@ -16,6 +16,11 @@
 //   static     : static loop partitioning, many bounds/steps/types/teams
 //   nested     : team sizes of the zDNNx 3-level matmul nest and collapse
 //   stress     : many regions with sleep/wake races (POMP_SPIN=0 helps)
+//   barriers2  : barriers in level-1 and level-2 teams at once, of sizes that
+//                change every region (needs OMP_MAX_ACTIVE_LEVELS=2)
+//   lockstep   : workers that alternate between two level-2 teams whose
+//                region and barrier counts stay equal (needs
+//                OMP_MAX_ACTIVE_LEVELS=2)
 //   cycles     : open / enter / run / close, repeated (the per-inference
 //                pattern)
 //   bench      : fork/join and barrier latency
@@ -340,6 +345,123 @@ static void test_barriers(long iters) {
 }
 
 // -----------------------------------------------------------------------------
+// barriers2: two active levels. Each level-1 member leads a level-2 team; both
+// levels pass barriers, interleaved, with team sizes, barrier counts and a
+// late member that change every region, so that workers move between level-2
+// teams and the leaders of level 2 meet level-1 barriers between their inner
+// regions. Each phase must see every write of the previous one, at both
+// levels.
+// -----------------------------------------------------------------------------
+
+static void test_barriers2(long iters) {
+  static long cell1[64], cell2[64][64];
+  long it, bad = 0, inactive = 0;
+  for (it = 0; it < iters; ++it) {
+    int n1 = 1 + (int)(it % (num_threads < 4 ? num_threads : 4));
+    int nbar1 = 1 + (int)(it % 3);
+#pragma omp parallel num_threads(n1)
+    {
+      int t1 = omp_get_thread_num(), m1 = omp_get_num_threads();
+      for (int b1 = 0; b1 < nbar1; ++b1) {
+        // Sizes differ between members and regions, from 1 to more than the
+        // share, so that inner teams take workers from each other.
+        int n2 = 1 + (int)((it * 7 + t1 * 3 + b1) % (num_threads / m1 + 2));
+        int nbar2 = 1 + (int)((it + t1 + b1) % 4);
+        long base = (it * 4 + b1) * 64;
+#pragma omp parallel num_threads(n2)
+        {
+          int t2 = omp_get_thread_num(), m2 = omp_get_num_threads();
+          if (n2 > 1 && m2 == 1)
+            __atomic_fetch_add(&inactive, 1, __ATOMIC_RELAXED);
+          for (int b2 = 0; b2 < nbar2; ++b2) {
+            // A late member, so that others wait, and with POMP_SPIN=0 sleep.
+            if (t2 == (int)((it + b2) % m2) && (it % 16) == 0)
+              for (volatile int d = 0; d < 2000; ++d)
+                ;
+            __atomic_store_n(&cell2[t1][t2], base + b2, __ATOMIC_RELAXED);
+#pragma omp barrier
+            for (int i = 0; i < m2; ++i)
+              if (__atomic_load_n(&cell2[t1][i], __ATOMIC_RELAXED) != base + b2)
+                __atomic_fetch_add(&bad, 1, __ATOMIC_RELAXED);
+#pragma omp barrier
+          }
+        }
+        // Level 1, after the inner join: every member's inner team is done.
+        __atomic_store_n(&cell1[t1], it * 4 + b1, __ATOMIC_RELAXED);
+#pragma omp barrier
+        for (int i = 0; i < m1; ++i)
+          if (__atomic_load_n(&cell1[i], __ATOMIC_RELAXED) != it * 4 + b1)
+            __atomic_fetch_add(&bad, 1, __ATOMIC_RELAXED);
+#pragma omp barrier
+      }
+    }
+  }
+  printf("barriers2: %ld regions, bad %ld, inactive inner %ld\n", iters, bad,
+      inactive);
+}
+
+// -----------------------------------------------------------------------------
+// lockstep: a level-1 team of 2, whose members fork in turn a level-2 team of
+// every other thread, with the same barriers. The two level-2 teams thus run
+// the same number of regions and barriers, and the same workers serve one
+// and then the other. A worker's sync line then holds, from the team it just
+// left, the very counts that the other team waits for: only their tags tell
+// them apart. Members other than the leader are late, so that a join or a
+// barrier that a stale value lets pass is seen, as a member that is not done
+// or a write that is missing.
+// -----------------------------------------------------------------------------
+
+static void test_lockstep(long iters) {
+  static long cell[64], fin[64];
+  long bad = 0, inactive = 0;
+  int n2 = num_threads - 1;
+  if (n2 < 2) {
+    printf("lockstep: needs a limit of 3 or more\n");
+    return;
+  }
+#pragma omp parallel num_threads(2)
+  {
+    int t1 = omp_get_thread_num();
+    for (long it = 0; it < iters; ++it) {
+      int nbar = 1 + (int)(it % 3);
+      for (int turn = 0; turn < 2; ++turn) {
+        long base = ((it * 2 + turn) * 4) * 64;
+        if (t1 == turn) {
+#pragma omp parallel num_threads(n2)
+          {
+            int t2 = omp_get_thread_num(), m2 = omp_get_num_threads();
+            if (t2 == 0 && m2 != n2)
+              __atomic_fetch_add(&inactive, 1, __ATOMIC_RELAXED);
+            for (int b = 0; b < nbar; ++b) {
+              if (t2 != 0)
+                for (volatile int d = 0; d < 3000; ++d)
+                  ;
+              __atomic_store_n(&cell[t2], base + b, __ATOMIC_RELAXED);
+#pragma omp barrier
+              for (int i = 0; i < m2; ++i)
+                if (__atomic_load_n(&cell[i], __ATOMIC_RELAXED) != base + b)
+                  __atomic_fetch_add(&bad, 1, __ATOMIC_RELAXED);
+#pragma omp barrier
+            }
+            if (t2 != 0)
+              for (volatile int d = 0; d < 3000; ++d)
+                ;
+            __atomic_store_n(&fin[t2], base, __ATOMIC_RELAXED);
+          }
+          // After the join, every member must be done.
+          for (int i = 0; i < n2; ++i)
+            if (__atomic_load_n(&fin[i], __ATOMIC_RELAXED) != base)
+              __atomic_fetch_add(&bad, 1, __ATOMIC_RELAXED);
+        }
+#pragma omp barrier
+      }
+    }
+  }
+  printf("lockstep: %ld cycles, bad %ld, short inner %ld\n", iters, bad,
+      inactive);
+}
+
+// -----------------------------------------------------------------------------
 // cycles: enter, run a few regions, close (once per "inference")
 // -----------------------------------------------------------------------------
 
@@ -476,6 +598,10 @@ int main(int argc, char **argv) {
     test_stress(n ? n : 100000);
   else if (!strcmp(test, "barriers"))
     test_barriers(n ? n : 20000);
+  else if (!strcmp(test, "barriers2"))
+    test_barriers2(n ? n : 5000);
+  else if (!strcmp(test, "lockstep"))
+    test_lockstep(n ? n : 5000);
   else if (!strcmp(test, "cycles"))
     test_cycles(n ? n : 1000);
   else if (!strcmp(test, "loop"))

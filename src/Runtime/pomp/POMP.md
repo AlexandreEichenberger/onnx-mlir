@@ -557,7 +557,8 @@ idle worker in the pool. All slots start busy:
 
 **Static descriptors.** Nothing is allocated after start-up:
 - `threads[64]`: per-slot wake-up epoch and state, each on its own cache line; the
-  current assignment; the region stack; and the sleep mutex and condition variable.
+  current assignment; the region stack; the sleep mutex and condition variable; and one sync
+  line per active level (done flag, tree barrier flags).
 - `rootTeam`: the team the root leads at level 1.
 - `slotTeams[64]`: the team that slot *i* leads at level 2.
 
@@ -566,8 +567,7 @@ A team descriptor holds:
 - the team size, and the leader's depth and level, which members start from;
 - the tid-to-slot map;
 - the reuse cache and the level-2 preferred sets;
-- the central barrier, and the `sleepers` mask of members asleep in a team wait;
-- one sync line per member (done flag, tree barrier flags).
+- the central barrier, and the `sleepers` mask of members asleep in a team wait.
 
 **Fork.**
 1. If the calling thread is a non-worker that does not own slot 0, take ownership. If another
@@ -637,10 +637,19 @@ an atomic OR. If the bit was still clear, nobody claimed the slot, and the pool 
 with `POMP_ERR_CLOSED`. Otherwise a close (or a fork after a new open) claimed it in between,
 and it serves as an ordinary worker.
 
-**Per-member sync lines.** Each team has one cache line per member, indexed by tid, holding
-three counters that only ever grow: `done` (the join), and `arrive` and `release` (the tree
-barrier). Each is written by one thread and read by one other, so no line is contended, and
-nothing is ever reset.
+**Per-member sync lines.** Each thread has one cache line per active level, holding three
+words: `done` (the join), and `arrive` and `release` (the tree barrier). A thread is in at most
+one team per active level, so it takes that line from team to team: members reach each other's
+lines through the team's tid-to-slot map. That is 2 lines per slot, where one line per member of
+each of the 65 teams would be 65 per slot. Each word is written by one thread and read by one
+other, so no line is contended.
+
+The values are tagged with the team, so that a value left in a line by a previous team never
+matches: value *n* of a team's counter is *n*·65 + the team's index (the leader's slot for a
+level-2 team, 64 for the root's). Every wait tests for equality, and nothing is ever reset.
+Counters are bumped before use, so no value is 0, which every line holds at first. A line keeps
+its `done` until the leader has read it, as the leader returns its workers to the pool only
+after the join.
 
 **Barrier.** The compiler emits one after every worksharing loop. Each thread counts the
 barriers it has passed in its region-stack entry. That count starts from the team's count at
@@ -650,13 +659,13 @@ the end of the previous region, which is the same for every member.
   counter. The last one resets it, bumps the barrier epoch and wakes any member that sleeps; the
   others wait until the epoch changes.
 - *Tree*, from `POMP_TREE_BARRIER` threads (default 5 on s390x): tid *t* is the parent of tids
-  4*t*+1 … 4*t*+4. A thread waits until each child's `arrive` reaches the barrier's count,
+  4*t*+1 … 4*t*+4. A thread waits until each child's `arrive` holds the barrier's count,
   publishes its own `arrive`, and waits for its `release`. Thread 0 does not wait for a
   release. Each thread then sets its children's `release`. The depth is ⌈log₄ T⌉.
 
 **Join.** A member stores the region number into its `done`, with release ordering. After
 that it touches only the team's `sleepers` word, to wake the leader if it sleeps; the leader's
-slot comes from the team's address. The leader waits for each member's `done` to match. Then
+slot comes from the team's address. The leader waits for each member's `done` to hold that number. Then
 it records the team's barrier count for the next region, and owns the descriptor again. A
 member's wake-up may still be in flight when the leader starts its next region on the team and
 waits there. Like any post, it then only makes the leader re-check, and its bit is the one that
