@@ -9,6 +9,8 @@
 #   test/run_z.sh [build-dir]           # default build-dir: ./build-z
 # Environment:
 #   CC=clang                            # needs -fopenmp and omp.h
+#   CXX=clang++                         # compiles pomp.cpp; by default, the
+#                                       # clang++ next to $CC
 #   OMPFLAGS=-fopenmp                   # compile flags for OpenMP code
 #   OMPLIBS=                            # link flags for libomp; by default,
 #                                       # found next to $CC, or none. May name
@@ -33,6 +35,7 @@
 
 set -u
 CC=${CC:-clang}
+CXX=${CXX:-$(dirname "$(command -v "$CC")")/$(basename "$CC" | sed 's/clang/clang++/;s/gcc/g++/')}
 OMPFLAGS=${OMPFLAGS:--fopenmp}
 OMPLIBS=${OMPLIBS:-}
 B=${1:-build-z}
@@ -45,17 +48,25 @@ fail=0
 note() { printf '\n== %s\n' "$*"; }
 bad() { echo "FAIL: $*"; fail=$((fail + 1)); }
 
-note "build ($($CC --version | head -1))"
+note "build ($($CC --version | head -1); C++: $CXX)"
 echo "pomp: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo this copy)" \
   "($(git rev-parse --short HEAD 2>/dev/null || echo no git))" \
   "$(git diff --quiet HEAD -- . 2>/dev/null || echo "+ local changes")"
 OPT="-O2 -std=gnu11"
-case $(uname -m) in s390x) OPT="$OPT -march=native" ;; esac
+# pomp.cpp needs no C++ header nor C++ runtime: -nostdinc++ enforces the
+# first, and linking every program with $CC (the C driver) the second.
+CXXOPT="-O2 -std=c++17 -nostdinc++ -fno-exceptions -fno-rtti -fno-threadsafe-statics
+  -funwind-tables"
+case $(uname -m) in s390x)
+  OPT="$OPT -march=native"
+  CXXOPT="$CXXOPT -march=native"
+  ;;
+esac
 $CC $OPT $OMPFLAGS -DPOMP -c test/pomp_test.c -o "$B/pomp_test.o" || exit 1
 for v in tls key; do
   D=$([ $v = key ] && echo -DPOMP_USE_PTHREAD_KEY)
   mkdir -p "$B/$v"
-  $CC $OPT $D -Wall -c pomp.c -o "$B/$v/pomp.o" &&
+  $CXX $CXXOPT $D -Wall -c pomp.cpp -o "$B/$v/pomp.o" &&
     $CC "$B/pomp_test.o" "$B/$v/pomp.o" -pthread -o "$B/$v/pomp_test" &&
     $CC $OPT test/pomp_host_test.c "$B/$v/pomp.o" -pthread \
       -o "$B/$v/pomp_host_test" || { echo "build of pomp-$v failed"; exit 1; }

@@ -7,10 +7,9 @@ zDNNx actually call. Its worker threads are **lent by the host** (for example Ja
 cannot do this: its workers stay until the process ends (see
 `astudy/analysis/openmp-calls-in-om.md`).
 
-It targets z/OS, where the host owns the threads. It is plain C plus pthreads, built like
-`cruntime` (the compiler's default C standard, no C++), and is developed and tested on Linux and
-macOS. It uses `<stdatomic.h>` and `_Alignas`, so the compiler must support at least C11, which
-every current default (gnu17) does.
+It targets z/OS, where the host owns the threads, and is developed and tested on Linux and
+macOS. Its interface, `pomp.h`, is C. Its implementation, `pomp.cpp`, is C++17 that needs exactly
+what a C library needs, the C library and pthreads; see "Language" below.
 
 ## Supported subset
 
@@ -504,6 +503,31 @@ and 0.74–0.94 µs. The tree barrier is
 *slower* there up to 16 threads (1.9 against 0.75 µs at 16), so the default keeps the central
 barrier on non-s390x targets.
 
+## Language
+
+`pomp.cpp` uses C++ for its classes and templates, and nothing that needs the C++ runtime. The
+object file has the same undefined symbols as a C one (the C library and pthreads), no static
+constructors, and links into C programs with the C driver: CMake builds it as a C source compiled
+as C++, so nothing that links `libompruntime.a` gets a C++ library. The rules:
+
+- **No C++ header**, enforced by `-nostdinc++`. Atomics are a small `Atomic<T>` class over the
+  compiler's `__atomic` builtins, which `<stdatomic.h>` and `<atomic>` are both built on: the
+  same instructions and memory model as C11. Mutexes and conditions are pthread's, behind
+  `Mutex`, `Condition` and `ScopedLock<T>` classes.
+- **No C++ runtime**: no exceptions, RTTI or thread-safe statics (`-fno-exceptions -fno-rtti
+  -fno-threadsafe-statics`), no `new` or `delete`, no virtual functions, and no `thread_local` of
+  a type with a constructor.
+- **Constant initialization only.** Every global is `constinit` (or clang's
+  `require_constant_initialization` in C++17) and trivially destructible, so nothing runs at
+  load or exit. The pthread objects start zeroed and are initialized on the first call, with the
+  rest of pomp.
+- **Templates for the code that was macros**: the loop partitioning for the four IV types, the
+  calls of outlined functions through their exact type (a table built at compile time), and the
+  team waits, whose condition is a function object.
+
+The tests are C programs and link with the C driver alone, so a C++ runtime symbol needed by
+pomp would be a link error.
+
 ## Design
 
 **Thread identity.** Each thread has one `__thread int32_t` word. It holds:
@@ -523,7 +547,7 @@ Every entry point finds the calling thread from this word. The `gtid` argument o
 `__kmpc_*` entry points is ignored: it is only what the caller says, while the word cannot name
 another thread, nor a slot out of range (see "Input checks" below).
 
-**One word for the pool.** `pomp_busy` holds one bit per slot. A bit is clear iff that slot is a
+**One word for the pool.** `busy` holds one bit per slot. A bit is clear iff that slot is a
 idle worker in the pool. All slots start busy:
 - A pool thread clears its own bit when it arrives. No team includes it yet, so there is no race.
 - A leader recruits its whole team with one CAS (`busy |= pick`).
@@ -532,10 +556,10 @@ idle worker in the pool. All slots start busy:
   they are entered again.
 
 **Static descriptors.** Nothing is allocated after start-up:
-- `pomp_threads[64]`: per-slot wake-up epoch and state, each on its own cache line; the
+- `threads[64]`: per-slot wake-up epoch and state, each on its own cache line; the
   current assignment; the region stack; and the sleep mutex and condition variable.
-- `pomp_root_team`: the team the root leads at level 1.
-- `pomp_slot_team[64]`: the team that slot *i* leads at level 2.
+- `rootTeam`: the team the root leads at level 1.
+- `slotTeams[64]`: the team that slot *i* leads at level 2.
 
 A team descriptor holds:
 - the outlined function and arguments;
@@ -667,7 +691,7 @@ state, never by an argument taken as is:
   slot comes from the calling thread's own word (written only by `pomp_enter_pool`, after that
   check), or from a bit of a 64-bit mask.
 - **`gtid` arguments are ignored**, so a wrong `gtid` (negative, 64 or more, or another
-  thread's) cannot index `pomp_threads`, read another thread's region stack, or join another
+  thread's) cannot index `threads`, read another thread's region stack, or join another
   team's barrier.
 - **Thread limit.** `pomp_open_pool` accepts only `[1, 64]` while no limit is set, and clamps
   any later value to the limit set. `OMP_THREAD_LIMIT` out of range is ignored.
@@ -722,7 +746,7 @@ Measured costs against libomp are in "Cost compared with libomp" in the example 
 ## Building outside onnx-mlir
 
 ```sh
-clang -O2 -c pomp.c
+clang++ -O2 -std=c++17 -nostdinc++ -fno-exceptions -fno-rtti -fno-threadsafe-statics -c pomp.cpp
 clang -O2 -fopenmp -DPOMP -c test/pomp_test.c && clang pomp_test.o pomp.o -o pomp_test
 OMP_THREAD_LIMIT=8 ./pomp_test static
 clang -O2 test/pomp_host_test.c pomp.o -o pomp_host_test
