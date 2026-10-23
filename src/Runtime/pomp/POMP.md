@@ -367,7 +367,7 @@ is the number of those workers that are asleep rather than spinning:
 | Step | Who | Cost | What it does |
 |---|---|---|---|
 | `__kmpc_fork_call`: recruit | leader | **O(1)** when the same team as last time is free (one CAS on `busy`); O(T) bit scan otherwise | Cached mask hit in the steady state |
-| `__kmpc_fork_call`: describe | leader | O(T) | Writes the tid→slot map and copies `argc` pointers (plus an O(T) split of spare workers, only when 2 levels are enabled) |
+| `__kmpc_fork_call`: describe | leader | O(T) | Writes the workers mask and copies `argc` pointers (plus an O(T) split of spare workers, only when 2 levels are enabled) |
 | `__kmpc_fork_call`: wake | leader | **O(T)** atomic increments (one `go` epoch per worker) + 1 load of `sleeping`; + O(W) posts (system calls) | No system call when every worker spins |
 | `__kmpc_global_thread_num` | each thread | O(1) | One `__thread` load (or `pthread_getspecific`) |
 | `__kmpc_for_static_init_8u` | each thread | O(1) | A division and a few multiplies; no shared memory touched |
@@ -556,8 +556,8 @@ idle worker in the pool. All slots start busy:
   they are entered again.
 
 **Static descriptors.** Nothing is allocated after start-up:
-- `threads[64]`: per slot, one wake-up line with the wake-up epoch, the current assignment
-  and the sync words (done flag, tree barrier flags); the region stack and state, on lines of
+- `threads[64]`: per slot, one wake-up line with the wake-up epoch, the current assignment,
+  the preferred workers for a level-2 team, and the sync words (done flag, tree barrier flags); the region stack and state, on lines of
   their own; and the sleep mutex and condition variable.
 - `rootTeam`: the team the root leads at level 1.
 - `slotTeams[64]`: the team that slot *i* leads at level 2.
@@ -565,8 +565,9 @@ idle worker in the pool. All slots start busy:
 A team descriptor holds:
 - the outlined function and arguments;
 - the team size, and the leader's depth and level, which members start from;
-- the tid-to-slot map;
-- the reuse cache and the level-2 preferred sets;
+- the mask of its workers: tid 0 is the leader, and tid *t* > 0 the *t*-th worker in increasing
+  order of slots;
+- the reuse cache;
 - the central barrier, and the `sleepers` mask of members asleep in a team wait.
 
 **Fork.**
@@ -583,16 +584,17 @@ A team descriptor holds:
 
    This matches libomp's default for the zDNNx matmul nest.
 4. Otherwise recruit. If the request matches the team's cached one and those same workers are
-   all idle, the pick is O(1). Otherwise take the lowest idle bits, preferring the team's
-   preferred set.
-5. Write the descriptor and the whole tid-to-slot map. Then set each member's `team` and
-   `tid`, and bump its `go` epoch.
+   all idle, the pick is O(1). Otherwise take the lowest idle bits, preferring the calling
+   thread's preferred set.
+5. Write the descriptor, with the workers mask. Then set each member's `team` and `tid`, and
+   bump its `go` epoch.
 6. Run as tid 0, and join: wait for each member's `done` flag. Then clear the team's bits, and
    if the pool was closed meanwhile, release the workers.
 
 **Two levels.** When a level-1 team forks with `OMP_MAX_ACTIVE_LEVELS=2`, the leader splits the
-remaining idle workers into one contiguous group per member. Each member's level-2 fork prefers
-its own group. Inner teams therefore do not compete with each other, and their caches stay
+remaining idle workers into one contiguous group per member, and stores each group in that
+member's descriptor before waking it. Each member's level-2 fork prefers its own group. Only the
+root leads a level-1 team, so one group per slot is enough. Inner teams therefore do not compete with each other, and their caches stay
 valid from one region to the next. For example, with 16 threads, a 4×4 split gives the same
 4 + 4×3 assignment every time.
 
@@ -642,7 +644,7 @@ and `release` (the tree barrier). Only members other than the leader use theirs:
 stores no `done`, has no parent in the tree, and only touches the words of other members. A
 thread is such a member of at most one team at a time, as it leads any team it forks and a
 level-1 member cannot be recruited at level 2. So it takes its words from team to team, and
-members reach each other's through the team's tid-to-slot map. Each word is written by one
+members reach each other's through the team's workers mask. Each word is written by one
 thread and read by one other.
 
 The words share the thread's wake-up line with its epoch and assignment. They are used in
@@ -671,7 +673,9 @@ the end of the previous region, which is the same for every member.
 - *Tree*, from `POMP_TREE_BARRIER` threads (default 5 on s390x): tid *t* is the parent of tids
   4*t*+1 … 4*t*+4. A thread waits until each child's `arrive` holds the barrier's count,
   publishes its own `arrive`, and waits for its `release`. Thread 0 does not wait for a
-  release. Each thread then sets its children's `release`. The depth is ⌈log₄ T⌉.
+  release. Each thread then sets its children's `release`. The depth is ⌈log₄ T⌉. Each member
+  finds the slots of its parent and children once, on entry to the region, from the workers
+  mask, so that a barrier does no lookup.
 
 **Join.** A member stores the region number into its `done`, with release ordering. After
 that it touches only the team's `sleepers` word, to wake the leader if it sleeps; the leader's
@@ -684,7 +688,7 @@ the leader's new wait set, so the post is consumed by that wait.
 **Waits in a team sleep.** The join and both barriers wait with the same protocol as an idle
 worker:
 1. Spin, yielding after 4096 iterations.
-2. After `POMP_SPIN` iterations, set the waiter's bit (its tid) in the team's `sleepers` word.
+2. After `POMP_SPIN` iterations, set the waiter's bit (its slot) in the team's `sleepers` word.
 3. Fence, re-check the condition, and sleep on the waiter's own post.
 
 A thread is in at most one wait at a time, so its slot's single post serves every kind of

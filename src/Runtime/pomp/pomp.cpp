@@ -140,21 +140,20 @@ inline void relax() {
 #endif
 }
 
-// A set of thread ids, one bit per id of a 64-bit word. Threads have two kinds
-// of id, which `Tag` keeps apart: slots, which name a thread in the pool
-// (`threads[slot]`), and tids, which name a member in its team (see
-// Team::slotOf). Iterating visits the ids in increasing order, one step per
-// id in the set.
-template <class Tag>
-class IdMask {
+// A set of slots, one bit per slot of a 64-bit word. Slots are pool-wide
+// ids: 0 for the root and 1..limit-1 for the workers (`threads[slot]`). Tids,
+// the ids of members in their team, are not sets: the leader is tid 0, and the
+// other members follow in increasing order of slots. Iterating visits the
+// slots in increasing order, one step per slot in the set.
+class SlotMask {
 public:
-  constexpr IdMask() = default;
-  static constexpr IdMask of(int id) { return IdMask(uint64_t(1) << id); }
+  constexpr SlotMask() = default;
+  static constexpr SlotMask of(int id) { return SlotMask(uint64_t(1) << id); }
   // Ids 0..n-1.
-  static constexpr IdMask below(int n) {
-    return IdMask(n >= 64 ? UINT64_MAX : (uint64_t(1) << n) - 1);
+  static constexpr SlotMask below(int n) {
+    return SlotMask(n >= 64 ? UINT64_MAX : (uint64_t(1) << n) - 1);
   }
-  static constexpr IdMask fromBits(uint64_t bits) { return IdMask(bits); }
+  static constexpr SlotMask fromBits(uint64_t bits) { return SlotMask(bits); }
   constexpr uint64_t bits() const { return bits_; }
 
   constexpr explicit operator bool() const { return bits_ != 0; }
@@ -162,26 +161,26 @@ public:
   // The lowest id of a nonempty set.
   int lowest() const { return __builtin_ctzll(bits_); }
   // The n lowest ids, or all of them if fewer.
-  IdMask lowest(int n) const {
+  SlotMask lowest(int n) const {
     uint64_t x = bits_, r = 0;
     for (; n > 0 && x; --n) {
       uint64_t low = x & (~x + 1);
       r |= low;
       x &= ~low;
     }
-    return IdMask(r);
+    return SlotMask(r);
   }
 
-  constexpr IdMask operator|(IdMask o) const { return IdMask(bits_ | o.bits_); }
-  constexpr IdMask operator&(IdMask o) const { return IdMask(bits_ & o.bits_); }
+  constexpr SlotMask operator|(SlotMask o) const { return SlotMask(bits_ | o.bits_); }
+  constexpr SlotMask operator&(SlotMask o) const { return SlotMask(bits_ & o.bits_); }
   // Set difference: the ids of this set that are not in `o`.
-  constexpr IdMask operator-(IdMask o) const {
-    return IdMask(bits_ & ~o.bits_);
+  constexpr SlotMask operator-(SlotMask o) const {
+    return SlotMask(bits_ & ~o.bits_);
   }
-  IdMask &operator|=(IdMask o) { return *this = *this | o; }
-  IdMask &operator-=(IdMask o) { return *this = *this - o; }
-  constexpr bool operator==(IdMask o) const { return bits_ == o.bits_; }
-  constexpr bool operator!=(IdMask o) const { return bits_ != o.bits_; }
+  SlotMask &operator|=(SlotMask o) { return *this = *this | o; }
+  SlotMask &operator-=(SlotMask o) { return *this = *this - o; }
+  constexpr bool operator==(SlotMask o) const { return bits_ == o.bits_; }
+  constexpr bool operator!=(SlotMask o) const { return bits_ != o.bits_; }
 
   class Iterator {
   public:
@@ -200,14 +199,10 @@ public:
   Iterator end() const { return Iterator(0); }
 
 private:
-  constexpr explicit IdMask(uint64_t bits) : bits_(bits) {}
+  constexpr explicit SlotMask(uint64_t bits) : bits_(bits) {}
   uint64_t bits_ = 0;
 };
 
-// Slots: pool-wide ids, 0 for the root and 1..limit-1 for the workers.
-using SlotMask = IdMask<struct SlotTag>;
-// Tids: ids within a team, 0 for the leader and 1..nth-1 for the members.
-using TidMask = IdMask<struct TidTag>;
 
 // Parse a positive integer; return -1 if the string is not one.
 long parseInt(const char *s, const char **end) {
@@ -288,29 +283,29 @@ private:
   T value_;
 };
 
-// An atomic IdMask. Operations take and return masks, as Atomic's do values;
-// fetchSet and fetchClear add and remove ids and return the previous set.
-template <class Mask>
+// An atomic SlotMask. Operations take and return masks, as Atomic's do
+// values; fetchSet and fetchClear add and remove slots and return the previous
+// set.
 class AtomicMask {
 public:
   constexpr AtomicMask() = default;
-  constexpr explicit AtomicMask(Mask m) : bits_(m.bits()) {}
+  constexpr explicit AtomicMask(SlotMask m) : bits_(m.bits()) {}
 
-  Mask load(Order o = Order::SeqCst) const {
-    return Mask::fromBits(bits_.load(o));
+  SlotMask load(Order o = Order::SeqCst) const {
+    return SlotMask::fromBits(bits_.load(o));
   }
-  void store(Mask m, Order o = Order::SeqCst) { bits_.store(m.bits(), o); }
-  Mask fetchSet(Mask m, Order o = Order::SeqCst) {
-    return Mask::fromBits(bits_.fetchOr(m.bits(), o));
+  void store(SlotMask m, Order o = Order::SeqCst) { bits_.store(m.bits(), o); }
+  SlotMask fetchSet(SlotMask m, Order o = Order::SeqCst) {
+    return SlotMask::fromBits(bits_.fetchOr(m.bits(), o));
   }
-  Mask fetchClear(Mask m, Order o = Order::SeqCst) {
-    return Mask::fromBits(bits_.fetchAnd(~m.bits(), o));
+  SlotMask fetchClear(SlotMask m, Order o = Order::SeqCst) {
+    return SlotMask::fromBits(bits_.fetchAnd(~m.bits(), o));
   }
-  bool compareExchangeWeak(Mask &expected, Mask desired,
+  bool compareExchangeWeak(SlotMask &expected, SlotMask desired,
       Order success = Order::SeqCst, Order failure = Order::SeqCst) {
     uint64_t e = expected.bits();
     bool ok = bits_.compareExchangeWeak(e, desired.bits(), success, failure);
-    expected = Mask::fromBits(e);
+    expected = SlotMask::fromBits(e);
     return ok;
   }
 
@@ -549,6 +544,41 @@ struct Level {
   int32_t tid = 0;
   int32_t nth = 0;
   uint64_t bar = 0; // Barriers this thread passed in this team, all regions.
+  // Tree barrier links, set on entry if the team uses the tree: the slots of
+  // this member's children, and of its parent (unused for tid 0).
+  SlotMask children;
+  int32_t parent = 0;
+};
+
+// A thread's regions, innermost on top, with the number of them that are
+// active (more than 1 thread). Regions past kMaxDepth are only counted: forks
+// there are serialized, and top() is then a shared entry of a team of one.
+//
+// A worker starts at its leader's depth and active level (startAt): the
+// entries below that depth are the leader's, on the leader's own stack, and
+// this stack never pops below it. So `active` is the inherited count plus the
+// active entries above it, not something the entries alone tell.
+class RegionStack {
+public:
+  void startAt(int32_t depth, int32_t active) {
+    depth_ = depth;
+    active_ = active;
+  }
+  void push(const Level &l);
+  void pop();
+  // The innermost region, or nullptr outside of any. Its `bar` is written by
+  // the barriers of its team; nothing else of it changes after push.
+  Level *top();
+  int32_t depth() const { return depth_; }
+  int32_t active() const { return active_; }
+  // Whether a region forked now may be active: a slot is left for it.
+  bool canNest() const { return depth_ < kMaxDepth; }
+
+private:
+  static Level serial_;
+  int32_t depth_ = 0;  // Nesting level; past kMaxDepth, only counted.
+  int32_t active_ = 0; // Active levels, enclosing teams included.
+  Level levels_[kMaxDepth];
 };
 
 // Synchronization words of a thread as a member of a team, on the thread's
@@ -576,7 +606,7 @@ class Team {
 public:
   // Leader: describe the work for the workers in `workers`, assign them, and
   // wake them. Members start at the leader's depth, at active level `level`.
-  void launch(int32_t leaderSlot, SlotMask workers, int32_t level,
+  void launch(SlotMask workers, int32_t level,
       int32_t depth, Microtask fn, int32_t argc, void **argv);
   // Leader: wait for every member to finish, then record the team's barrier
   // count, `bar` as the leader saw it, for the next region.
@@ -587,9 +617,8 @@ public:
   void barrier(Thread &self, Level &top);
 
   int32_t size() const { return nth_; }
-  uint64_t barrierCount() const { return barSeq_; }
-  // For a level-1 team: the workers that member `tid` prefers at level 2.
-  SlotMask preferredSlots(int32_t tid) const { return preferredSlots_[tid]; }
+  // The region-stack entry of member `tid` in this region.
+  Level levelFor(int32_t tid) const;
   // Reuse cache of the recruitment: the workers of the last request of
   // `want` workers, if all of them are among `idle`, or else none.
   SlotMask cachedPick(int want, SlotMask idle) const {
@@ -604,16 +633,17 @@ public:
 
 private:
   template <class Cond>
-  void wait(Thread &self, int32_t tid, Cond cond);
-  TidMask claimSleepers(TidMask tids);
-  void wakeMembers(TidMask tids);
+  void wait(Thread &self, Cond cond);
+  SlotMask claimSleepers(SlotMask slots);
+  void wakeMembers(SlotMask slots);
   void wakeLeader();
   int32_t leaderSlot() const;
+  // Every member, leader included.
+  SlotMask members() const { return workers_ | SlotMask::of(leaderSlot()); }
+  // The slot of member `tid`, by counting: off the fast paths.
+  int32_t slotOf(int32_t tid) const;
   void partition();
-  void treeBarrier(Thread &self, int32_t tid, int32_t nth, uint64_t k);
-  // The slot of member `tid` in this team, and its sync line.
-  int32_t slotOf(int32_t tid) const { return slotOfTid_[tid]; }
-  MemberSync &syncOf(int32_t tid) const;
+  void treeBarrier(Thread &self, Level &top);
   // Value `n` of one of this team's counters, as stored in sync lines: n
   // teams apart, plus the team's index, so that the values of two teams
   // never meet. Counters start at 0 and are bumped before use, so a value is
@@ -632,19 +662,18 @@ private:
   int32_t depth_ = 0;    // Leader's nesting depth before this region.
   uint64_t region_ = 0;  // Number of this region, for the members' done flags.
   uint64_t barSeq_ = 0;  // Barrier count before this region, for the tree.
-  // The slot of each tid, in increasing order of slots after the leader's.
-  uint8_t slotOfTid_[kMaxThreads] = {};
+  // The members other than the leader: tids 1..nth-1, in increasing order of
+  // slots.
+  SlotMask workers_;
   // Reuse cache: the last request and the workers it got.
   int32_t cachedReq_ = 0;
   SlotMask cachedPick_;
-  // For a level-1 team: preferred workers for the level-2 team of each tid.
-  SlotMask preferredSlots_[kMaxThreads] = {};
   // Central barrier, for small teams: arrival count and generation.
   alignas(kCacheLine) Atomic<int> barCount_;
   alignas(kCacheLine) Atomic<uint64_t> barEpoch_;
-  // Tid t is in while member t sleeps in a join or barrier wait, or is about
-  // to. Written only by sleepers and their wakers, so it stays shared.
-  alignas(kCacheLine) AtomicMask<TidMask> sleepers_;
+  // A member's slot is in while it sleeps in a join or barrier wait, or is
+  // about to. Written only by sleepers and their wakers, so it stays shared.
+  alignas(kCacheLine) AtomicMask sleepers_;
 };
 
 // A thread descriptor, one per slot.
@@ -669,6 +698,9 @@ public:
   void fork(int32_t gtid, int32_t want, Microtask fn, int32_t argc,
       void **argv);
 
+  // This thread's slot.
+  int32_t slot() const;
+
   // Recruiter: the assignment for the next wake-up, then the wake-up.
   void assign(Team *team, int32_t tid) {
     wake_.team = team;
@@ -681,15 +713,8 @@ public:
   int32_t assignedTid() const { return wake_.tid; }
 
   // Region stack.
-  void push(Team *team, int32_t tid, int32_t nth);
-  void pop();
-  Level *top();
-  int32_t depth() const { return depth_; }
-  int32_t active() const { return active_; }
-  void setNesting(int32_t depth, int32_t active) {
-    depth_ = depth;
-    active_ = active;
-  }
+  RegionStack &regions() { return regions_; }
+  const RegionStack &regions() const { return regions_; }
 
   // Sleep.
   void post() { post_.post(); }
@@ -707,6 +732,12 @@ public:
   // Sync line of this thread as a member, other than the leader, of a team.
   MemberSync &sync() { return wake_.sync; }
 
+  // The workers this thread prefers for a level-2 team: set by the root for
+  // each member of a level-1 team, before its wake-up, and read by the member
+  // in that region.
+  void setPreferred(SlotMask slots) { wake_.preferred = slots; }
+  SlotMask preferred() const { return wake_.preferred; }
+
 private:
   // Wake-up and team words, on one line. They are used in turn: the recruiter
   // writes the assignment and then `go` only while the thread is idle, and
@@ -719,6 +750,7 @@ private:
     Atomic<uint64_t> go;
     // Assignment for the next wake-up, written by the recruiter before `go`.
     Team *team = nullptr;
+    SlotMask preferred;
     int32_t tid = 0;
     // Join and tree barrier.
     MemberSync sync;
@@ -728,10 +760,7 @@ private:
 
   // Owned by the thread itself, on lines of their own: the region stack is
   // written at every barrier, while the leader may poll `sync`.
-  // Nesting level; past kMaxDepth, only counted.
-  alignas(kCacheLine) int32_t depth_ = 0;
-  int32_t active_ = 0; // Number of active levels, enclosing teams included.
-  Level stack_[kMaxDepth];
+  alignas(kCacheLine) RegionStack regions_;
   // kFree, kInPool or kLeaving. Read by another thread only when it enters
   // the pool as this slot.
   Atomic<int> present_;
@@ -769,11 +798,11 @@ private:
   void releaseIdle();
 
   // Slot i is out iff it is an idle worker in the pool.
-  alignas(kCacheLine) AtomicMask<SlotMask> busy_{SlotMask::below(64)};
+  alignas(kCacheLine) AtomicMask busy_{SlotMask::below(64)};
   // Slot i is in while worker i sleeps, or is about to.
-  alignas(kCacheLine) AtomicMask<SlotMask> sleeping_;
+  alignas(kCacheLine) AtomicMask sleeping_;
   // Slot i is in from the release that claimed worker i until it leaves.
-  alignas(kCacheLine) AtomicMask<SlotMask> released_;
+  alignas(kCacheLine) AtomicMask released_;
   // 1 from a close until the next open: no thread may enter, and forks
   // run on their leader alone.
   alignas(kCacheLine) Atomic<int> closed_;
@@ -816,7 +845,7 @@ private:
   // them with its store to `closed`.
   Mutex limitMutex_;
   Atomic<int> limit_; // Root included; 0 until set.
-  AtomicMask<SlotMask> limitSlots_;
+  AtomicMask limitSlots_;
   Atomic<int> nthreads_[kMaxActive]; // Default team sizes.
   Atomic<int> limitMismatchSeen_;
   long spin_ = 0;
@@ -1087,9 +1116,9 @@ private:
 // spin, then yield, which lets an oversubscribed waitee run, then sleep after
 // POMP_SPIN iterations in all.
 template <class Cond>
-void Team::wait(Thread &self, int32_t tid, Cond cond) {
+void Team::wait(Thread &self, Cond cond) {
   long i = 0;
-  TidMask me = TidMask::of(tid);
+  SlotMask me = SlotMask::of(self.slot());
   while (!cond()) {
     if (i++ < settings.spin()) {
       if (i < kYieldSpin)
@@ -1110,25 +1139,26 @@ void Team::wait(Thread &self, int32_t tid, Cond cond) {
   }
 }
 
-// Claim the members in `tids` that sleep in a team wait. Return the sleepers
-// whose bit this call cleared, for the caller to post to.
-inline TidMask Team::claimSleepers(TidMask tids) {
+// Claim the members in `slots` that sleep in a team wait. Return the
+// sleepers whose bit this call cleared, for the caller to post to.
+inline SlotMask Team::claimSleepers(SlotMask slots) {
   fence(Order::SeqCst);
-  TidMask s = sleepers_.load(Order::Relaxed) & tids;
-  return s ? sleepers_.fetchClear(s) & s : TidMask();
+  SlotMask s = sleepers_.load(Order::Relaxed) & slots;
+  return s ? sleepers_.fetchClear(s) & s : SlotMask();
 }
 
-inline void Team::wakeMembers(TidMask tids) {
-  for (int tid : claimSleepers(tids))
-    threads[slotOf(tid)].post();
+inline void Team::wakeMembers(SlotMask slots) {
+  for (int slot : claimSleepers(slots))
+    threads[slot].post();
 }
 
 // A member's last access to its team, at the join: wake the leader if it
 // sleeps. The leader is found from the team's address, as the team may
 // already be reused.
 inline void Team::wakeLeader() {
-  if (claimSleepers(TidMask::of(0)))
-    threads[leaderSlot()].post();
+  int32_t leader = leaderSlot();
+  if (claimSleepers(SlotMask::of(leader)))
+    threads[leader].post();
 }
 
 // The slot of the leader of this team.
@@ -1140,9 +1170,37 @@ inline int32_t Team::index() const {
   return this == &rootTeam ? kMaxThreads : int32_t(this - slotTeams);
 }
 
-// The member's slot comes from the map, written before the wake-up.
-inline MemberSync &Team::syncOf(int32_t tid) const {
-  return threads[slotOf(tid)].sync();
+inline int32_t Thread::slot() const { return int32_t(this - threads); }
+
+// Tid t > 0 is the t-th worker in increasing order of slots.
+inline int32_t Team::slotOf(int32_t tid) const {
+  if (tid == 0)
+    return leaderSlot();
+  return (workers_ - workers_.lowest(tid - 1)).lowest();
+}
+
+// Tid t is the parent of tids ARITY*t+1 .. ARITY*t+ARITY, which are
+// consecutive workers. Members read the workers, written before their
+// wake-up, once per region, so that barriers need no lookup.
+//
+// The barrier count starts from the team's at the end of the previous region,
+// the same for every member.
+Level Team::levelFor(int32_t tid) const {
+  Level l;
+  l.team = const_cast<Team *>(this);
+  l.tid = tid;
+  l.nth = nth_;
+  l.bar = barSeq_;
+  if (nth_ >= settings.treeMin()) {
+    int32_t first = kTreeArity * tid + 1;
+    int32_t n = nth_ - first;
+    if (n > kTreeArity)
+      n = kTreeArity;
+    l.children = n > 0 ? (workers_ - workers_.lowest(first - 1)).lowest(n)
+                       : SlotMask();
+    l.parent = tid ? slotOf((tid - 1) / kTreeArity) : 0;
+  }
+  return l;
 }
 
 // Spin on a condition outside of any team (reclaim), yielding when long.
@@ -1160,40 +1218,39 @@ void spinUntil(Cond cond) {
 // Region stack
 // -----------------------------------------------------------------------------
 
-// Levels past kMaxDepth are only counted: forks there are serialized, so each
-// of them is this entry. Never written, as its team has one thread.
-POMP_CONSTINIT Level serialLevel = {nullptr, 0, 1, 0};
+// The entry of the regions past kMaxDepth. Never written, as its team has one
+// thread.
+POMP_CONSTINIT Level RegionStack::serial_ = {nullptr, 0, 1, 0};
 
-inline void Thread::push(Team *team, int32_t tid, int32_t nth) {
+// The entry of a serialized region.
+inline Level serialized() { return {nullptr, 0, 1, 0}; }
+
+inline void RegionStack::push(const Level &l) {
   if (depth_ >= kMaxDepth) {
-    if (nth > 1)
+    if (l.nth > 1)
       fatal("internal: active region past the maximum depth");
     depth_++;
     return;
   }
-  Level &l = stack_[depth_];
-  l.team = team;
-  l.tid = tid;
-  l.nth = nth;
-  l.bar = team ? team->barrierCount() : 0;
+  levels_[depth_] = l;
   depth_++;
-  if (nth > 1)
+  if (l.nth > 1)
     active_++;
 }
 
-inline void Thread::pop() {
+inline void RegionStack::pop() {
   if (depth_ <= 0)
     fatal("__kmpc_end_serialized_parallel without a matching "
           "__kmpc_serialized_parallel");
   depth_--;
-  if (depth_ < kMaxDepth && stack_[depth_].nth > 1)
+  if (depth_ < kMaxDepth && levels_[depth_].nth > 1)
     active_--;
 }
 
-inline Level *Thread::top() {
+inline Level *RegionStack::top() {
   if (depth_ > kMaxDepth)
-    return &serialLevel;
-  return depth_ > 0 ? &stack_[depth_ - 1] : nullptr;
+    return &serial_;
+  return depth_ > 0 ? &levels_[depth_ - 1] : nullptr;
 }
 
 inline Thread *Thread::current() {
@@ -1203,7 +1260,7 @@ inline Thread *Thread::current() {
 
 inline Level *Thread::currentLevel() {
   Thread *self = current();
-  return self ? self->top() : nullptr;
+  return self ? self->regions().top() : nullptr;
 }
 
 // -----------------------------------------------------------------------------
@@ -1303,17 +1360,26 @@ void Pool::returnWorkers(SlotMask workers) {
 // For a level-1 team, split the remaining idle workers into one contiguous
 // group per member, which that member then prefers for its level-2 team, so
 // that concurrent inner forks do not compete and their caches stay valid.
+// Each member's group is kept in its thread descriptor, written before the
+// wake-up: called once the workers are known.
 void Team::partition() {
   SlotMask spare = pool.idle();
   int n = spare.count();
+  int32_t slot = leaderSlot();
+  SlotMask rest = workers_;
   for (int t = 0; t < nth_; ++t) {
     int k = n / nth_ + (t < n % nth_ ? 1 : 0);
-    preferredSlots_[t] = spare.lowest(k);
-    spare -= preferredSlots_[t];
+    SlotMask group = spare.lowest(k);
+    threads[slot].setPreferred(group);
+    spare -= group;
+    if (rest) {
+      slot = rest.lowest();
+      rest -= SlotMask::of(slot);
+    }
   }
 }
 
-void Team::launch(int32_t leader, SlotMask workers, int32_t level,
+void Team::launch(SlotMask workers, int32_t level,
     int32_t depth, Microtask fn, int32_t argc, void **argv) {
   fn_ = fn;
   argc_ = argc;
@@ -1322,18 +1388,16 @@ void Team::launch(int32_t leader, SlotMask workers, int32_t level,
   level_ = level;
   depth_ = depth;
   region_++;
-  slotOfTid_[0] = uint8_t(leader);
+  workers_ = workers;
   barCount_.store(0, Order::Relaxed);
   if (level_ == 1 && settings.maxActive() > 1)
     partition();
 
-  // Assign and wake the members; post only to those that sleep. The whole
-  // map is written first: members use it to wake each other.
+  // Assign and wake the members; post only to those that sleep. The team's
+  // workers are written first: members use them to wake each other.
   int32_t tid = 1;
   for (int slot : workers)
-    slotOfTid_[tid++] = uint8_t(slot);
-  for (tid = 1; tid < nth_; ++tid)
-    threads[slotOf(tid)].assign(this, tid);
+    threads[slot].assign(this, tid++);
   pool.wakeSleeping(workers);
 }
 
@@ -1341,8 +1405,8 @@ void Team::launch(int32_t leader, SlotMask workers, int32_t level,
 // increments of one shared counter serialize. A long wait sleeps; each member
 // wakes the leader after its done flag.
 void Team::join(Thread &leader, uint64_t bar) {
-  for (int32_t tid = 1; tid < nth_; ++tid)
-    wait(leader, 0, FlagIs(syncOf(tid).done, tag(region_)));
+  for (int slot : workers_)
+    wait(leader, FlagIs(threads[slot].sync().done, tag(region_)));
   // Every member passed the same barriers: the leader's count is the team's
   // for the next region. Written after the join, as members read it on entry.
   barSeq_ = bar;
@@ -1352,10 +1416,11 @@ void Team::runMember(Thread &self, int32_t slot, int32_t tid) {
   uint64_t done = tag(region_);
   MemberSync &sync = self.sync();
   // Continue the leader's nesting: same depth, same active levels.
-  self.setNesting(depth_, level_ - 1);
-  self.push(this, tid, nth_);
+  RegionStack &regions = self.regions();
+  regions.startAt(depth_, level_ - 1);
+  regions.push(levelFor(tid));
   invoke(fn_, slot, tid, argc_, argv_);
-  self.pop();
+  regions.pop();
   // After this store, the leader may reuse the team; only the wake-up of
   // the leader follows, which allows it. The line keeps `done` until the
   // leader reads it: the thread joins no other team before the leader returns
@@ -1368,7 +1433,7 @@ void Thread::fork(
     int32_t gtid, int32_t want, Microtask fn, int32_t argc, void **argv) {
   int32_t limit = settings.limit();
   if (want <= 0)
-    want = settings.numThreads(active_);
+    want = settings.numThreads(regions_.active());
   if (want > limit)
     want = limit;
 
@@ -1376,34 +1441,35 @@ void Thread::fork(
   // deeply, or pool closed.
   Team *team = nullptr;
   SlotMask workers;
-  if (want > 1 && active_ < settings.maxActive() && depth_ < kMaxDepth &&
-      !pool.isClosed(Order::Acquire)) {
+  if (want > 1 && regions_.active() < settings.maxActive() &&
+      regions_.canNest() && !pool.isClosed(Order::Acquire)) {
     SlotMask prefer;
-    if (active_ == 0) {
+    if (regions_.active() == 0) {
       if (gtid != 0)
         fatal("a worker started a parallel region outside of a team");
       team = &rootTeam;
       prefer = settings.limitSlots();
     } else {
       team = &slotTeams[gtid];
-      Level *t = top();
-      prefer = t->team ? t->team->preferredSlots(t->tid) : SlotMask();
+      Level *t = regions_.top();
+      prefer = t->team ? preferred() : SlotMask();
     }
     workers = pool.recruit(*team, want - 1, prefer);
   }
   if (!workers) {
-    push(nullptr, 0, 1);
+    regions_.push(serialized());
     invoke(fn, gtid, 0, argc, argv);
-    pop();
+    regions_.pop();
     return;
   }
 
   // Members start at the leader's depth and level. Run as tid 0, then join.
-  team->launch(gtid, workers, active_ + 1, depth_, fn, argc, argv);
-  push(team, 0, team->size());
+  team->launch(
+      workers, regions_.active() + 1, regions_.depth(), fn, argc, argv);
+  regions_.push(team->levelFor(0));
   invoke(fn, gtid, 0, argc, argv);
-  uint64_t bar = top()->bar;
-  pop();
+  uint64_t bar = regions_.top()->bar;
+  regions_.pop();
   team->join(*this, bar);
   pool.returnWorkers(workers);
 }
@@ -1457,7 +1523,7 @@ int Pool::enter(int slot) {
   }
 
   SelfWord::set(SelfWord(slot));
-  self.setNesting(0, 0);
+  self.regions().startAt(0, 0);
   self.clearPost();
   uint64_t epoch = self.epoch();
 
@@ -1481,7 +1547,7 @@ int Pool::enter(int slot) {
     self.assignedTeam().runMember(self, slot, self.assignedTid());
 
   // Released. The busy bit stays set until a thread enters as this slot.
-  self.setNesting(0, 0);
+  self.regions().startAt(0, 0);
   self.setPresence(Thread::kLeaving);
   released_.fetchClear(me);
   wakeReleased(2);
@@ -1560,42 +1626,35 @@ int Pool::open(int threadLimit) {
 // No flag can pass the value its reader waits for: a child publishes the next
 // `arrive` only after this barrier's `release`, which its parent sets only
 // after this barrier's `arrive`.
-void Team::treeBarrier(Thread &self, int32_t tid, int32_t nth, uint64_t k) {
-  int32_t first = kTreeArity * tid + 1;
-  int32_t last = first + kTreeArity;
-  TidMask children;
-  uint64_t v = tag(k);
-  if (last > nth)
-    last = nth;
-  for (int32_t c = first; c < last; ++c) {
-    wait(self, tid, FlagIs(syncOf(c).arrive, v));
-    children |= TidMask::of(c);
-  }
-  if (tid != 0) {
+void Team::treeBarrier(Thread &self, Level &top) {
+  uint64_t v = tag(top.bar);
+  for (int c : top.children)
+    wait(self, FlagIs(threads[c].sync().arrive, v));
+  if (top.tid != 0) {
     MemberSync &sync = self.sync();
     sync.arrive.store(v, Order::Release);
-    wakeMembers(TidMask::of((tid - 1) / kTreeArity));
-    wait(self, tid, FlagIs(sync.release, v));
+    wakeMembers(SlotMask::of(top.parent));
+    wait(self, FlagIs(sync.release, v));
   }
-  for (int32_t c = first; c < last; ++c)
-    syncOf(c).release.store(v, Order::Release);
-  if (children)
-    wakeMembers(children);
+  for (int c : top.children)
+    threads[c].sync().release.store(v, Order::Release);
+  if (top.children)
+    wakeMembers(top.children);
 }
 
 void Team::barrier(Thread &self, Level &top) {
   top.bar++;
   if (top.nth >= settings.treeMin()) {
-    treeBarrier(self, top.tid, top.nth, top.bar);
+    treeBarrier(self, top);
     return;
   }
   uint64_t epoch = barEpoch_.load(Order::Acquire);
   if (barCount_.fetchAdd(1, Order::AcqRel) == top.nth - 1) {
     barCount_.store(0, Order::Relaxed);
     barEpoch_.store(epoch + 1, Order::Release);
-    wakeMembers(TidMask::below(top.nth) - TidMask::of(top.tid));
+    wakeMembers(members() - SlotMask::of(self.slot()));
   } else {
-    wait(self, top.tid, FlagLeaves(barEpoch_, epoch));
+    wait(self, FlagLeaves(barEpoch_, epoch));
   }
 }
 
@@ -1794,7 +1853,7 @@ void __kmpc_serialized_parallel(void *, int32_t) {
     SelfWord::set(SelfWord::current().enterForeign());
     return;
   }
-  Thread::current()->push(nullptr, 0, 1);
+  Thread::current()->regions().push(serialized());
 }
 
 void __kmpc_end_serialized_parallel(void *, int32_t) {
@@ -1807,14 +1866,14 @@ void __kmpc_end_serialized_parallel(void *, int32_t) {
   if (!self)
     fatal("__kmpc_end_serialized_parallel without a matching "
           "__kmpc_serialized_parallel");
-  self->pop();
-  if (self == &threads[0] && self->depth() == 0)
+  self->regions().pop();
+  if (self == &threads[0] && self->regions().depth() == 0)
     root.leave();
 }
 
 void __kmpc_barrier(void *, int32_t) {
   Thread *self = Thread::current();
-  Level *top = self ? self->top() : nullptr;
+  Level *top = self ? self->regions().top() : nullptr;
   if (!top || top->nth == 1)
     return;
   top->team->barrier(*self, *top);
@@ -1870,12 +1929,13 @@ int omp_get_level(void) {
   if (w.inForeign())
     return w.foreignDepth();
   Thread *self = Thread::current();
-  return self ? self->depth() : 0;
+  return self ? self->regions().depth() : 0;
 }
 
 int omp_get_active_level(void) {
   Thread *self = Thread::current();
-  return self && !SelfWord::current().inForeign() ? self->active() : 0;
+  return self && !SelfWord::current().inForeign() ? self->regions().active()
+                                                   : 0;
 }
 
 int omp_in_parallel(void) { return omp_get_active_level() > 0; }
