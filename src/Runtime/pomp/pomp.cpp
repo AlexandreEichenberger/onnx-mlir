@@ -475,8 +475,9 @@ struct Level {
   uint64_t bar = 0; // Barriers this thread passed in this team, all regions.
 };
 
-// Synchronization words of a thread as a member of a team, on their own cache
-// line. `done` is written by the member and polled by the leader at the join;
+// Synchronization words of a thread as a member of a team, on the thread's
+// wake-up line (see Thread). `done` is written by the member and polled by the
+// leader at the join;
 // `arrive` is written by the member and polled by its parent in the barrier
 // tree, and `release` the other way, so a line is shared by two threads at a
 // time. Only members other than the leader use their line: the leader of a
@@ -487,7 +488,7 @@ struct Level {
 // to team. The values stored are tagged with the team (see Team::tag), and
 // waits test for equality, so that a value left by a previous team never
 // matches; nothing needs to be reset.
-struct alignas(kCacheLine) MemberSync {
+struct MemberSync {
   Atomic<uint64_t> done;
   Atomic<uint64_t> arrive;
   Atomic<uint64_t> release;
@@ -592,14 +593,14 @@ public:
 
   // Recruiter: the assignment for the next wake-up, then the wake-up.
   void assign(Team *team, int32_t tid) {
-    team_ = team;
-    tid_ = tid;
-    go_.fetchAdd(1);
+    wake_.team = team;
+    wake_.tid = tid;
+    wake_.go.fetchAdd(1);
   }
   // Worker: the wake-up epoch, and the assignment it brings.
-  uint64_t epoch(Order o = Order::SeqCst) const { return go_.load(o); }
-  Team &assignedTeam() const { return *team_; }
-  int32_t assignedTid() const { return tid_; }
+  uint64_t epoch(Order o = Order::SeqCst) const { return wake_.go.load(o); }
+  Team &assignedTeam() const { return *wake_.team; }
+  int32_t assignedTid() const { return wake_.tid; }
 
   // Region stack.
   void push(Team *team, int32_t tid, int32_t nth);
@@ -626,23 +627,38 @@ public:
   void setPresence(int p, Order o = Order::SeqCst) { present_.store(p, o); }
 
   // Sync line of this thread as a member, other than the leader, of a team.
-  MemberSync &sync() { return sync_; }
+  MemberSync &sync() { return wake_.sync; }
 
 private:
-  // Wake-up, on its own line: the epoch the worker waits on.
-  alignas(kCacheLine) Atomic<uint64_t> go_;
-  // Assignment for the next wake-up, written by the recruiter before `go_`.
-  alignas(kCacheLine) Team *team_ = nullptr;
-  int32_t tid_ = 0;
-  // Owned by the thread itself.
-  int32_t depth_ = 0;  // Nesting level; past kMaxDepth, only counted.
+  // Wake-up and team words, on one line. They are used in turn: the recruiter
+  // writes the assignment and then `go` only while the thread is idle, and
+  // the thread's teams use `sync` only while it runs their work, from its
+  // wake-up to the leader's read of its `done`, before which the leader does
+  // not return it to the pool. So the recruiter and the team never meet on
+  // the line, and the thread finds its assignment on the line of its wake-up.
+  struct alignas(kCacheLine) WakeLine {
+    // The epoch the worker waits on.
+    Atomic<uint64_t> go;
+    // Assignment for the next wake-up, written by the recruiter before `go`.
+    Team *team = nullptr;
+    int32_t tid = 0;
+    // Join and tree barrier.
+    MemberSync sync;
+  };
+  static_assert(sizeof(WakeLine) == kCacheLine, "one line");
+  WakeLine wake_;
+
+  // Owned by the thread itself, on lines of their own: the region stack is
+  // written at every barrier, while the leader may poll `sync`.
+  // Nesting level; past kMaxDepth, only counted.
+  alignas(kCacheLine) int32_t depth_ = 0;
   int32_t active_ = 0; // Number of active levels, enclosing teams included.
   Level stack_[kMaxDepth];
-  Post post_;
-  // kFree, kInPool or kLeaving.
+  // kFree, kInPool or kLeaving. Read by another thread only when it enters
+  // the pool as this slot.
   Atomic<int> present_;
-  // Join and tree barrier.
-  MemberSync sync_;
+  // Sleep: only after a spin, on lines of its own.
+  alignas(kCacheLine) Post post_;
 };
 
 // The pool: which workers are in it and idle, sleeping or released, and the

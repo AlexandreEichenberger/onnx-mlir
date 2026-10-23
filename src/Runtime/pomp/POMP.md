@@ -556,9 +556,9 @@ idle worker in the pool. All slots start busy:
   they are entered again.
 
 **Static descriptors.** Nothing is allocated after start-up:
-- `threads[64]`: per-slot wake-up epoch and state, each on its own cache line; the
-  current assignment; the region stack; the sleep mutex and condition variable; and one sync
-  line per active level (done flag, tree barrier flags).
+- `threads[64]`: per slot, one wake-up line with the wake-up epoch, the current assignment
+  and the sync words (done flag, tree barrier flags); the region stack and state, on lines of
+  their own; and the sleep mutex and condition variable.
 - `rootTeam`: the team the root leads at level 1.
 - `slotTeams[64]`: the team that slot *i* leads at level 2.
 
@@ -637,12 +637,22 @@ an atomic OR. If the bit was still clear, nobody claimed the slot, and the pool 
 with `POMP_ERR_CLOSED`. Otherwise a close (or a fork after a new open) claimed it in between,
 and it serves as an ordinary worker.
 
-**Per-member sync lines.** Each thread has one cache line per active level, holding three
-words: `done` (the join), and `arrive` and `release` (the tree barrier). A thread is in at most
-one team per active level, so it takes that line from team to team: members reach each other's
-lines through the team's tid-to-slot map. That is 2 lines per slot, where one line per member of
-each of the 65 teams would be 65 per slot. Each word is written by one thread and read by one
-other, so no line is contended.
+**Per-member sync words.** Each thread has three sync words: `done` (the join), and `arrive`
+and `release` (the tree barrier). Only members other than the leader use theirs: a leader
+stores no `done`, has no parent in the tree, and only touches the words of other members. A
+thread is such a member of at most one team at a time, as it leads any team it forks and a
+level-1 member cannot be recruited at level 2. So it takes its words from team to team, and
+members reach each other's through the team's tid-to-slot map. Each word is written by one
+thread and read by one other.
+
+The words share the thread's wake-up line with its epoch and assignment. They are used in
+turn: the recruiter writes the assignment and the epoch only while the thread is idle, and the
+team uses the sync words from the wake-up until the leader has read `done`, before which the
+leader does not return the thread to the pool. A woken thread thus finds its assignment on the
+line it was polling, and a leader that forks the same team again already holds the lines whose
+`done` it last read. The region stack, written at every barrier, is on lines of its own, so it
+does not disturb a leader polling `done`. That is 1 line per slot for synchronization, where
+one line per member of each of the 65 teams would be 65.
 
 The values are tagged with the team, so that a value left in a line by a previous team never
 matches: value *n* of a team's counter is *n*·65 + the team's index (the leader's slot for a
