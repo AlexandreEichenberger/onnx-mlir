@@ -519,8 +519,8 @@ as C++, so nothing that links `libompruntime.a` gets a C++ library. The rules:
   a type with a constructor.
 - **Constant initialization only.** Every global is `constinit` (or clang's
   `require_constant_initialization` in C++17) and trivially destructible, so nothing runs at
-  load or exit. The pthread objects start zeroed and are initialized on the first call, with the
-  rest of pomp.
+  load or exit. The descriptors come from `calloc`, as zero bytes are their initial state; no
+  constructor runs. The pthread objects start zeroed and are initialized on first use.
 - **Templates for the code that was macros**: the loop partitioning for the four IV types, the
   calls of outlined functions through their exact type (a table built at compile time), and the
   team waits, whose condition is a function object.
@@ -555,12 +555,27 @@ idle worker in the pool. All slots start busy:
 - `pomp_close_pool` claims every idle bit the same way. Released slots stay busy until
   they are entered again.
 
-**Static descriptors.** Nothing is allocated after start-up:
-- `threads[64]`: per slot, one wake-up line with the wake-up epoch, the current assignment,
-  the preferred workers for a level-2 team, and the sync words (done flag, tree barrier flags); the region stack and state, on lines of
-  their own; and the sleep mutex and condition variable.
-- `rootTeam`: the team the root leads at level 1.
-- `slotTeams[64]`: the team that slot *i* leads at level 2.
+**Descriptors, allocated with the limit.** When the thread limit is set, pomp allocates two
+arrays with `calloc`, once per process, and never frees them, as the static arrays they replace
+never were. No descriptor is O(limit²): the memory is linear in the limit.
+- `threads[limit]`: per slot, one wake-up line with the wake-up epoch, the current assignment,
+  the preferred workers for a level-2 team, and the sync words (done flag, tree barrier flags);
+  the region stack and state, on lines of their own; and the sleep mutex and condition variable.
+- `teams[limit + 1]`: entry *i* is the team that slot *i* leads at level 2, and entry *limit*
+  the team the root leads at level 1.
+
+Zero bytes are the initial state of both, so `calloc` is their whole construction, except for
+the sleep's mutex and condition. Those are initialized once per slot, on demand: slot 0's when
+the arrays are allocated, and a worker slot's by the first thread that enters as it, before it
+clears its `busy` bit. No other thread posts to a slot before that, as only idle workers and
+team members are posted to. A slot's sleep is never initialized again, since a waker that
+claimed a previous occupant's sleeping bit may still hold its mutex.
+
+Until the limit is set, there are no descriptors. Regions then run inline as foreign
+regions, as those of a second host thread do (S9), but without its warning: their nesting is
+kept in the thread's word, and they report what a serialized region would. A thread inside such
+a region when the limit is set stays foreign until it leaves it. The store of the limit publishes the arrays, and every path that reads
+them first loads the limit with acquire, or follows a step that did.
 
 A team descriptor holds:
 - the outlined function and arguments;
@@ -572,7 +587,8 @@ A team descriptor holds:
 
 **Fork.**
 1. If the calling thread is a non-worker that does not own slot 0, take ownership. If another
-   thread owns it, run the region inline as a team of one, outside slot 0 (S9).
+   thread owns it, or no thread limit is set yet, run the region inline as a team of one,
+   outside slot 0 (S9).
 2. Decide the team size: the pushed `num_threads`, otherwise the `OMP_NUM_THREADS` entry for
    the current active level, clamped to the limit.
 3. Run inline as a team of 1 in any of these cases:
@@ -734,8 +750,10 @@ state, never by an argument taken as is:
 UBSan (bad slots, limits, `gtid`s, `num_threads` and loop bounds), and against libomp at the
 ends of every IV type.
 
-**Failures and resources.** pomp never allocates memory: all state is static. Every pthread
-call is checked, and a failure aborts with the name of the call. Nothing else aborts at run
+**Failures and resources.** pomp allocates memory once: the descriptors, when the thread
+limit is set. If that fails, `pomp_open_pool` returns `POMP_ERR_NOMEM` and no limit is set (an
+`OMP_THREAD_LIMIT` that cannot be allocated is ignored, with a warning). Every pthread call is
+checked, and a failure aborts with the name of the call. Nothing else aborts at run
 time, except:
 - an outlined function with more than 16 arguments;
 - a loop schedule other than static, or a loop increment of 0;

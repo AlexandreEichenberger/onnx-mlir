@@ -33,6 +33,7 @@ extern "C" {
 #define POMP_ERR_SLOT 2   /* Slot number out of range or already in use. */
 #define POMP_ERR_STATE 3  /* Call not valid in the current state. */
 #define POMP_ERR_CLOSED 4 /* Entry refused: the pool is closed. */
+#define POMP_ERR_NOMEM 5  /* The thread limit's descriptors cannot be allocated. */
 
 // The pool is the set of host threads lent to pomp as workers. A host
 // (e.g. Java) uses it in cycles, from any number of host threads:
@@ -68,7 +69,9 @@ int pomp_get_thread_limit(void);
 // Once it is set, `thread_limit` may be 0 (use it); any other value is
 // clamped to it, with one warning on stderr per process, and the call still
 // opens the pool. Returns POMP_ERR_LIMIT, with the pool left as it was, only
-// while no limit is set and `thread_limit` is not a valid one.
+// while no limit is set and `thread_limit` is not a valid one. Setting the
+// limit allocates pomp's per-thread descriptors, once; if that fails, the call
+// returns POMP_ERR_NOMEM, no limit is set, and a later call may try again.
 int pomp_open_pool(int thread_limit);
 
 // The calling thread enters the pool as worker `slot`, in

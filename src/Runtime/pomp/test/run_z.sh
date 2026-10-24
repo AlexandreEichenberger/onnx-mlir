@@ -173,9 +173,13 @@ for L in 2 3 4 8 16 17; do
       done
       [ $L -ge 3 ] && run $E "$T/pomp_host_test" swap
       [ $S = 0 ] && run $E "$T/pomp_host_test" sleepers &&
-        run $E "$T/pomp_host_test" sleepjoin
+        run $E "$T/pomp_host_test" sleepjoin &&
+        run $E "$T/pomp_host_test" rejoin 50
     done
   done
+  # No OMP_THREAD_LIMIT: the limit, and the descriptors, come from an open.
+  run env POMP_SPIN=0 "$T/pomp_host_test" nolimit 50 $L
+  run env POMP_SPIN=0 "$T/pomp_host_test" lateopen $L
 done
 echo "$runs runs, $fail failures"
 

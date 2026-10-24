@@ -36,8 +36,9 @@
 // the wake-ups spread as a tree. See POMP.md for the scenarios supported.
 //
 // Language: C++ for its classes and templates only. No virtual functions,
-// exceptions, RTTI, dynamic allocation, nor any C++ header; every global is
-// constant-initialized and trivially destructible. The object file thus needs
+// exceptions, RTTI, nor any C++ header; every global is constant-initialized
+// and trivially destructible. The thread and team descriptors are allocated
+// once, with calloc, when the thread limit is set, and never freed. The object file thus needs
 // only the C library and pthreads, as a C one does, and links into C
 // programs with the C driver. See "Language" in POMP.md.
 //
@@ -532,7 +533,8 @@ void invoke(Microtask fn, int32_t gtid, int32_t tid, int argc, void **argv) {
 }
 
 // -----------------------------------------------------------------------------
-// Data structures, all statically allocated
+// Data structures: static, except for the descriptors, allocated once with
+// the thread limit
 // -----------------------------------------------------------------------------
 
 class Team;
@@ -668,8 +670,8 @@ private:
   // never meet. Counters start at 0 and are bumped before use, so a value is
   // never 0, which a line holds at first.
   uint64_t tag(uint64_t n) const { return n * kTeams + uint64_t(index()); }
-  // Index of this team, 0..kTeams-1: the leader's slot for a level-2 team,
-  // kMaxThreads for the root's.
+  // Index of this team in `teams`, below kTeams: the leader's slot for a
+  // level-2 team, the limit for the root's.
   int32_t index() const;
 
   // Work, written before the wake-up of the members.
@@ -711,7 +713,16 @@ public:
   // The calling thread's innermost region, or nullptr outside of any.
   static RegionStack *currentRegions();
 
-  void init() { post_.init(); }
+  // Initialize the sleep, once per slot: by the first thread to enter as this
+  // slot, before it becomes recruitable, and at allocation for slot 0. Other
+  // threads post only to slots of the pool or of their teams, so never to one
+  // before this. Entries as a slot are serialized by `present_`.
+  void initPost() {
+    if (!postReady_) {
+      post_.init();
+      postReady_ = true;
+    }
+  }
 
   // Leader `gtid`: run `fn` as a region of `want` threads (0: the default).
   void fork(int32_t gtid, int32_t want, Microtask fn, int32_t argc,
@@ -783,6 +794,7 @@ private:
   // kFree, kInPool or kLeaving. Read by another thread only when it enters
   // the pool as this slot.
   Atomic<int> present_;
+  bool postReady_ = false; // See initPost.
   // Sleep: only after a spin, on lines of its own.
   alignas(kCacheLine) Post post_;
 };
@@ -840,6 +852,8 @@ public:
   int setLimit(long limit);
 
   int limit() const { return limit_.load(Order::Relaxed); }
+  // The limit, ordered before the reads of the descriptors that follow.
+  int limitAcquire() const { return limit_.load(Order::Acquire); }
   // Slots 0..limit-1.
   SlotMask limitSlots() const { return limitSlots_.load(Order::Relaxed); }
   // Default team size of a fork at `active` enclosing active levels.
@@ -894,14 +908,32 @@ private:
 POMP_CONSTINIT Settings settings;
 POMP_CONSTINIT Pool pool;
 POMP_CONSTINIT Root root;
-POMP_CONSTINIT Thread threads[kMaxThreads];
-// Team led by the root at level 1, and team led by slot i at level 2.
-POMP_CONSTINIT Team rootTeam;
-POMP_CONSTINIT Team slotTeams[kMaxThreads];
+// The descriptors, one per slot up to the thread limit, allocated when the
+// limit is set (see Settings::setLimit) and published by its store of the
+// limit. Before that, regions run as foreign ones and touch none of them.
+// Zero bytes are the initial state of both classes: calloc gives it.
+//
+// teams[i] is the team that slot i leads at level 2, and teams[limit] the
+// team that the root leads at level 1.
+POMP_CONSTINIT Thread *threads = nullptr;
+POMP_CONSTINIT Team *teams = nullptr;
+
+inline Team &rootTeam() { return teams[settings.limit()]; }
+inline Team &slotTeam(int32_t slot) { return teams[slot]; }
 
 // -----------------------------------------------------------------------------
 // Initialization
 // -----------------------------------------------------------------------------
+
+// `n` zeroed objects of `size` bytes, starting on a cache line, or nullptr.
+// calloc's alignment may be less than a line: over-allocate and round up.
+void *allocLines(size_t n, size_t size) {
+  char *p = static_cast<char *>(calloc(1, n * size + kCacheLine));
+  if (!p)
+    return nullptr;
+  uintptr_t a = (uintptr_t(p) + kCacheLine - 1) & ~uintptr_t(kCacheLine - 1);
+  return reinterpret_cast<void *>(a);
+}
 
 // Set the thread limit, once per process, as OpenMP's thread-limit-var: from
 // OMP_THREAD_LIMIT at initialization, or else from the first open that gives
@@ -921,12 +953,25 @@ int Settings::setLimit(long limit) {
   }
   if (limit < 1 || limit > kMaxThreads)
     return POMP_ERR_LIMIT;
+  Thread *t = static_cast<Thread *>(allocLines(size_t(limit), sizeof(Thread)));
+  Team *m = static_cast<Team *>(allocLines(size_t(limit) + 1, sizeof(Team)));
+  if (!t || !m) {
+    // Not freed: aligned blocks keep no base pointer, and this happens once.
+    return POMP_ERR_NOMEM;
+  }
+  // The root sleeps in joins and barriers before any worker enters: its
+  // sleep is ready now. Workers ready theirs on entry.
+  t[0].initPost();
+  threads = t;
+  teams = m;
   for (int i = 0; i < kMaxActive; ++i) {
     int n = envNthreads_[i];
     nthreads_[i].store(n && n < limit ? n : int(limit));
   }
   limitSlots_.store(SlotMask::below(int(limit)));
-  limit_.store(int(limit));
+  // Publishes the descriptors: read them only after an acquire of the limit
+  // (limitAcquire), or after a step that follows one.
+  limit_.store(int(limit), Order::Release);
   return POMP_OK;
 }
 
@@ -935,8 +980,6 @@ void Settings::init() {
   long v;
 
   limitMutex_.init();
-  for (Thread &t : threads)
-    t.init();
   SelfWord::createStorage();
 
   // OMP_NUM_THREADS: "n" or "n1,n2"; missing entries repeat the last one.
@@ -980,9 +1023,9 @@ void Settings::init() {
     int rc = v < 1 || *end ? POMP_ERR_LIMIT : setLimit(v);
     if (rc != POMP_OK)
       fprintf(stderr,
-          "pomp: warning: OMP_THREAD_LIMIT=\"%s\" is not in [1, %d] and "
-          "is ignored; the pool stays closed until pomp_open_pool "
-          "gives a limit\n",
+          "pomp: warning: OMP_THREAD_LIMIT=\"%s\" is not in [1, %d] or "
+          "cannot be allocated, and is ignored; the pool stays closed "
+          "until pomp_open_pool gives a limit\n",
           s, kMaxThreads);
   }
   if (!limit())
@@ -1182,11 +1225,12 @@ inline void Team::wakeLeader() {
 
 // The slot of the leader of this team.
 inline int32_t Team::leaderSlot() const {
-  return this == &rootTeam ? 0 : int32_t(this - slotTeams);
+  int32_t i = index();
+  return i == settings.limit() ? 0 : i;
 }
 
 inline int32_t Team::index() const {
-  return this == &rootTeam ? kMaxThreads : int32_t(this - slotTeams);
+  return int32_t(this - teams);
 }
 
 inline int32_t Thread::slot() const { return int32_t(this - threads); }
@@ -1328,9 +1372,16 @@ inline void Root::leave() {
 // For a region about to start on the calling thread, whose word is `w`
 // (pending bits clear): say whether it runs on its slot as usual, after taking
 // root ownership, or as a foreign region, as another thread owns slot 0.
+//
+// Before the thread limit is set there are no descriptors: a region of a
+// non-worker then runs as a foreign one, which keeps its nesting in the
+// thread's word, as a serialized region would (workers exist only after).
+// The acquire of the limit orders the descriptors' allocation before their use.
 inline Root::Entry Root::enter(SelfWord w) {
   if (w.slot() || w.ownsRoot())
     return Entry::Own;
+  if (!settings.limitAcquire())
+    return Entry::Foreign;
   if (tryEnter(w))
     return Entry::Taken;
   warnSecondRoot();
@@ -1473,10 +1524,10 @@ void Thread::fork(
     if (regions_.active() == 0) {
       if (gtid != 0)
         fatal("a worker started a parallel region outside of a team");
-      team = &rootTeam;
+      team = &rootTeam();
       prefer = settings.limitSlots();
     } else {
-      team = &slotTeams[gtid];
+      team = &slotTeam(gtid);
       prefer = regions_.topIsActive() ? preferred() : SlotMask();
     }
     workers = pool.recruit(*team, want - 1, prefer);
@@ -1524,7 +1575,7 @@ void forkCall(Microtask fn, int32_t argc, void **argv) {
 // -----------------------------------------------------------------------------
 
 int Pool::enter(int slot) {
-  int limit = settings.limit();
+  int limit = settings.limitAcquire();
   if (!limit)
     return POMP_ERR_CLOSED; // Closed until an open gives the limit.
   if (slot < 1 || slot >= limit)
@@ -1547,6 +1598,9 @@ int Pool::enter(int slot) {
     sched_yield();
   }
 
+  // Ready this slot's sleep before the slot can be recruited, posted to or
+  // claimed by a release: all of these follow the clear of `busy` below.
+  self.initPost();
   SelfWord::set(SelfWord(slot));
   self.regions().startAt(0, 0);
   self.clearPost();
@@ -1614,7 +1668,7 @@ int Pool::close() {
 int Pool::waitEmpty() {
   if (SelfWord::current().inPomp())
     return POMP_ERR_STATE;
-  int limit = settings.limit();
+  int limit = settings.limitAcquire();
   // Wake any claimed worker still asleep, until all have left.
   while (released_.load() & settings.limitSlots()) {
     wakeReleased(kMaxThreads);
@@ -1892,7 +1946,7 @@ void __kmpc_end_serialized_parallel(void *, int32_t) {
     fatal("__kmpc_end_serialized_parallel without a matching "
           "__kmpc_serialized_parallel");
   self->regions().pop();
-  if (self == &threads[0] && self->regions().depth() == 0)
+  if (self->slot() == 0 && self->regions().depth() == 0)
     root.leave();
 }
 

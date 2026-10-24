@@ -26,6 +26,10 @@
 //   sleepjoin: S11, join and barriers that sleep (POMP_SPIN=0)
 //   steal    : S13, level-2 teams of varying sizes take each other's workers
 //   nolimit  : S12, no OMP_THREAD_LIMIT; the limit comes from open
+//   lateopen : S14, no OMP_THREAD_LIMIT; regions of host threads span the
+//              open that sets the limit (and allocates the descriptors)
+//   rejoin   : S15, workers leave and enter again as the same slots, many
+//              times, while they sleep and are posted to (POMP_SPIN=0)
 //   latency  : leader time in release, and to the next region
 //
 //===----------------------------------------------------------------------===//
@@ -736,12 +740,129 @@ static void test_nolimit(long cycles, int lim) {
   test_fresh(cycles);
 }
 
+// -----------------------------------------------------------------------------
+// S14: no OMP_THREAD_LIMIT. Host threads run nested serialized regions, and
+// regions, while another thread sets the limit with the first open. Until
+// then there are no descriptors: every region runs inline, at the right level,
+// on one thread. A thread inside a region when the limit is set stays inline
+// until it leaves it; its next region may use the pool.
+// -----------------------------------------------------------------------------
+
+static atomic_int late_go, late_open, late_bad;
+
+static void late_inner(int32_t *gtid, int32_t *tid) {
+  (void)gtid;
+  if (*tid != 0 || omp_get_num_threads() != 1 || omp_get_level() != 2 ||
+      omp_get_active_level() != 0)
+    atomic_fetch_add(&late_bad, 1);
+}
+
+static void late_outer(int32_t *gtid, int32_t *tid) {
+  (void)gtid;
+  // Started before the open: inline, whatever happens meanwhile.
+  if (*tid != 0 || omp_get_num_threads() != 1 || omp_get_level() != 1)
+    atomic_fetch_add(&late_bad, 1);
+  while (!atomic_load(&late_open))
+    sched_yield();
+  __kmpc_fork_call(NULL, 0, (void *)late_inner);
+  __kmpc_serialized_parallel(NULL, 0);
+  if (omp_get_level() != 2 || omp_get_num_threads() != 1)
+    atomic_fetch_add(&late_bad, 1);
+  __kmpc_end_serialized_parallel(NULL, 0);
+}
+
+static void *late_host(void *arg) {
+  (void)arg;
+  while (!atomic_load(&late_go))
+    sched_yield();
+  __kmpc_fork_call(NULL, 0, (void *)late_outer);
+  if (omp_get_level() != 0)
+    atomic_fetch_add(&late_bad, 1);
+  return NULL;
+}
+
+static void test_lateopen(int lim) {
+  pthread_t b;
+  limit = 1;
+  CHECK(pomp_get_thread_limit() == 0);
+  // Before any limit: serialized and forked regions, nested, all inline.
+  __kmpc_serialized_parallel(NULL, 0);
+  CHECK(omp_get_level() == 1 && omp_get_num_threads() == 1);
+  CHECK(run_region() == 1);
+  __kmpc_end_serialized_parallel(NULL, 0);
+  CHECK(omp_get_level() == 0);
+  // A second host thread inside a region while this one opens.
+  pthread_create(&b, NULL, late_host, NULL);
+  atomic_store(&late_go, 1);
+  for (int i = 0; i < 1000; ++i)
+    sched_yield();
+  CHECK(pomp_open_pool(lim) == POMP_OK);
+  atomic_store(&late_open, 1);
+  pthread_join(b, NULL);
+  CHECK(atomic_load(&late_bad) == 0);
+  // With the limit: the pool works, from either thread.
+  limit = lim;
+  host_start();
+  host_enter_all();
+  wait_pool_size(limit - 1);
+  for (int c = 0; c < 100; ++c)
+    CHECK(run_region() == limit);
+  CHECK(pomp_close_pool() == POMP_OK);
+  host_stop();
+  printf("lateopen: errors %ld\n", errors);
+}
+
+// -----------------------------------------------------------------------------
+// S15: workers leave and enter again as the same slots, over and over, while
+// the leader's regions make them sleep in joins and barriers and be posted to.
+// A slot's sleep is initialized by its first entry only: a later entry must
+// find it ready, and a waker still posting to the previous occupant must not
+// find it re-initialized.
+// -----------------------------------------------------------------------------
+
+static void rejoin_body(int32_t *gtid, int32_t *tid) {
+  // A late member, so that others sleep with POMP_SPIN=0.
+  if (*tid == omp_get_num_threads() - 1) {
+    struct timespec ts = {0, 100000};
+    nanosleep(&ts, NULL);
+  }
+  __kmpc_barrier(NULL, *gtid);
+  atomic_fetch_add(&region_sum, *tid);
+}
+
+static void test_rejoin(long cycles) {
+  host_start();
+  for (long c = 0; c < cycles; ++c) {
+    CHECK(pomp_open_pool(0) == POMP_OK);
+    host_enter_all();
+    wait_pool_size(limit - 1);
+    for (int r = 0; r < 3; ++r) {
+      atomic_store(&region_sum, 0);
+      __kmpc_fork_call(NULL, 0, (void *)rejoin_body);
+      CHECK(atomic_load(&region_sum) == (long)limit * (limit - 1) / 2);
+    }
+    // Close without waiting: the next cycle's entries race with the leaving
+    // threads of this one, as the same slots.
+    CHECK(pomp_close_pool() == POMP_OK);
+    for (int i = 1; i < limit; ++i)
+      while (atomic_load(&host[i].done) <= c)
+        sched_yield();
+  }
+  host_stop();
+  printf("rejoin: %ld cycles, errors %ld\n", cycles, errors);
+}
+
 int main(int argc, char **argv) {
   const char *test = argc > 1 ? argv[1] : "reuse";
   long n = argc > 2 ? atol(argv[2]) : 200;
   if (!strcmp(test, "nolimit")) {
     // Run without OMP_THREAD_LIMIT; argv[3] is the limit to open with.
     test_nolimit(n, argc > 3 ? atoi(argv[3]) : 4);
+    return errors ? 1 : 0;
+  }
+  if (!strcmp(test, "lateopen")) {
+    // Run without OMP_THREAD_LIMIT; argv[2] is the limit to open with.
+    test_lateopen(argc > 2 ? atoi(argv[2]) : 4);
     return errors ? 1 : 0;
   }
   if (pomp_get_thread_limit() == 0) {
@@ -773,6 +894,8 @@ int main(int argc, char **argv) {
     test_sleepjoin(n);
   else if (!strcmp(test, "steal"))
     test_steal(n);
+  else if (!strcmp(test, "rejoin"))
+    test_rejoin(n);
   else if (!strcmp(test, "latency"))
     test_latency(n);
   else {
