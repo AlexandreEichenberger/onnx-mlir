@@ -551,8 +551,11 @@ struct Level {
 };
 
 // A thread's regions, innermost on top, with the number of them that are
-// active (more than 1 thread). Regions past kMaxDepth are only counted: forks
-// there are serialized, and top() is then a shared entry of a team of one.
+// active (more than 1 thread). Callers ask either for the innermost region's
+// tid and size, which are 0 and 1 outside of any region and in a serialized
+// one, or for its team membership, which only an active region has; how the
+// entries are kept is not theirs to see. Regions past kMaxDepth are only
+// counted: forks there are serialized.
 //
 // A worker starts at its leader's depth and active level (startAt): the
 // entries below that depth are the leader's, on the leader's own stack, and
@@ -564,18 +567,34 @@ public:
     depth_ = depth;
     active_ = active;
   }
-  void push(const Level &l);
+  // Enter a region of a team of more than one thread, as the member that `l`
+  // describes.
+  void pushActive(const Level &l);
+  // Enter a region of one thread.
+  void pushSerialized();
   void pop();
-  // The innermost region, or nullptr outside of any. Its `bar` is written by
-  // the barriers of its team; nothing else of it changes after push.
-  Level *top();
+
+  // The innermost region's tid and team size.
+  int32_t topTid() const;
+  int32_t topNth() const;
+  // The innermost region's team membership, or nullptr if that region is
+  // serialized or there is none. Its `bar` is written by the barriers of its
+  // team; nothing else of it changes after push.
+  Level *activeTop();
+  bool topIsActive() const;
+
   int32_t depth() const { return depth_; }
   int32_t active() const { return active_; }
   // Whether a region forked now may be active: a slot is left for it.
   bool canNest() const { return depth_ < kMaxDepth; }
 
 private:
-  static Level serial_;
+  // The innermost recorded entry, or nullptr if none or past kMaxDepth. A
+  // serialized entry is recorded as a team of one, for pop().
+  const Level *recordedTop() const {
+    return depth_ > 0 && depth_ <= kMaxDepth ? &levels_[depth_ - 1] : nullptr;
+  }
+
   int32_t depth_ = 0;  // Nesting level; past kMaxDepth, only counted.
   int32_t active_ = 0; // Active levels, enclosing teams included.
   Level levels_[kMaxDepth];
@@ -690,7 +709,7 @@ public:
   // thread's own word cannot name another thread, nor a slot out of range.
   static Thread *current();
   // The calling thread's innermost region, or nullptr outside of any.
-  static Level *currentLevel();
+  static RegionStack *currentRegions();
 
   void init() { post_.init(); }
 
@@ -1218,24 +1237,18 @@ void spinUntil(Cond cond) {
 // Region stack
 // -----------------------------------------------------------------------------
 
-// The entry of the regions past kMaxDepth. Never written, as its team has one
-// thread.
-POMP_CONSTINIT Level RegionStack::serial_ = {nullptr, 0, 1, 0};
-
-// The entry of a serialized region.
-inline Level serialized() { return {nullptr, 0, 1, 0}; }
-
-inline void RegionStack::push(const Level &l) {
-  if (depth_ >= kMaxDepth) {
-    if (l.nth > 1)
-      fatal("internal: active region past the maximum depth");
-    depth_++;
-    return;
-  }
+inline void RegionStack::pushActive(const Level &l) {
+  if (depth_ >= kMaxDepth || l.nth < 2)
+    fatal("internal: active region past the maximum depth or of one thread");
   levels_[depth_] = l;
   depth_++;
-  if (l.nth > 1)
-    active_++;
+  active_++;
+}
+
+inline void RegionStack::pushSerialized() {
+  if (depth_ < kMaxDepth)
+    levels_[depth_] = Level{nullptr, 0, 1, 0};
+  depth_++;
 }
 
 inline void RegionStack::pop() {
@@ -1247,10 +1260,23 @@ inline void RegionStack::pop() {
     active_--;
 }
 
-inline Level *RegionStack::top() {
-  if (depth_ > kMaxDepth)
-    return &serial_;
-  return depth_ > 0 ? &levels_[depth_ - 1] : nullptr;
+inline int32_t RegionStack::topTid() const {
+  const Level *l = recordedTop();
+  return l ? l->tid : 0;
+}
+
+inline int32_t RegionStack::topNth() const {
+  const Level *l = recordedTop();
+  return l ? l->nth : 1;
+}
+
+inline bool RegionStack::topIsActive() const {
+  const Level *l = recordedTop();
+  return l && l->nth > 1;
+}
+
+inline Level *RegionStack::activeTop() {
+  return topIsActive() ? &levels_[depth_ - 1] : nullptr;
 }
 
 inline Thread *Thread::current() {
@@ -1258,9 +1284,9 @@ inline Thread *Thread::current() {
   return w.hasDescriptor() ? &threads[w.slot()] : nullptr;
 }
 
-inline Level *Thread::currentLevel() {
+inline RegionStack *Thread::currentRegions() {
   Thread *self = current();
-  return self ? self->regions().top() : nullptr;
+  return self ? &self->regions() : nullptr;
 }
 
 // -----------------------------------------------------------------------------
@@ -1418,7 +1444,7 @@ void Team::runMember(Thread &self, int32_t slot, int32_t tid) {
   // Continue the leader's nesting: same depth, same active levels.
   RegionStack &regions = self.regions();
   regions.startAt(depth_, level_ - 1);
-  regions.push(levelFor(tid));
+  regions.pushActive(levelFor(tid));
   invoke(fn_, slot, tid, argc_, argv_);
   regions.pop();
   // After this store, the leader may reuse the team; only the wake-up of
@@ -1451,13 +1477,12 @@ void Thread::fork(
       prefer = settings.limitSlots();
     } else {
       team = &slotTeams[gtid];
-      Level *t = regions_.top();
-      prefer = t->team ? preferred() : SlotMask();
+      prefer = regions_.topIsActive() ? preferred() : SlotMask();
     }
     workers = pool.recruit(*team, want - 1, prefer);
   }
   if (!workers) {
-    regions_.push(serialized());
+    regions_.pushSerialized();
     invoke(fn, gtid, 0, argc, argv);
     regions_.pop();
     return;
@@ -1466,9 +1491,9 @@ void Thread::fork(
   // Members start at the leader's depth and level. Run as tid 0, then join.
   team->launch(
       workers, regions_.active() + 1, regions_.depth(), fn, argc, argv);
-  regions_.push(team->levelFor(0));
+  regions_.pushActive(team->levelFor(0));
   invoke(fn, gtid, 0, argc, argv);
-  uint64_t bar = regions_.top()->bar;
+  uint64_t bar = regions_.activeTop()->bar;
   regions_.pop();
   team->join(*this, bar);
   pool.returnWorkers(workers);
@@ -1694,7 +1719,7 @@ void emptyShare(T *plower, T *pupper, UT hi, ST incr) {
 template <class T, class ST, class UT>
 void staticInit(int32_t sched, int32_t *plast, T *plower, T *pupper,
     ST *pstride, ST incr, ST chunk) {
-  Level *top = Thread::currentLevel();
+  RegionStack *regions = Thread::currentRegions();
   UT lo = UT(*plower), hi = UT(*pupper), inc = UT(incr);
   if (incr == 0)
     fatal("loop increment of 0");
@@ -1705,8 +1730,8 @@ void staticInit(int32_t sched, int32_t *plast, T *plower, T *pupper,
     *pstride = incr;
     return;
   }
-  UT nth = top ? UT(top->nth) : 1;
-  UT tid = top ? UT(top->tid) : 0;
+  UT nth = regions ? UT(regions->topNth()) : 1;
+  UT tid = regions ? UT(regions->topTid()) : 0;
   if (nth == 1) {
     if (plast)
       *plast = 1;
@@ -1853,7 +1878,7 @@ void __kmpc_serialized_parallel(void *, int32_t) {
     SelfWord::set(SelfWord::current().enterForeign());
     return;
   }
-  Thread::current()->regions().push(serialized());
+  Thread::current()->regions().pushSerialized();
 }
 
 void __kmpc_end_serialized_parallel(void *, int32_t) {
@@ -1873,10 +1898,9 @@ void __kmpc_end_serialized_parallel(void *, int32_t) {
 
 void __kmpc_barrier(void *, int32_t) {
   Thread *self = Thread::current();
-  Level *top = self ? self->regions().top() : nullptr;
-  if (!top || top->nth == 1)
-    return;
-  top->team->barrier(*self, *top);
+  Level *top = self ? self->regions().activeTop() : nullptr;
+  if (top)
+    top->team->barrier(*self, *top);
 }
 
 void __kmpc_for_static_init_4(void *, int32_t, int32_t sched, int32_t *plast,
@@ -1914,13 +1938,13 @@ void __kmpc_for_static_fini(void *, int32_t) {}
 // -----------------------------------------------------------------------------
 
 int omp_get_thread_num(void) {
-  Level *top = Thread::currentLevel();
-  return top && !SelfWord::current().inForeign() ? top->tid : 0;
+  RegionStack *regions = Thread::currentRegions();
+  return regions && !SelfWord::current().inForeign() ? regions->topTid() : 0;
 }
 
 int omp_get_num_threads(void) {
-  Level *top = Thread::currentLevel();
-  return top && !SelfWord::current().inForeign() ? top->nth : 1;
+  RegionStack *regions = Thread::currentRegions();
+  return regions && !SelfWord::current().inForeign() ? regions->topNth() : 1;
 }
 
 // A foreign region is nested only in other foreign regions, all inactive.
