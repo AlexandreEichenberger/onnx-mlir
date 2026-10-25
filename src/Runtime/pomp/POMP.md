@@ -525,6 +525,12 @@ as C++, so nothing that links `libompruntime.a` gets a C++ library. The rules:
   calls of outlined functions through their exact type (a table built at compile time), and the
   team waits, whose condition is a function object.
 
+The support code that is not specific to pomp (`POMP_CONSTINIT`, the cache-line size, `fatal`,
+`relax`, `Atomic<T>`, `Mutex`, `Condition`, `ScopedLock<T>`, `Post`, and `invoke`, the call of an
+outlined function through its exact type) is in `pompSupport.inc`. `pomp.cpp` includes it, so it
+is still one translation unit and the inliner sees all of it; the object code is the same as with
+one file.
+
 The tests are C programs and link with the C driver alone, so a C++ runtime symbol needed by
 pomp would be a link error.
 

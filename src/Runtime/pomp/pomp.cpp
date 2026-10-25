@@ -38,9 +38,9 @@
 // Language: C++ for its classes and templates only. No virtual functions,
 // exceptions, RTTI, nor any C++ header; every global is constant-initialized
 // and trivially destructible. The thread and team descriptors are allocated
-// once, with calloc, when the thread limit is set, and never freed. The object file thus needs
-// only the C library and pthreads, as a C one does, and links into C
-// programs with the C driver. See "Language" in POMP.md.
+// once, with calloc, when the thread limit is set, and never freed. The object
+// file thus needs only the C library and pthreads, as a C one does, and links
+// into C programs with the C driver. See "Language" in POMP.md.
 //
 //===----------------------------------------------------------------------===//
 
@@ -54,20 +54,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-// Every global must be initialized at compile time: a constructor run at load
-// would need the C++ runtime's static-init machinery. C++20 checks it with
-// constinit, and clang in C++17 with its own attribute.
-#if defined(__cpp_constinit)
-#define POMP_CONSTINIT constinit
-#elif defined(__has_cpp_attribute)
-#if __has_cpp_attribute(clang::require_constant_initialization)
-#define POMP_CONSTINIT [[clang::require_constant_initialization]]
-#endif
-#endif
-#ifndef POMP_CONSTINIT
-#define POMP_CONSTINIT
-#endif
-
 namespace {
 
 // -----------------------------------------------------------------------------
@@ -79,17 +65,10 @@ static_assert(kMaxThreads <= 64, "slots are bits of one 64-bit word");
 // Teams: one led by each slot at level 2, and the root's at level 1.
 constexpr int kTeams = kMaxThreads + 1;
 
-#if defined(__s390x__) || defined(__MVS__)
-constexpr int kCacheLine = 256;
-#elif defined(__aarch64__) && defined(__APPLE__)
-constexpr int kCacheLine = 128;
-#else
-constexpr int kCacheLine = 64;
-#endif
-
 // Max shared args passed to an outlined fn: one more than the 15 of libomp's
 // portable kmp_invoke_microtask.cpp.
 constexpr int kMaxArgs = 16;
+
 // Max nesting levels recorded; deeper ones are serialized and only counted.
 constexpr int kMaxDepth = 8;
 constexpr int kMaxActive = 2; // Max active (more than 1 thread) levels.
@@ -108,38 +87,30 @@ constexpr int kDefaultTreeBarrier = kMaxThreads + 1; // Never.
 #endif
 constexpr int kTreeArity = 4;
 
+// Size of a cache line, for alignment and padding.
+#if defined(__s390x__) || defined(__MVS__)
+constexpr int kCacheLine = 256;
+#elif defined(__aarch64__) && defined(__APPLE__)
+constexpr int kCacheLine = 128;
+#else
+constexpr int kCacheLine = 64;
+#endif
+
 // Schedule kinds (values of libomp's enum sched_type).
 constexpr int32_t kSchStaticChunked = 33;
 constexpr int32_t kSchStatic = 34;
 constexpr int32_t kSchModifierMask = (1 << 29) | (1 << 30);
 
-using Microtask = void (*)(int32_t *gtid, int32_t *btid, ...);
+} // namespace
+
+// Generic support code, in the same anonymous namespace; it uses kMaxArgs.
+#include "pompSupport.inc"
+
+namespace {
 
 // -----------------------------------------------------------------------------
-// Utilities
+// Slot sets
 // -----------------------------------------------------------------------------
-
-[[noreturn]] void fatal(const char *msg, const char *detail = "") {
-  fprintf(stderr, "pomp: fatal: %s%s\n", msg, detail);
-  fflush(stderr);
-  abort();
-}
-
-// Abort if a pthread call fails: pomp has no way to continue without it.
-inline void checkPthread(int rc, const char *call) {
-  if (rc != 0)
-    fatal("pthread call failed: ", call);
-}
-
-inline void relax() {
-#if defined(__x86_64__) || defined(__i386__)
-  __asm__ volatile("pause" ::: "memory");
-#elif defined(__aarch64__)
-  __asm__ volatile("yield" ::: "memory");
-#else
-  __asm__ volatile("" ::: "memory");
-#endif
-}
 
 // A set of slots, one bit per slot of a 64-bit word. Slots are pool-wide
 // ids: 0 for the root and 1..limit-1 for the workers (`threads[slot]`). Tids,
@@ -172,8 +143,12 @@ public:
     return SlotMask(r);
   }
 
-  constexpr SlotMask operator|(SlotMask o) const { return SlotMask(bits_ | o.bits_); }
-  constexpr SlotMask operator&(SlotMask o) const { return SlotMask(bits_ & o.bits_); }
+  constexpr SlotMask operator|(SlotMask o) const {
+    return SlotMask(bits_ | o.bits_);
+  }
+  constexpr SlotMask operator&(SlotMask o) const {
+    return SlotMask(bits_ & o.bits_);
+  }
   // Set difference: the ids of this set that are not in `o`.
   constexpr SlotMask operator-(SlotMask o) const {
     return SlotMask(bits_ & ~o.bits_);
@@ -204,86 +179,6 @@ private:
   uint64_t bits_ = 0;
 };
 
-
-// Parse a positive integer; return -1 if the string is not one.
-long parseInt(const char *s, const char **end) {
-  char *e;
-  while (*s == ' ' || *s == '\t')
-    ++s;
-  if (*s < '0' || *s > '9')
-    return -1;
-  long v = strtol(s, &e, 10);
-  while (*e == ' ' || *e == '\t')
-    ++e;
-  if (end)
-    *end = e;
-  return v;
-}
-
-// -----------------------------------------------------------------------------
-// Atomics and locks
-//
-// Atomics use the compiler's __atomic builtins, on which both <stdatomic.h>
-// and <atomic> are built: the same instructions and the same memory model as
-// C11, without a header. As in C11, an operation is sequentially consistent
-// unless told otherwise. Locks are pthread's, behind small classes.
-// -----------------------------------------------------------------------------
-
-enum class Order : int {
-  Relaxed = __ATOMIC_RELAXED,
-  Acquire = __ATOMIC_ACQUIRE,
-  Release = __ATOMIC_RELEASE,
-  AcqRel = __ATOMIC_ACQ_REL,
-  SeqCst = __ATOMIC_SEQ_CST,
-};
-
-inline void fence(Order o) { __atomic_thread_fence(int(o)); }
-
-// An atomic integer or pointer.
-template <class T>
-class Atomic {
-public:
-  constexpr Atomic() : value_() {}
-  constexpr explicit Atomic(T v) : value_(v) {}
-  Atomic(const Atomic &) = delete;
-  Atomic &operator=(const Atomic &) = delete;
-
-  T load(Order o = Order::SeqCst) const {
-    return __atomic_load_n(&value_, int(o));
-  }
-  void store(T v, Order o = Order::SeqCst) {
-    __atomic_store_n(&value_, v, int(o));
-  }
-  T exchange(T v, Order o = Order::SeqCst) {
-    return __atomic_exchange_n(&value_, v, int(o));
-  }
-  T fetchAdd(T v, Order o = Order::SeqCst) {
-    return __atomic_fetch_add(&value_, v, int(o));
-  }
-  T fetchSub(T v, Order o = Order::SeqCst) {
-    return __atomic_fetch_sub(&value_, v, int(o));
-  }
-  T fetchAnd(T v, Order o = Order::SeqCst) {
-    return __atomic_fetch_and(&value_, v, int(o));
-  }
-  T fetchOr(T v, Order o = Order::SeqCst) {
-    return __atomic_fetch_or(&value_, v, int(o));
-  }
-  bool compareExchange(T &expected, T desired, Order success = Order::SeqCst,
-      Order failure = Order::SeqCst) {
-    return __atomic_compare_exchange_n(
-        &value_, &expected, desired, false, int(success), int(failure));
-  }
-  bool compareExchangeWeak(T &expected, T desired,
-      Order success = Order::SeqCst, Order failure = Order::SeqCst) {
-    return __atomic_compare_exchange_n(
-        &value_, &expected, desired, true, int(success), int(failure));
-  }
-
-private:
-  T value_;
-};
-
 // An atomic SlotMask. Operations take and return masks, as Atomic's do
 // values; fetchSet and fetchClear add and remove slots and return the previous
 // set.
@@ -312,93 +207,6 @@ public:
 
 private:
   Atomic<uint64_t> bits_;
-};
-
-// A pthread mutex. Its storage starts zeroed, so that static arrays of them
-// stay in .bss; init() must run before any other use.
-class Mutex {
-public:
-  constexpr Mutex() : mutex_() {}
-  Mutex(const Mutex &) = delete;
-  Mutex &operator=(const Mutex &) = delete;
-
-  void init() {
-    checkPthread(pthread_mutex_init(&mutex_, nullptr), "pthread_mutex_init");
-  }
-  void lock() {
-    checkPthread(pthread_mutex_lock(&mutex_), "pthread_mutex_lock");
-  }
-  void unlock() {
-    checkPthread(pthread_mutex_unlock(&mutex_), "pthread_mutex_unlock");
-  }
-  pthread_mutex_t *native() { return &mutex_; }
-
-private:
-  pthread_mutex_t mutex_;
-};
-
-// A pthread condition, zeroed until init() as a Mutex.
-class Condition {
-public:
-  constexpr Condition() : cond_() {}
-  Condition(const Condition &) = delete;
-  Condition &operator=(const Condition &) = delete;
-
-  void init() {
-    checkPthread(pthread_cond_init(&cond_, nullptr), "pthread_cond_init");
-  }
-  void signal() {
-    checkPthread(pthread_cond_signal(&cond_), "pthread_cond_signal");
-  }
-  void wait(Mutex &m) {
-    checkPthread(pthread_cond_wait(&cond_, m.native()), "pthread_cond_wait");
-  }
-
-private:
-  pthread_cond_t cond_;
-};
-
-// Holds a lock for the lifetime of the object.
-template <class Lockable>
-class ScopedLock {
-public:
-  explicit ScopedLock(Lockable &l) : lockable_(l) { lockable_.lock(); }
-  ~ScopedLock() { lockable_.unlock(); }
-  ScopedLock(const ScopedLock &) = delete;
-  ScopedLock &operator=(const ScopedLock &) = delete;
-
-private:
-  Lockable &lockable_;
-};
-
-// Sleep: a binary "posted" flag with its mutex and condition. A post only
-// means "re-check"; see "Wake-up and sleep".
-class Post {
-public:
-  void init() {
-    mutex_.init();
-    cond_.init();
-  }
-  void post() {
-    ScopedLock<Mutex> lock(mutex_);
-    posted_ = true;
-    cond_.signal();
-  }
-  void wait() {
-    ScopedLock<Mutex> lock(mutex_);
-    while (!posted_)
-      cond_.wait(mutex_);
-    posted_ = false;
-  }
-  void clear() {
-    ScopedLock<Mutex> lock(mutex_);
-    posted_ = false;
-  }
-
-private:
-  Mutex mutex_;
-  Condition cond_;
-  bool posted_ = false;
 };
 
 // -----------------------------------------------------------------------------
@@ -481,56 +289,6 @@ inline SelfWord SelfWord::current() { return SelfWord(selfTls); }
 inline void SelfWord::set(SelfWord w) { selfTls = w.word_; }
 void SelfWord::createStorage() {}
 #endif
-
-// -----------------------------------------------------------------------------
-// Invoking an outlined function
-//
-// Outlined functions are not variadic. Call each through its exact type, as
-// libomp's portable kmp_invoke_microtask.cpp does, so that the call is valid
-// on ABIs where variadic and fixed calls differ. A table, built at compile
-// time, holds one caller per argument count.
-// -----------------------------------------------------------------------------
-
-template <unsigned... I>
-struct IndexList {};
-template <unsigned N, unsigned... I>
-struct MakeIndexList : MakeIndexList<N - 1, N - 1, I...> {};
-template <unsigned... I>
-struct MakeIndexList<0, I...> {
-  using Type = IndexList<I...>;
-};
-
-template <unsigned>
-using ArgType = void *;
-
-// Call `fn` with argv[I]..., through its exact type.
-template <unsigned... I>
-void invokeExact(Microtask fn, int32_t *gtid, int32_t *tid, void **argv,
-    IndexList<I...>) {
-  using Exact = void (*)(int32_t *, int32_t *, ArgType<I>...);
-  reinterpret_cast<Exact>(fn)(gtid, tid, argv[I]...);
-}
-
-template <unsigned N>
-void invokeWith(Microtask fn, int32_t *gtid, int32_t *tid, void **argv) {
-  invokeExact(fn, gtid, tid, argv, typename MakeIndexList<N>::Type());
-}
-
-using Invoker = void (*)(Microtask, int32_t *, int32_t *, void **);
-
-template <class List>
-struct InvokerTable;
-template <unsigned... N>
-struct InvokerTable<IndexList<N...>> {
-  static constexpr Invoker entries[] = {&invokeWith<N>...};
-};
-
-void invoke(Microtask fn, int32_t gtid, int32_t tid, int argc, void **argv) {
-  using Table = InvokerTable<MakeIndexList<kMaxArgs + 1>::Type>;
-  if (argc < 0 || argc > kMaxArgs)
-    fatal("too many arguments to an outlined function");
-  Table::entries[argc](fn, &gtid, &tid, argv);
-}
 
 // -----------------------------------------------------------------------------
 // Data structures: static, except for the descriptors, allocated once with
@@ -627,8 +385,8 @@ class Team {
 public:
   // Leader: describe the work for the workers in `workers`, assign them, and
   // wake them. Members start at the leader's depth, at active level `level`.
-  void launch(SlotMask workers, int32_t level,
-      int32_t depth, Microtask fn, int32_t argc, void **argv);
+  void launch(SlotMask workers, int32_t level, int32_t depth, Microtask fn,
+      int32_t argc, void **argv);
   // Leader: wait for every member to finish, then record the team's barrier
   // count, `bar` as the leader saw it, for the next region.
   void join(Thread &leader, uint64_t bar);
@@ -678,11 +436,11 @@ private:
   Microtask fn_ = nullptr;
   int32_t argc_ = 0;
   void *argv_[kMaxArgs] = {};
-  int32_t nth_ = 0;      // Team size, leader included.
-  int32_t level_ = 0;    // Active level of this team: 1 or 2.
-  int32_t depth_ = 0;    // Leader's nesting depth before this region.
-  uint64_t region_ = 0;  // Number of this region, for the members' done flags.
-  uint64_t barSeq_ = 0;  // Barrier count before this region, for the tree.
+  int32_t nth_ = 0;     // Team size, leader included.
+  int32_t level_ = 0;   // Active level of this team: 1 or 2.
+  int32_t depth_ = 0;   // Leader's nesting depth before this region.
+  uint64_t region_ = 0; // Number of this region, for the members' done flags.
+  uint64_t barSeq_ = 0; // Barrier count before this region, for the tree.
   // The members other than the leader: tids 1..nth-1, in increasing order of
   // slots.
   SlotMask workers_;
@@ -725,8 +483,8 @@ public:
   }
 
   // Leader `gtid`: run `fn` as a region of `want` threads (0: the default).
-  void fork(int32_t gtid, int32_t want, Microtask fn, int32_t argc,
-      void **argv);
+  void fork(
+      int32_t gtid, int32_t want, Microtask fn, int32_t argc, void **argv);
 
   // This thread's slot.
   int32_t slot() const;
@@ -869,7 +627,7 @@ private:
   void initOnce();
   void init();
 
-  Atomic<int> initialized_; // 0: no, 1: in progress, 2: done.
+  Atomic<int> initialized_;          // 0: no, 1: in progress, 2: done.
   int envNthreads_[kMaxActive] = {}; // OMP_NUM_THREADS, 0: unset.
   int maxActive_ = 0;
   // Settings that depend on the thread limit, set once: by init from
@@ -1229,9 +987,7 @@ inline int32_t Team::leaderSlot() const {
   return i == settings.limit() ? 0 : i;
 }
 
-inline int32_t Team::index() const {
-  return int32_t(this - teams);
-}
+inline int32_t Team::index() const { return int32_t(this - teams); }
 
 inline int32_t Thread::slot() const { return int32_t(this - threads); }
 
@@ -1259,8 +1015,8 @@ Level Team::levelFor(int32_t tid) const {
     int32_t n = nth_ - first;
     if (n > kTreeArity)
       n = kTreeArity;
-    l.children = n > 0 ? (workers_ - workers_.lowest(first - 1)).lowest(n)
-                       : SlotMask();
+    l.children =
+        n > 0 ? (workers_ - workers_.lowest(first - 1)).lowest(n) : SlotMask();
     l.parent = tid ? slotOf((tid - 1) / kTreeArity) : 0;
   }
   return l;
@@ -1456,8 +1212,8 @@ void Team::partition() {
   }
 }
 
-void Team::launch(SlotMask workers, int32_t level,
-    int32_t depth, Microtask fn, int32_t argc, void **argv) {
+void Team::launch(SlotMask workers, int32_t level, int32_t depth, Microtask fn,
+    int32_t argc, void **argv) {
   fn_ = fn;
   argc_ = argc;
   memcpy(argv_, argv, sizeof(void *) * size_t(argc));
@@ -1895,9 +1651,7 @@ int pomp_pool_size(void) { return pool.size(); }
 
 extern "C" {
 
-int32_t __kmpc_global_thread_num(void *) {
-  return SelfWord::current().slot();
-}
+int32_t __kmpc_global_thread_num(void *) { return SelfWord::current().slot(); }
 
 void __kmpc_fork_call(void *, int32_t argc, Microtask fn, ...) {
   void *argv[kMaxArgs];
@@ -2013,7 +1767,7 @@ int omp_get_level(void) {
 int omp_get_active_level(void) {
   Thread *self = Thread::current();
   return self && !SelfWord::current().inForeign() ? self->regions().active()
-                                                   : 0;
+                                                  : 0;
 }
 
 int omp_in_parallel(void) { return omp_get_active_level() > 0; }
