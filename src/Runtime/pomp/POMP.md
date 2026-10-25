@@ -525,11 +525,24 @@ as C++, so nothing that links `libompruntime.a` gets a C++ library. The rules:
   calls of outlined functions through their exact type (a table built at compile time), and the
   team waits, whose condition is a function object.
 
-The support code that is not specific to pomp (`POMP_CONSTINIT`, the cache-line size, `fatal`,
-`relax`, `Atomic<T>`, `Mutex`, `Condition`, `ScopedLock<T>`, `Post`, and `invoke`, the call of an
-outlined function through its exact type) is in `pompSupport.inc`. `pomp.cpp` includes it, so it
-is still one translation unit and the inliner sees all of it; the object code is the same as with
-one file.
+**One translation unit, in parts.** `pomp.cpp` holds the configuration, the entry points, and
+the includes of its parts, in this order; all of them but the first are in its anonymous
+namespace:
+
+| File | Contents |
+|---|---|
+| `pompSupport.inc` | Code not specific to pomp: `POMP_CONSTINIT`, `fatal`, `relax`, `Atomic<T>`, `Mutex`, `Condition`, `ScopedLock<T>`, `Post`, and `invoke`, the call of an outlined function through its exact type |
+| `pompIdentity.inc` | Slot sets, and the per-thread word |
+| `pompSyncTypes.inc` | The types of the synchronization inside a team, which `Team` and `Thread` hold by value: `TeamWait`, `TeamJoin`, `TeamBarrier`, `MemberBarrier`, `TreeFlags`, `MemberSync` |
+| `pompTypes.inc` | The descriptors and the globals: the region stack, `Team`, `Thread`, `Pool`, `Settings`, `Root` |
+| `pompInit.inc` | Settings from the environment, the thread limit and the allocation of the descriptors |
+| `pompPool.inc` | The idle wait, recruitment, and the host protocol of the pool |
+| `pompSync.inc` | The code of the synchronization inside a team |
+| `pompRegion.inc` | The region stack, root ownership, and fork/join |
+| `pompLoop.inc` | Static loop partitioning |
+
+As it is one translation unit, the inliner sees all of it, and the object code is the same as
+with one file. The `.inc` files are not compiled on their own: copy them with `pomp.cpp`.
 
 The tests are C programs and link with the C driver alone, so a C++ runtime symbol needed by
 pomp would be a link error.
