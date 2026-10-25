@@ -57,7 +57,11 @@ void Pool::wakeReleased(int n) {
 
 // Wait for work or for release. Return true for work, with `last` updated to
 // the new epoch, and false when a release has claimed this worker.
+//
+// While it spins, it yields only with POMP_YIELD: once every that many spins.
 bool Pool::waitWork(Thread &t, SlotMask self, uint64_t &last) {
+  long every = settings.yieldEvery();
+  SpinYield spinner(every == kYieldUnset ? 0 : every);
   for (long i = 0; i < settings.spin(); ++i) {
     uint64_t g = t.epoch(Order::Acquire);
     if (g != last) {
@@ -66,7 +70,7 @@ bool Pool::waitWork(Thread &t, SlotMask self, uint64_t &last) {
     }
     if (released_.load(Order::Relaxed) & self)
       return false;
-    relax();
+    spinner.spin();
   }
   uint64_t g;
   for (;;) {

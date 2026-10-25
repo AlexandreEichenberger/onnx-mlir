@@ -48,6 +48,7 @@ other than the two above aborts at run time.
 | `OMP_NUM_THREADS` | `n` or `n1,n2`: default team size at levels 1 and 2, clamped to the limit once it is known. Default is the limit |
 | `OMP_MAX_ACTIVE_LEVELS` | 1 (default) or 2; 0 means 1 and larger values mean 2. As in libomp, a list in `OMP_NUM_THREADS` implies 2 |
 | `POMP_SPIN` | Spin iterations of any wait before it sleeps: an idle worker, the leader at the join, a thread in a barrier (default 200000; 0 sleeps immediately). Team waits yield after 4096 iterations of the spin |
+| `POMP_YIELD` | Under evaluation. Unset (the default): idle workers never yield while they spin, and team waits yield on every spin after 4096. Set to N: every wait yields once every N spins, as libomp does every 512 by default on Linux; 0 never yields |
 | `POMP_TREE_BARRIER` | Smallest team that uses the tree barrier instead of the central one. Default 5 on s390x, never elsewhere; 0 or 2 forces the tree, 65 forces central |
 
 ## Host interface (`pomp.h`)

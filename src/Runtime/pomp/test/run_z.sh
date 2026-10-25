@@ -208,21 +208,27 @@ runs5() { # cmd...
 }
 med_of() { field "$1" | med; } # field, on the output of runs5
 ratio() { awk -v a="$1" -v b="$2" 'BEGIN { if (a > 0 && b > 0) printf "%.1fx", b / a; else print "-" }'; }
-RUNTIMES="pomp $([ $HAVE_LIBOMP = 1 ] && echo libomp)"
-exe() { [ $1 = pomp ] && echo "$B/tls/pomp_test" || echo "$B/pomp_test_libomp"; }
+# pomp runs once per POMP_YIELD setting in YIELDS: "-" leaves it unset (the
+# default policy), a number sets it. Each is named pomp, pomp-y<N>.
+YIELDS=${YIELDS:-"- 512 64"}
+POMPS=$(for y in $YIELDS; do [ "$y" = - ] && echo pomp || echo pomp-y$y; done)
+RUNTIMES="$POMPS $([ $HAVE_LIBOMP = 1 ] && echo libomp)"
+exe() { case $1 in pomp*) echo "$B/tls/pomp_test" ;; *) echo "$B/pomp_test_libomp" ;; esac; }
+# Environment of a pomp variant: its POMP_YIELD.
+yenv() { case $1 in pomp-y*) echo "POMP_YIELD=${1#pomp-y}" ;; esac; }
 LIBENV="KMP_BLOCKTIME=200"
 R="$B/results"
 mkdir -p "$R"
 
 note "one level, us per region (median of 5 runs of 100000)"
 echo "overhead = region - work; work = one thread's share of the loop alone."
-printf '%-4s %-7s %-7s %9s %9s | %9s %9s %9s\n' T runtime place \
+printf '%-4s %-10s %-7s %9s %9s | %9s %9s %9s\n' T runtime place \
   overhead barrier region work fork/join
 for L in $LIMITS; do
   for rt in $RUNTIMES; do
     for place in free pinned; do
       P=$([ $place = pinned ] && echo "POMP_TEST_CPUS=$CPUS")
-      E="env $LIBENV OMP_THREAD_LIMIT=$L OMP_NUM_THREADS=$L $P"
+      E="env $LIBENV OMP_THREAD_LIMIT=$L OMP_NUM_THREADS=$L $P $(yenv $rt)"
       X=$(exe $rt)
       b=$(runs5 $E "$X" bench 100000)
       lo=$(runs5 $E "$X" loop 100000)
@@ -231,7 +237,7 @@ for L in $LIMITS; do
       re=$(echo "$lo" | med_of region)
       wo=$(echo "$lo" | med_of work)
       ov=$(echo "$lo" | med_of overhead)
-      printf '%-4s %-7s %-7s %9s %9s | %9s %9s %9s\n' $L $rt $place \
+      printf '%-4s %-10s %-7s %9s %9s | %9s %9s %9s\n' $L $rt $place \
         "$ov" "$ba" "$re" "$wo" "$fj"
       echo "$ov $ba" > "$R/one-$L-$rt-$place"
     done
@@ -254,7 +260,7 @@ for s in $NESTS; do
   n2=${s#*x}
   for rt in $RUNTIMES $([ $HAVE_LIBOMP = 1 ] && echo libomp-hot); do
     case $rt in
-    pomp) RE="OMP_THREAD_LIMIT=$((n1 * n2))" ;;
+    pomp*) RE="OMP_THREAD_LIMIT=$((n1 * n2)) $(yenv $rt)" ;;
     libomp) RE= ;;
     libomp-hot) RE="KMP_HOT_TEAMS_MAX_LEVEL=2 KMP_HOT_TEAMS_MODE=1" ;;
     esac
@@ -280,28 +286,42 @@ done
 [ $short = 0 ] || echo "$short nested timings had short teams and are invalid"
 
 if [ $HAVE_LIBOMP = 1 ]; then
-  note "summary: the two metrics, pomp against libomp (us; libomp/pomp)"
+  note "summary: the two metrics, pomp against libomp (us; ratio = libomp/pomp)"
   echo "overhead: of a parallel region with one static loop; barrier: one barrier."
-  for place in free pinned; do
-    echo
-    echo "$place"
-    printf '%-4s | %8s %8s %7s | %8s %8s %7s\n' T "overhead" "" "" "barrier" "" ""
-    printf '%-4s | %8s %8s %7s | %8s %8s %7s\n' "" pomp libomp ratio pomp libomp ratio
-    for L in $LIMITS; do
-      read po pb < "$R/one-$L-pomp-$place"
-      read lo lb < "$R/one-$L-libomp-$place"
-      printf '%-4s | %8s %8s %7s | %8s %8s %7s\n' $L "$po" "$lo" \
-        "$(ratio "$po" "$lo")" "$pb" "$lb" "$(ratio "$pb" "$lb")"
-    done
-    printf '%-6s | %8s %8s %7s %8s %7s\n' nested pomp libomp ratio lib-hot ratio
-    for s in $NESTS; do
-      po=$(cat "$R/nest-$s-pomp-$place")
-      lo=$(cat "$R/nest-$s-libomp-$place")
-      lh=$(cat "$R/nest-$s-libomp-hot-$place")
-      printf '%-6s | %8s %8s %7s %8s %7s\n' $s "$po" "$lo" \
-        "$(ratio "$po" "$lo")" "$lh" "$(ratio "$po" "$lh")"
+  echo "pomp variants: $POMPS (pomp-yN: POMP_YIELD=N)."
+  for metric in overhead barrier; do
+    for place in free pinned; do
+      echo
+      echo "$metric, $place"
+      printf '%-6s %8s' T libomp
+      for p in $POMPS; do printf ' | %10s %6s' $p ratio; done
+      echo
+      for L in $LIMITS; do
+        read lo lb < "$R/one-$L-libomp-$place"
+        l=$([ $metric = overhead ] && echo $lo || echo $lb)
+        printf '%-6s %8s' $L "$l"
+        for p in $POMPS; do
+          read po pb < "$R/one-$L-$p-$place"
+          v=$([ $metric = overhead ] && echo $po || echo $pb)
+          printf ' | %10s %6s' "$v" "$(ratio "$v" "$l")"
+        done
+        echo
+      done
+      [ $metric = overhead ] || continue
+      for s in $NESTS; do
+        l=$(cat "$R/nest-$s-libomp-hot-$place")
+        printf '%-6s %8s' $s "$l"
+        for p in $POMPS; do
+          v=$(cat "$R/nest-$s-$p-$place")
+          printf ' | %10s %6s' "$v" "$(ratio "$v" "$l")"
+        done
+        echo
+      done
     done
   done
+  echo
+  echo "Nested rows compare with libomp-hot (libomp keeping its inner teams);"
+  echo "plain libomp, which builds them again each region, is in the table above."
 fi
 
 note "pomp_zbench, section 4 (fork/join designs; F is pomp today)"

@@ -108,6 +108,11 @@ void Settings::init() {
   if (s && (v = parseInt(s, nullptr)) >= 0)
     spin_ = v;
 
+  yield_ = kYieldUnset;
+  s = getenv("POMP_YIELD");
+  if (s && (v = parseInt(s, nullptr)) >= 0)
+    yield_ = v;
+
   // OMP_THREAD_LIMIT, if set, must be valid. If it is not set, or not valid,
   // the pool starts closed, and the first open that gives a limit opens it.
   s = getenv("OMP_THREAD_LIMIT");

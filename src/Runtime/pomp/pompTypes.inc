@@ -315,6 +315,8 @@ public:
   }
   int maxActive() const { return maxActive_; }
   long spin() const { return spin_; }
+  // POMP_YIELD: spins between yields in every wait, or kYieldUnset.
+  long yieldEvery() const { return yield_; }
   int treeMin() const { return treeMin_; }
 
 private:
@@ -334,6 +336,7 @@ private:
   Atomic<int> nthreads_[kMaxActive]; // Default team sizes.
   Atomic<int> limitMismatchSeen_;
   long spin_ = 0;
+  long yield_ = kYieldUnset;
   int treeMin_ = 0; // Team size from which the tree barrier is used.
 };
 

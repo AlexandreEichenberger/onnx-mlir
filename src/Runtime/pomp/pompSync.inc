@@ -52,15 +52,24 @@ private:
   uint64_t value_;
 };
 
-// Spin, then yield, which lets an oversubscribed waitee run, then sleep after
-// POMP_SPIN iterations in all.
+// Spin, then sleep after POMP_SPIN iterations in all. While spinning, yield,
+// which lets an oversubscribed waitee run: by default on every spin after
+// kYieldSpin, and with POMP_YIELD once every that many spins.
+//
+// Inlined: the condition is a load and a compare, and the spin loop is the
+// whole cost of a short wait.
 template <class Cond>
-void TeamWait::until(Thread &self, Cond cond) {
+__attribute__((always_inline)) inline void TeamWait::until(
+    Thread &self, Cond cond) {
   long i = 0;
+  long every = settings.yieldEvery();
+  SpinYield spinner(every == kYieldUnset ? 0 : every);
   SlotMask me = SlotMask::of(self.slot());
   while (!cond()) {
     if (i++ < settings.spin()) {
-      if (i < kYieldSpin)
+      if (every != kYieldUnset)
+        spinner.spin();
+      else if (i < kYieldSpin)
         relax();
       else
         sched_yield();

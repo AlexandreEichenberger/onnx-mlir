@@ -75,6 +75,10 @@ constexpr int kMaxActive = 2; // Max active (more than 1 thread) levels.
 // Spin iterations of any wait (idle, join, barrier) before it sleeps.
 constexpr long kDefaultSpin = 200000;
 constexpr long kYieldSpin = 4096; // Team-wait spin iterations before yield.
+// POMP_YIELD unset: today's policy, kept until z measurements decide (see
+// POMP.md): idle waits never yield, team waits yield on every spin after
+// kYieldSpin. Set, every wait yields once every POMP_YIELD spins (0: never).
+constexpr long kYieldUnset = -1;
 
 // Teams of at least this many threads use the tree barrier, smaller ones the
 // central one (POMP_TREE_BARRIER overrides it). Measured: on z17 the tree is
