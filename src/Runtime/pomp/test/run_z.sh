@@ -184,41 +184,70 @@ done
 echo "$runs runs, $fail failures"
 
 # Timings: median of 5 runs. libomp spins 200 ms before sleeping, as pomp
-# spins POMP_SPIN iterations.
+# spins POMP_SPIN iterations. Every timing starts after 1000 untimed regions
+# of the same shape, so that libomp's threads exist and are hot: no timing
+# includes the creation of a thread.
+#
+# The two metrics, in us:
+#   overhead  the runtime's cost of a parallel region with one static loop
+#             (fork, loop init, the loop's barrier, join): the region's time
+#             minus the time of its work, one thread's share of the loop run
+#             alone;
+#   barrier   one barrier inside a running region.
 med() { sort -n | sed -n 3p; }
-field() { sed -n "s/.*$1 \([0-9.]*\) us.*/\1/p"; }
+field() { sed -n "s/.*$1 \([-0-9.]*\) us.*/\1/p"; }
 time5() { # field cmd...
   local f=$1 r
   shift
   for r in 1 2 3 4 5; do "$@" 2>/dev/null | field "$f"; done | med
 }
+# 5 runs of a command whose output has several fields: the median of each.
+runs5() { # cmd...
+  local r
+  for r in 1 2 3 4 5; do "$@" 2>/dev/null; done
+}
+med_of() { field "$1" | med; } # field, on the output of runs5
+ratio() { awk -v a="$1" -v b="$2" 'BEGIN { if (a > 0 && b > 0) printf "%.1fx", b / a; else print "-" }'; }
 RUNTIMES="pomp $([ $HAVE_LIBOMP = 1 ] && echo libomp)"
 exe() { [ $1 = pomp ] && echo "$B/tls/pomp_test" || echo "$B/pomp_test_libomp"; }
 LIBENV="KMP_BLOCKTIME=200"
+R="$B/results"
+mkdir -p "$R"
 
 note "one level, us per region (median of 5 runs of 100000)"
-printf '%-4s %-7s %-7s %10s %10s %10s\n' T runtime place fork/join barrier loop
+echo "overhead = region - work; work = one thread's share of the loop alone."
+printf '%-4s %-7s %-7s %9s %9s | %9s %9s %9s\n' T runtime place \
+  overhead barrier region work fork/join
 for L in $LIMITS; do
   for rt in $RUNTIMES; do
     for place in free pinned; do
       P=$([ $place = pinned ] && echo "POMP_TEST_CPUS=$CPUS")
       E="env $LIBENV OMP_THREAD_LIMIT=$L OMP_NUM_THREADS=$L $P"
       X=$(exe $rt)
-      fj=$(time5 join $E "$X" bench 100000)
-      ba=$(time5 barrier $E "$X" bench 100000)
-      lo=$(time5 region $E "$X" loop 100000)
-      printf '%-4s %-7s %-7s %10s %10s %10s\n' $L $rt $place "$fj" "$ba" "$lo"
+      b=$(runs5 $E "$X" bench 100000)
+      lo=$(runs5 $E "$X" loop 100000)
+      fj=$(echo "$b" | med_of join)
+      ba=$(echo "$b" | med_of barrier)
+      re=$(echo "$lo" | med_of region)
+      wo=$(echo "$lo" | med_of work)
+      ov=$(echo "$lo" | med_of overhead)
+      printf '%-4s %-7s %-7s %9s %9s | %9s %9s %9s\n' $L $rt $place \
+        "$ov" "$ba" "$re" "$wo" "$fj"
+      echo "$ov $ba" > "$R/one-$L-$rt-$place"
     done
   done
 done
 
 note "nested, outer x inner threads, us per outer region (median of 5 runs of 50000)"
 echo "Each outer member forks an inner team that runs one loop and its barrier."
+echo "overhead = region - work; work = one inner thread's share of the loop."
 echo "libomp runs twice: by default, which creates every inner team again, and"
 echo "with hot inner teams, which it keeps as pomp does. Hot teams get full inner"
 echo "teams only without OMP_THREAD_LIMIT (else libomp gives them 1 thread), so"
-echo "libomp runs without it. Any short team is flagged: that timing is invalid."
-printf '%-6s %-12s %-7s %10s\n' shape runtime place region
+echo "libomp runs without it. Pinned, every inner thread is on its own CPU, the"
+echo "same one for both runtimes. Any short team is flagged: that timing is"
+echo "invalid."
+printf '%-6s %-12s %-7s %9s | %9s %9s\n' shape runtime place overhead region work
 short=0
 for s in $NESTS; do
   n1=${s%x*}
@@ -233,21 +262,50 @@ for s in $NESTS; do
     for place in free pinned; do
       P=$([ $place = pinned ] && echo "POMP_TEST_CPUS=$CPUS")
       E="env $LIBENV OMP_MAX_ACTIVE_LEVELS=2 $RE $P"
-      v=$(for r in 1 2 3 4 5; do $E "$X" nestbench 50000 $n1 $n2 2>/dev/null; done)
-      r=$(echo "$v" | field region | med)
+      v=$(runs5 $E "$X" nestbench 50000 $n1 $n2)
+      re=$(echo "$v" | med_of region)
+      wo=$(echo "$v" | med_of work)
+      ov=$(echo "$v" | med_of overhead)
       flag=
       if echo "$v" | grep -qE 'short teams ([1-9][0-9]* outer|[0-9]+ outer [1-9])'; then
         flag="  SHORT TEAMS: invalid"
         short=$((short + 1))
+        ov=-
       fi
-      printf '%-6s %-12s %-7s %10s%s\n' $s $rt $place "$r" "$flag"
+      printf '%-6s %-12s %-7s %9s | %9s %9s%s\n' $s $rt $place "$ov" "$re" "$wo" "$flag"
+      echo "$ov" > "$R/nest-$s-$rt-$place"
     done
   done
 done
 [ $short = 0 ] || echo "$short nested timings had short teams and are invalid"
 
+if [ $HAVE_LIBOMP = 1 ]; then
+  note "summary: the two metrics, pomp against libomp (us; libomp/pomp)"
+  echo "overhead: of a parallel region with one static loop; barrier: one barrier."
+  for place in free pinned; do
+    echo
+    echo "$place"
+    printf '%-4s | %8s %8s %7s | %8s %8s %7s\n' T "overhead" "" "" "barrier" "" ""
+    printf '%-4s | %8s %8s %7s | %8s %8s %7s\n' "" pomp libomp ratio pomp libomp ratio
+    for L in $LIMITS; do
+      read po pb < "$R/one-$L-pomp-$place"
+      read lo lb < "$R/one-$L-libomp-$place"
+      printf '%-4s | %8s %8s %7s | %8s %8s %7s\n' $L "$po" "$lo" \
+        "$(ratio "$po" "$lo")" "$pb" "$lb" "$(ratio "$pb" "$lb")"
+    done
+    printf '%-6s | %8s %8s %7s %8s %7s\n' nested pomp libomp ratio lib-hot ratio
+    for s in $NESTS; do
+      po=$(cat "$R/nest-$s-pomp-$place")
+      lo=$(cat "$R/nest-$s-libomp-$place")
+      lh=$(cat "$R/nest-$s-libomp-hot-$place")
+      printf '%-6s | %8s %8s %7s %8s %7s\n' $s "$po" "$lo" \
+        "$(ratio "$po" "$lo")" "$lh" "$(ratio "$po" "$lh")"
+    done
+  done
+fi
+
 note "pomp_zbench, section 4 (fork/join designs; F is pomp today)"
-"$B/pomp_zbench" $(echo $LIMITS | tr ' ' ',') 2>&1 | sed -n '/^4\./,/^5\./p'
+"$B/pomp_zbench" $(echo $LIMITS | tr ' ' ',') 2>&1 | sed -n '/^4\./,/^5\./p' | sed '$d'
 
 note "summary: $fail failures"
 exit $((fail != 0))

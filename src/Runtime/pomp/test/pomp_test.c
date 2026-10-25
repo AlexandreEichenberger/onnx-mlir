@@ -24,8 +24,11 @@
 //   cycles     : open / enter / run / close, repeated (the per-inference
 //                pattern)
 //   bench      : fork/join and barrier latency
-//   loop       : one parallel loop region on a small array
-//   nestbench N1 N2 : nested region, N1 outer threads each forking N2
+//   loop       : one parallel loop region on a small array; prints the region,
+//                the work of one thread's share alone, and their difference,
+//                the runtime's overhead per region
+//   nestbench N1 N2 : nested region, N1 outer threads each forking N2; prints
+//                the region, work and overhead as `loop` does
 //
 // POMP_TEST_CPUS=0-7 (Linux) pins thread t of the run to the t-th CPU listed:
 // the pool threads under pomp, and libomp's threads, in tid order, under
@@ -58,6 +61,10 @@ static int num_threads = 4;
 // -----------------------------------------------------------------------------
 
 static int test_cpus[256], test_ncpus;
+#ifdef __linux__
+// Index in test_cpus of the CPU the calling thread is pinned to, or -1.
+static __thread int pinned_index = -1;
+#endif
 
 static void parse_cpus(void) {
   const char *s = getenv("POMP_TEST_CPUS");
@@ -83,10 +90,24 @@ static void pin_self(int i) {
   CPU_ZERO(&set);
   CPU_SET(test_cpus[i], &set);
   pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+  pinned_index = i;
 #else
   (void)i;
 #endif
 }
+
+#ifndef POMP
+// Pin the calling thread to the i-th listed CPU unless it already is: one
+// thread-local compare when it is, which is how it stays inside a timing.
+static inline void pin_once(int i) {
+#ifdef __linux__
+  if (test_ncpus && pinned_index != i)
+    pin_self(i);
+#else
+  (void)i;
+#endif
+}
+#endif
 
 // -----------------------------------------------------------------------------
 // Host side: threads entering the pool (stands for the Java layer)
@@ -137,14 +158,22 @@ static void start(void) {
   }
 #endif
   num_threads = omp_get_thread_limit();
+#ifndef POMP
+  // Without OMP_THREAD_LIMIT, libomp's limit is INT_MAX: a team of that many
+  // threads would exhaust memory. Use at most as many as pomp could.
+  if (num_threads > 64)
+    num_threads = 64;
+#endif
   parse_cpus();
   pin_self(0);
   enter_all();
 #ifndef POMP
   // libomp: pin each thread of a full team, which libomp keeps for later
-  // teams, so tid t stays on the t-th CPU as pomp's slot t does.
+  // teams, so tid t stays on the t-th CPU as pomp's slot t does. No more
+  // threads than CPUs listed: extra spinning threads would share them.
   if (test_ncpus) {
-#pragma omp parallel num_threads(num_threads)
+    int n = num_threads < test_ncpus ? num_threads : test_ncpus;
+#pragma omp parallel num_threads(n)
     pin_self(omp_get_thread_num());
   }
 #endif
@@ -525,6 +554,30 @@ static void test_bench(long iters) {
 
 static float loop_data[4096];
 
+// The work of one thread in a region: its share of the loop, as the
+// worksharing loop runs it, without any runtime call. The barrier keeps the
+// compiler from merging or removing the repeated calls.
+__attribute__((noinline)) static void scale_share(
+    float *a, long lo, long hi, float s) {
+  for (long i = lo; i < hi; ++i)
+    a[i] *= s;
+  __asm__ volatile("" ::: "memory");
+}
+
+// Time per call of one thread's share of a loop of n over nth threads, the
+// largest share of a static schedule: ceil(n / nth) elements.
+static double share_time(float *a, long n, int nth, long iters) {
+  long len = (n + nth - 1) / nth;
+  volatile float vs = 1.0f;
+  float s = vs;
+  for (long i = 0; i < 1000; ++i)
+    scale_share(a, 0, len, s);
+  double t0 = now();
+  for (long i = 0; i < iters; ++i)
+    scale_share(a, 0, len, s);
+  return (now() - t0) / iters;
+}
+
 static void scale(float *a, long n, float s) {
 #pragma omp parallel
   {
@@ -542,8 +595,13 @@ static void test_loop(long iters) {
   t0 = now();
   for (i = 0; i < iters; ++i)
     scale(loop_data, n, 1.0f);
-  printf("loop: %d threads, region %.2f us\n", num_threads,
-      (now() - t0) / iters * 1e6);
+  double region = (now() - t0) / iters;
+  // The region lasts as long as its slowest thread's share: the overhead is
+  // the rest, the runtime's cost of the region (fork, loop init, barrier,
+  // join).
+  double work = share_time(loop_data, n, num_threads, iters);
+  printf("loop: %d threads, region %.3f us, work %.3f us, overhead %.3f us\n",
+      num_threads, region * 1e6, work * 1e6, (region - work) * 1e6);
 }
 
 // -----------------------------------------------------------------------------
@@ -554,6 +612,14 @@ static void test_loop(long iters) {
 
 static float nest_data[64][1024];
 
+// Placement: with POMP_TEST_CPUS, inner thread i of outer member t goes on the
+// CPU that pomp's pool gives it: t for i = 0 (the outer member itself), and
+// n1 + t * (n2 - 1) + i - 1 otherwise, as the root splits the remaining slots
+// into one contiguous group per outer member. pomp's threads are pinned that
+// way as they enter the pool; libomp creates its inner threads from pinned
+// outer members, whose CPU they would inherit, so under libomp they are
+// pinned here, on their first region (and again only if libomp moves a thread
+// between teams).
 static void test_nestbench(long iters, int n1, int n2) {
   long i, short1 = 0, short2 = 0;
   double t0 = now();
@@ -569,8 +635,14 @@ static void test_nestbench(long iters, int n1, int n2) {
       float *a = nest_data[omp_get_thread_num() & 63];
       if (omp_get_thread_num() == 0 && omp_get_num_threads() != n1)
         __atomic_fetch_add(&short1, 1, __ATOMIC_RELAXED);
+      int t = omp_get_thread_num();
+      (void)t;
 #pragma omp parallel num_threads(n2)
       {
+#ifndef POMP
+        int it = omp_get_thread_num();
+        pin_once(it == 0 ? t : n1 + t * (n2 - 1) + it - 1);
+#endif
 #pragma omp for
         for (long k = 0; k < 1024; ++k)
           a[k] *= s;
@@ -581,9 +653,12 @@ static void test_nestbench(long iters, int n1, int n2) {
   }
   // A runtime that gives smaller teams than asked does less work: report it,
   // as a timing is then not comparable.
+  double region = (now() - t0) / iters;
+  double work = share_time(nest_data[0], 1024, n2, iters);
   printf("nestbench: %dx%d threads, short teams %ld outer %ld inner, region "
-         "%.2f us\n",
-      n1, n2, short1, short2, (now() - t0) / iters * 1e6);
+         "%.3f us, work %.3f us, overhead %.3f us\n",
+      n1, n2, short1, short2, region * 1e6, work * 1e6,
+      (region - work) * 1e6);
 }
 
 int main(int argc, char **argv) {
