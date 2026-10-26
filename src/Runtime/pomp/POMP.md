@@ -541,7 +541,7 @@ namespace:
 |---|---|
 | `pompSupport.inc` | Code not specific to pomp: `POMP_CONSTINIT`, `fatal`, `relax`, `Atomic<T>`, `Mutex`, `Condition`, `ScopedLock<T>`, `Post`, and `invoke`, the call of an outlined function through its exact type |
 | `pompIdentity.inc` | Slot sets, and the per-thread word |
-| `pompSyncTypes.inc` | The types of the synchronization inside a team, which `Team` and `Thread` hold by value: `TeamWait`, `TeamJoin`, `TeamBarrier`, `MemberBarrier`, `TreeFlags`, `MemberSync` |
+| `pompSyncTypes.inc` | The types of the synchronization inside a team, which `Team` and `Thread` hold by value: `TeamWait`, `TeamJoin`, `TeamCentralBarrier`, `TeamTreeBarrier`, `MemberTreeBarrier`, `TreeFlags`, `MemberSync` |
 | `pompTypes.inc` | The descriptors and the globals: the region stack, `Team`, `Thread`, `Pool`, `Settings`, `Root` |
 | `pompInit.inc` | Settings from the environment, the thread limit and the allocation of the descriptors |
 | `pompPool.inc` | The idle wait, recruitment, and the host protocol of the pool |

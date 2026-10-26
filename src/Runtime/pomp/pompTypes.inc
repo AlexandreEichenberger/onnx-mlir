@@ -26,7 +26,7 @@ struct Level {
   Team *team = nullptr; // nullptr for a serialized (team of one) region.
   int32_t tid = 0;
   int32_t nth = 0;
-  MemberBarrier bar;
+  MemberTreeBarrier bar;
 };
 
 // A thread's regions, innermost on top, with the number of them that are
@@ -92,8 +92,14 @@ public:
   void join(Thread &leader, uint64_t bar);
   // Member `tid`, a worker of slot `slot`: run the work, then report done.
   void runMember(Thread &self, int32_t slot, int32_t tid);
-  // A barrier of the team, for the member at `top`.
-  void barrier(Thread &self, Level &top) { bar_.wait(*this, self, top); }
+  // A barrier of the team, for the member at `top`: the algorithm of the
+  // team's size, the same for every member.
+  void barrier(Thread &self, Level &top) {
+    if (TeamTreeBarrier::usesTree(top.nth))
+      TeamTreeBarrier::wait(*this, self, top);
+    else
+      central_.wait(*this, self, top);
+  }
 
   int32_t size() const { return nth_; }
   // The region-stack entry of member `tid` in this region.
@@ -113,7 +119,8 @@ public:
 private:
   // The components use the team's members, tags and waits.
   friend class TeamJoin;
-  friend class TeamBarrier;
+  friend class TeamCentralBarrier;
+  friend class TeamTreeBarrier;
 
   int32_t leaderSlot() const;
   // Every member, leader included.
@@ -136,16 +143,16 @@ private:
   int32_t level_ = 0;   // Active level of this team: 1 or 2.
   int32_t depth_ = 0;   // Leader's nesting depth before this region.
   TeamJoin join_;
-  // Barrier count at the end of the previous region (see TeamBarrier): with
-  // the fields members read on entry, not on the barrier's own lines.
-  uint64_t barSeq_ = 0;
+  // Read by members on entry: with the fields they read then, not on lines
+  // of its own as the central barrier is.
+  TeamTreeBarrier tree_;
   // The members other than the leader: tids 1..nth-1, in increasing order of
   // slots.
   SlotMask workers_;
   // Reuse cache: the last request and the workers it got.
   int32_t cachedReq_ = 0;
   SlotMask cachedPick_;
-  TeamBarrier bar_;
+  TeamCentralBarrier central_;
   TeamWait wait_;
 };
 

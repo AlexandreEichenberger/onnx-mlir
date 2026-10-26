@@ -30,7 +30,7 @@ inline void RegionStack::pushSerialized() {
   if (depth_ >= kMaxNesting)
     fatal("regions nested too deeply");
   if (depth_ < kMaxDepth)
-    levels_[depth_] = Level{nullptr, 0, 1, MemberBarrier()};
+    levels_[depth_] = Level{nullptr, 0, 1, MemberTreeBarrier()};
   depth_++;
 }
 
@@ -143,7 +143,7 @@ Level Team::levelFor(int32_t tid) const {
   l.team = const_cast<Team *>(this);
   l.tid = tid;
   l.nth = nth_;
-  l.bar = TeamBarrier::enter(*this, tid);
+  l.bar = tree_.enter(*this, tid);
   return l;
 }
 
@@ -179,7 +179,7 @@ void Team::launch(SlotMask workers, int32_t level, int32_t depth, Microtask fn,
   depth_ = depth;
   join_.startRegion();
   workers_ = workers;
-  bar_.startRegion();
+  central_.startRegion();
   if (level_ == 1 && settings.maxActive() > 1)
     partition();
 
@@ -193,7 +193,7 @@ void Team::launch(SlotMask workers, int32_t level, int32_t depth, Microtask fn,
 
 void Team::join(Thread &leader, uint64_t bar) {
   TeamJoin::wait(*this, leader);
-  TeamBarrier::endRegion(*this, bar);
+  tree_.endRegion(bar);
 }
 
 void Team::runMember(Thread &self, int32_t slot, int32_t tid) {

@@ -10,7 +10,8 @@
 //
 // Part of pomp.cpp, included in its anonymous namespace: the synchronization
 // inside a team, declared in pompSyncTypes.inc. TeamWait (the waits of members
-// and their wake-ups), TeamJoin (the end of a region) and TeamBarrier.
+// and their wake-ups), TeamJoin (the end of a region), and the barriers:
+// TeamCentralBarrier and TeamTreeBarrier.
 //
 //===----------------------------------------------------------------------===//
 
@@ -137,64 +138,12 @@ inline void TeamJoin::wait(Team &team, Thread &leader) {
 // A barrier holds every member of the team until all of them have reached
 // it. The compiler emits one at the end of each worksharing loop without
 // nowait, and for `#pragma omp barrier`; each member calls __kmpc_barrier,
-// which ends in TeamBarrier::wait.
+// which ends in Team::barrier.
 //
-// Two algorithms, chosen by team size (usesTree), the same for every member
-// of a team, as all of them see the same size:
-//
-// - Central, for small teams. One shared counter and one generation number
-//   (epoch), in the team, on lines of their own. Each member reads the epoch,
-//   then increments the counter. The last to arrive (the one that sees
-//   nth - 1) resets the counter, bumps the epoch, and wakes the members that
-//   sleep; the others wait until the epoch moves. Simple, but every member
-//   writes the same line, so the line moves between cores nth times per
-//   barrier: cheap on a few cores, slow on many.
-//
-// - Tree, from POMP_TREE_BARRIER threads (default 5 on s390x, never
-//   elsewhere). The members form a 4-ary tree by tid:
-//
-//     tid 0 (leader)
-//     +-- tid 1 --+-- tids 5, 6, 7, 8
-//     +-- tid 2 --+-- tids 9, 10, 11, 12
-//     +-- tid 3 --+-- tids 13 .. 16
-//     +-- tid 4 --+-- tids 17 .. 20
-//
-//   tid t is the parent of tids 4t+1 .. 4t+4. A barrier has two sweeps:
-//     gather: a member waits until each child has stored the barrier's value
-//             into its own `arrive`, then stores its own `arrive` for its
-//             parent; this goes up to tid 0, which then knows that all have
-//             arrived;
-//     release: tid 0 stores the value into each child's `release`; each
-//             member, once its `release` holds it, does the same for its own
-//             children, down to the leaves.
-//   Every flag has one writer and one reader, so no line is contended, and
-//   the depth is log4(nth): 3 levels for 64 threads.
-//
-// State, kept with the data it is used with (see pompSyncTypes.inc):
-//   Team::bar_           TeamBarrier: the central counter and epoch;
-//   Team::barSeq_        the count of barriers at the end of the last region;
-//   Level::bar           MemberBarrier, in the member's region-stack entry:
-//                        its count of barriers passed, and its tree links;
-//   MemberSync::tree     TreeFlags, on the member's wake-up line: `arrive`
-//                        and `release`.
-//
-// Lifetime, the four points at which the team calls into the barrier:
-//   Team::launch      startRegion   leader, before waking the members: reset
-//                                   the central counter
-//   Team::levelFor    enter         each member, on entry to the region: its
-//                                   count, from barSeq_, and its tree links
-//   Team::barrier     wait          each member, at each barrier
-//   Team::join        endRegion     leader, after the join: barSeq_ = its
-//                                   count, for the next region
-//
-// Values instead of resets. Each member counts the barriers it passed in the
-// team (MemberBarrier::passed), and the k-th barrier waits for value k, tagged
-// with the team (Team::tag): a tree flag is never reset, it is overwritten by
-// the next barrier's value, and a value left by an earlier barrier, or by
-// another team that used the same thread, never matches. As all members pass
-// the same barriers, their counts agree; the count of the leader at the join
-// is the team's, and the next region starts from it, so the tags keep
-// growing across regions of the team rather than restarting at 1.
+// Two algorithms, chosen by team size (TeamTreeBarrier::usesTree), the same
+// for every member of a team, as all of them see the same size. Each has its
+// own state, below: TeamCentralBarrier, and TeamTreeBarrier with the
+// members' MemberTreeBarrier and TreeFlags.
 //
 // Waiting. Every wait is TeamWait::until: spin, yield, then sleep with the
 // waiter's bit set in the team's `sleepers`. Every store that a waiter may
@@ -203,19 +152,108 @@ inline void TeamJoin::wait(Team &team, Thread &leader) {
 
 // The choice is by team size only, so that every member of a team makes the
 // same one.
-inline bool TeamBarrier::usesTree(int32_t nth) {
+inline bool TeamTreeBarrier::usesTree(int32_t nth) {
   return nth >= settings.treeMin();
 }
 
+// -----------------------------------------------------------------------------
+// Central barrier
+//
+// For small teams. One shared counter and one generation number (epoch), in
+// the team, on lines of their own. Each member reads the epoch, then
+// increments the counter. The last to arrive (the one that sees nth - 1)
+// resets the counter, bumps the epoch, and wakes the members that sleep; the
+// others wait until the epoch moves. Simple, but every member writes the
+// same line, so the line moves between cores nth times per barrier: cheap
+// on a few cores, slow on many.
+//
+// State: TeamCentralBarrier, in the team (Team::central_); none in the
+// members, as the epoch, read on arrival, tells each member which barrier
+// it waits for.
+//
+// Lifetime:
+//   Team::launch      startRegion   leader, before waking the members: reset
+//                                   the counter
+//   Team::barrier     wait          each member, at each barrier
+// -----------------------------------------------------------------------------
+
 // No member is in a barrier of the team yet: the store needs no ordering
 // beyond the wake-up of the members, which publishes it.
-inline void TeamBarrier::startRegion() { count_.store(0, Order::Relaxed); }
-
-// Every member passed the same barriers. Written after the join, as members
-// read it on entry.
-inline void TeamBarrier::endRegion(Team &team, uint64_t passed) {
-  team.barSeq_ = passed;
+inline void TeamCentralBarrier::startRegion() {
+  count_.store(0, Order::Relaxed);
 }
+
+// The last member to arrive resets the count and bumps the generation, which
+// the others wait for.
+//
+// The epoch is read before the increment: a member that arrives early reads
+// this barrier's epoch, and cannot see the next one, which needs its own
+// arrival. The reset of the count comes before the bump of the epoch, which
+// publishes it (release), so a member that leaves and arrives at the next
+// barrier finds the count at 0. The increment is acq_rel so that the last
+// member sees the writes of all others before it releases them.
+inline void TeamCentralBarrier::wait(
+    Team &team, Thread &self, const Level &top) {
+  uint64_t epoch = epoch_.load(Order::Acquire);
+  if (count_.fetchAdd(1, Order::AcqRel) == top.nth - 1) {
+    count_.store(0, Order::Relaxed);
+    epoch_.store(epoch + 1, Order::Release);
+    team.wait_.wake(team.members() - SlotMask::of(self.slot()));
+  } else {
+    team.wait_.until(self, FlagLeaves(epoch_, epoch));
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Tree barrier
+//
+// From POMP_TREE_BARRIER threads (default 5 on s390x, never elsewhere). The
+// members form a 4-ary tree by tid:
+//
+//   tid 0 (leader)
+//   +-- tid 1 --+-- tids 5, 6, 7, 8
+//   +-- tid 2 --+-- tids 9, 10, 11, 12
+//   +-- tid 3 --+-- tids 13 .. 16
+//   +-- tid 4 --+-- tids 17 .. 20
+//
+// tid t is the parent of tids 4t+1 .. 4t+4. A barrier has two sweeps:
+//   gather:  a member waits until each child has stored the barrier's value
+//            into its own `arrive`, then stores its own `arrive` for its
+//            parent; this goes up to tid 0, which then knows that all have
+//            arrived;
+//   release: tid 0 stores the value into each child's `release`; each
+//            member, once its `release` holds it, does the same for its own
+//            children, down to the leaves.
+// Every flag has one writer and one reader, so no line is contended, and the
+// depth is log4(nth): 3 levels for 64 threads.
+//
+// State, kept with the data it is used with (see pompSyncTypes.inc):
+//   Team::tree_          TeamTreeBarrier: the count of barriers at the end
+//                        of the last region;
+//   Level::bar           MemberTreeBarrier, in the member's region-stack
+//                        entry: its count of barriers passed, and its tree
+//                        links;
+//   MemberSync::tree     TreeFlags, on the member's wake-up line: `arrive`
+//                        and `release`.
+//
+// Lifetime, the three points at which the team calls into the barrier:
+//   Team::levelFor    enter         each member, on entry to the region: its
+//                                   count, from the base, and its tree links
+//   Team::barrier     wait          each member, at each barrier
+//   Team::join        endRegion     leader, after the join: the base = its
+//                                   count, for the next region
+//
+// Values instead of resets. Each member counts the barriers it passed in the
+// team (MemberTreeBarrier::passed), and the k-th barrier waits for value k,
+// tagged with the team (Team::tag): a flag is never reset, it is overwritten
+// by the next barrier's value, and a value left by an earlier barrier, or by
+// another team that used the same thread, never matches. As all members pass
+// the same barriers, their counts agree; the count of the leader at the join
+// is the team's, and the next region starts from it, so the tags keep
+// growing across regions of the team rather than restarting at 1. Only tree
+// barriers count: in a region with the central barrier, the counts stay at
+// the base, which is enough, as only tree barriers store the values.
+// -----------------------------------------------------------------------------
 
 // The count starts from the team's at the end of the previous region, the
 // same for every member.
@@ -229,9 +267,10 @@ inline void TeamBarrier::endRegion(Team &team, uint64_t passed) {
 // region, here, so that a barrier does no lookup. Example, 12 threads on
 // slots 0 (leader), 3, 5, 6, 8, ..: tid 1 is slot 3, its children are tids
 // 5..8, its parent tid 0, slot 0.
-inline MemberBarrier TeamBarrier::enter(const Team &team, int32_t tid) {
-  MemberBarrier m;
-  m.passed = team.barSeq_;
+inline MemberTreeBarrier TeamTreeBarrier::enter(
+    const Team &team, int32_t tid) const {
+  MemberTreeBarrier m;
+  m.passed = base_;
   int32_t nth = team.nth_;
   if (!usesTree(nth))
     return m;
@@ -250,40 +289,10 @@ inline MemberBarrier TeamBarrier::enter(const Team &team, int32_t tid) {
   return m;
 }
 
-// This member's count of barriers moves first: the barrier waits for value
-// `passed` in both algorithms (the central one only through the epoch).
-void TeamBarrier::wait(Team &team, Thread &self, Level &top) {
-  top.bar.passed++;
-  if (usesTree(top.nth))
-    tree(team, self, top);
-  else
-    central(team, self, top);
-}
-
-// Central barrier: the last member to arrive resets the count and bumps the
-// generation, which the others wait for.
-//
-// The epoch is read before the increment: a member that arrives early reads
-// this barrier's epoch, and cannot see the next one, which needs its own
-// arrival. The reset of the count comes before the bump of the epoch, which
-// publishes it (release), so a member that leaves and arrives at the next
-// barrier finds the count at 0. The increment is acq_rel so that the last
-// member sees the writes of all others before it releases them.
-inline void TeamBarrier::central(Team &team, Thread &self, Level &top) {
-  uint64_t epoch = epoch_.load(Order::Acquire);
-  if (count_.fetchAdd(1, Order::AcqRel) == top.nth - 1) {
-    count_.store(0, Order::Relaxed);
-    epoch_.store(epoch + 1, Order::Release);
-    team.wait_.wake(team.members() - SlotMask::of(self.slot()));
-  } else {
-    team.wait_.until(self, FlagLeaves(epoch_, epoch));
-  }
-}
-
-// Tree barrier: each thread waits for its children to arrive, reports its own
-// arrival to its parent and waits for the parent's release, then releases its
-// children. Every flag is written by one thread and read by one other, so no
-// line is contended; the depth is log_ARITY(nth).
+// Each thread waits for its children to arrive, reports its own arrival to
+// its parent and waits for the parent's release, then releases its children.
+// Every flag is written by one thread and read by one other, so no line is
+// contended; the depth is log_ARITY(nth).
 //
 // Which flags: a member's `arrive` and `release` are on its own line, so a
 // thread writes its own `arrive` and reads its own `release`, and reads and
@@ -298,9 +307,9 @@ inline void TeamBarrier::central(Team &team, Thread &self, Level &top) {
 // No flag can pass the value its reader waits for: a child publishes the next
 // `arrive` only after this barrier's `release`, which its parent sets only
 // after this barrier's `arrive`.
-void TeamBarrier::tree(Team &team, Thread &self, Level &top) {
-  const MemberBarrier &m = top.bar;
-  uint64_t v = team.tag(m.passed);
+void TeamTreeBarrier::wait(Team &team, Thread &self, Level &top) {
+  MemberTreeBarrier &m = top.bar;
+  uint64_t v = team.tag(++m.passed);
   // Gather: all of this member's subtree has arrived.
   for (int c : m.children)
     team.wait_.until(self, FlagIs(threads[c].sync().tree.arrive, v));

@@ -45,12 +45,12 @@ struct Level;
 //                pool, whose idle wait (pompPool.inc) is the "release" of
 //                the join. Hence a done flag per member, which the leader
 //                polls, and no release step.
-//   TeamBarrier  a barrier inside the region (__kmpc_barrier, "Barriers").
+//   barriers     a barrier inside the region (__kmpc_barrier, "Barriers").
 //                All to all: every member waits until all have arrived, and
-//                then all go on in the same region. Central counter for
-//                small teams, tree for large ones.
+//                then all go on in the same region. TeamCentralBarrier, a
+//                counter, for small teams; TeamTreeBarrier for large ones.
 //
-// How they wait: TeamWait ("Waits inside a team"), the one wait that both
+// How they wait: TeamWait ("Waits inside a team"), the one wait that all
 // use. Spin, yield, then sleep on the waiter's own post, with its bit set in
 // the team's `sleepers`. A protocol stores its flag first, then calls wake()
 // for the threads that read that flag, so no wake-up is lost. This is the
@@ -59,43 +59,47 @@ struct Level;
 // wait at a time, idle or in a team.
 //
 // Where the state lives. A member is one of the team's nth threads: tid 0,
-// the leader, and the workers it recruited, tids 1 .. nth-1. Each protocol
-// has a team part and a member part, and needs both:
+// the leader, and the workers it recruited, tids 1 .. nth-1. A protocol has
+// a team part, and may have a member part:
 //   Team part    one copy per team, in Team, shared by the members: what all
 //                of them must agree on.
 //   Member part  one copy per member, written only by that member, so that
 //                the writes are spread over lines of their own. Either
 //                private, or read by exactly one other thread:
-//     MemberBarrier  in the member's region-stack entry, private: its count
-//                    of barriers passed, and its links in the barrier tree.
-//     MemberSync     on the thread's wake-up line, the flags that one other
-//                    thread polls: `done`, for the leader at the join, and
-//                    TreeFlags, for the parent or children in the tree
-//                    barrier. The leader uses none. Per thread rather than
-//                    per team, as a thread is a non-leader member of at
-//                    most one team at a time.
+//     MemberTreeBarrier  in the member's region-stack entry, private: its
+//                        count of barriers passed, and its links in the
+//                        barrier tree.
+//     MemberSync         on the thread's wake-up line, the flags that one
+//                        other thread polls: `done`, for the leader at the
+//                        join, and TreeFlags, for the parent or children in
+//                        the tree barrier. The leader uses none. Per thread
+//                        rather than per team, as a thread is a non-leader
+//                        member of at most one team at a time.
 //
-// The two parts of each protocol:
+// The parts of each protocol:
 //
 //                    team part                    member part
-//   join             TeamJoin::region_: tags      MemberSync::done: one flag
-//                    `done`, so that a value of   per member, which the
-//                    an earlier region never      leader polls
+//   join             TeamJoin: the region         MemberSync::done: one flag
+//                    number, which tags `done`,   per member, which the
+//                    so that a value of an        leader polls
+//                    earlier region never
 //                    matches
-//   central barrier  TeamBarrier::count_ and      MemberBarrier::passed: the
-//                    epoch_: the barrier itself,  member's barrier count,
-//                    written by every member      kept but not waited on
-//   tree barrier     Team::barSeq_ and the team   MemberBarrier (count, tree
-//                    tag: the base of the values  links) and TreeFlags: the
-//                    that the flags wait for      barrier itself, one writer
-//                                                 and one reader per flag
+//   central barrier  TeamCentralBarrier: the      none
+//                    counter and epoch, the
+//                    barrier itself, written by
+//                    every member
+//   tree barrier     TeamTreeBarrier: the base    MemberTreeBarrier (count,
+//                    of the members' counts,      tree links) and TreeFlags:
+//                    which, with the team tag,    the barrier itself, one
+//                    give the values that the     writer and one reader per
+//                    flags wait for               flag
 //
 // The central barrier accepts contention on its shared lines, which is cheap
 // on a few cores. The tree and the join avoid it: per-member flags on
 // distinct lines are read in parallel, where one shared line is written in
 // turn.
 
-// The wait primitive of the team's protocols (TeamJoin, TeamBarrier): wait
+// The wait primitive of the team's protocols (join, barriers): wait
 // until a condition on a flag holds, then sleep if it takes too long. It
 // defines no flags of its own; `sleepers_` only records who sleeps, so that
 // a waker posts only to those threads. See "Waits inside a team".
@@ -142,63 +146,76 @@ private:
 };
 
 // A barrier inside a region. Unlike the join, every member waits, and all of
-// them continue in the region.
-//
-// Barrier state, in parts that each stay with the data they are used with:
-// TeamBarrier and Team::barSeq_ in the team, MemberBarrier in each member's
-// region-stack entry, and TreeFlags on each member's wake-up line. The design
-// of both barriers, central and tree, and all of the code on this state, are
-// in "Barriers" in pompSync.inc.
+// them continue in the region. Two algorithms, each with its own state; a
+// team uses one of them, by its size (TeamTreeBarrier::usesTree), and
+// Team::barrier picks it. The design of both, and their code, are in
+// "Barriers" in pompSync.inc.
 
-// A member's part, in its region-stack entry. Written only by the member,
-// which keeps it private: it is the member's own copy of the team's state.
-struct MemberBarrier {
+// Central barrier, for small teams: the team's part only, in the team.
+// Members keep no state of their own for it.
+class TeamCentralBarrier {
+public:
+  // Leader, before waking the members.
+  void startRegion();
+  // A barrier, for the member at `top`, running on `self`.
+  void wait(Team &team, Thread &self, const Level &top);
+
+private:
+  // On lines of their own, as every member writes them. `count_` is the
+  // number of members that arrived at the current barrier, 0 between
+  // barriers; `epoch_` is bumped once per barrier, by the last to arrive,
+  // and the others wait for it to move.
+  alignas(kCacheLine) Atomic<int> count_;
+  alignas(kCacheLine) Atomic<uint64_t> epoch_;
+};
+
+// Tree barrier, for large teams: a member's part, in its region-stack entry.
+// Written only by the member, which keeps it private: its own copy of the
+// team's state, set on entry.
+struct MemberTreeBarrier {
   // Barriers this thread passed in this team, all regions: the k-th barrier
   // waits for value k (tagged with the team). The same for every member, as
   // all pass the same barriers.
   uint64_t passed = 0;
-  // Tree links, set on entry if the team uses the tree: the slots of this
-  // member's children (none for a leaf), and of its parent (unused for tid
-  // 0). Slots, not tids, so that a barrier reaches their flags directly.
+  // The slots of this member's children (none for a leaf), and of its
+  // parent (unused for tid 0). Slots, not tids, so that a barrier reaches
+  // their flags directly.
   SlotMask children;
   int32_t parent = 0;
 };
 
-// A member's tree flags, on its wake-up line (see MemberSync): `arrive` is
-// written by the member and polled by its parent, `release` the other way.
-// Each holds the value of the last barrier it took part in; never reset.
+// Tree barrier: a member's flags, on its wake-up line (see MemberSync):
+// `arrive` is written by the member and polled by its parent, `release` the
+// other way. Each holds the value of the last barrier it took part in;
+// never reset.
 struct TreeFlags {
   Atomic<uint64_t> arrive;
   Atomic<uint64_t> release;
 };
 
-// The team's part, in the team.
-class TeamBarrier {
+// Tree barrier: the team's part, in the team. Only the base of the members'
+// counts, read once by each member on entry; so not aligned, unlike the
+// central barrier: it stays on the line of the other fields members read on
+// entry (see Team).
+class TeamTreeBarrier {
 public:
   // Whether a team of `nth` threads uses the tree, rather than the central
   // barrier.
   static bool usesTree(int32_t nth);
-  // Leader, before waking the members.
-  void startRegion();
   // Member `tid` of `team`, on entry: its part of the barrier.
-  static MemberBarrier enter(const Team &team, int32_t tid);
+  MemberTreeBarrier enter(const Team &team, int32_t tid) const;
   // A barrier, for the member at `top`, running on `self`.
-  void wait(Team &team, Thread &self, Level &top);
+  static void wait(Team &team, Thread &self, Level &top);
   // Leader, after the join: `passed` is the leader's count, and so every
-  // member's, which the next region of `team` starts from.
-  static void endRegion(Team &team, uint64_t passed);
+  // member's, which the next region of the team starts from.
+  void endRegion(uint64_t passed) { base_ = passed; }
 
 private:
-  void central(Team &team, Thread &self, Level &top);
-  static void tree(Team &team, Thread &self, Level &top);
-
-  // Central barrier, on lines of their own. `count_` is the number of
-  // members that arrived at the current barrier, 0 between barriers;
-  // `epoch_` is bumped once per barrier, by the last to arrive, and the
-  // others wait for it to move. Unused by teams that use the tree.
-  alignas(kCacheLine) Atomic<int> count_;
-  alignas(kCacheLine) Atomic<uint64_t> epoch_;
+  // Barrier count of the members at the end of the previous region.
+  uint64_t base_ = 0;
 };
+static_assert(sizeof(TeamTreeBarrier) == sizeof(uint64_t),
+    "takes the place of a plain counter in Team");
 
 // Synchronization words of a thread as a member of a team, on the thread's
 // wake-up line (see Thread). `done` is written by the member and polled by the
