@@ -8,10 +8,138 @@
 //
 // =============================================================================
 //
-// Part of pomp.cpp, included in its anonymous namespace: slot sets, and the
-// per-thread word that names the calling thread's slot.
+// Part of pomp.cpp, included in its anonymous namespace: the per-thread word
+// that names the calling thread's slot, and slot sets.
 //
 //===----------------------------------------------------------------------===//
+
+// -----------------------------------------------------------------------------
+// Thread identity: one per-thread word, SelfWord, which every entry point
+// reads first to know who is calling. The terms it uses:
+//
+// - Worker: a thread that entered the pool with pomp_enter_pool(slot). It is
+//   given its slot, 1..limit-1, on entry, and reads 0 again once it leaves.
+//
+// - Non-worker (host thread): any other thread, such as the application's
+//   main thread or a thread of its own that runs a model. Its slot is always
+//   0, so all non-workers share slot 0's descriptor, `threads[0]`.
+//
+// - Root: the one non-worker that currently owns slot 0, and so may use
+//   `threads[0]`: its region stack, and the teams it leads at level 1. There
+//   is at most one root at a time. No thread is the root between regions.
+//   Ownership is taken when a non-worker starts a region (fork or serialized)
+//   at depth 0: the first to swap Root::active_ from 0 to 1 becomes the root,
+//   in whatever order the threads arrive. It is given up when that outermost
+//   region ends. Any non-worker can then be the root of its next region, so
+//   the root may change from region to region, but two are never root at once.
+//
+// - Foreign region: a region that a non-worker runs inline as a team of one,
+//   without touching any descriptor. Its nesting is counted in this word
+//   instead of in a region stack, and inside it every query and barrier sees
+//   a team of one. A thread starts a foreign region:
+//     * when another thread is the root: a second host thread running a model
+//       at the same time (POMP.md, S9). pomp warns once;
+//     * when the thread limit is not set yet, as there are no descriptors yet;
+//     * for any region nested in a foreign region, even if the root has left
+//       or the limit has been set meanwhile.
+//   Like a region stack, the depth is at most kMaxNesting; deeper aborts.
+//   Each foreign region ends by decrementing the depth. At depth 0 the thread
+//   is no longer foreign, and its next region tries again to take the root.
+//   Workers and the root never start foreign regions: they run on their slot.
+//
+// - Pending team size: the size __kmpc_push_num_threads gives the thread's
+//   next fork, 0 if none. The next fork or serialized region consumes it.
+//
+// The pending size and foreign depth belong to the thread, not to its slot:
+// non-workers share slot 0, so they cannot be kept in `threads[0]`.
+//
+// Layout of the word (bits): 0-7 slot, 8 root owner, 9-15 pending team size,
+// 16-30 foreign depth. Zero is a non-worker that is in no region.
+// -----------------------------------------------------------------------------
+
+class SelfWord {
+public:
+  constexpr explicit SelfWord(int32_t word = 0) : word_(word) {}
+
+  // The calling thread's word, and its update.
+  static SelfWord current();
+  static void set(SelfWord w);
+  // Create the per-thread storage, once, before any thread has a slot.
+  static void createStorage();
+
+  // The thread's slot: 1..limit-1 for a worker, 0 for any non-worker.
+  int32_t slot() const { return word_ & kSlotBits; }
+  // A non-worker that is the root, inside its regions.
+  bool ownsRoot() const { return (word_ & kRootOwner) != 0; }
+  // A worker, or the root: the thread may use `threads[slot()]`. Any other
+  // thread is a non-worker outside regions or in foreign ones.
+  bool hasDescriptor() const { return (word_ & (kSlotBits | kRootOwner)) != 0; }
+  // A worker, the root, or a thread in a foreign region: the pool calls of
+  // pomp.h are refused from such a thread.
+  bool inPomp() const { return (word_ & kInPompBits) != 0; }
+  // The pending team size, 0 if none.
+  int32_t pending() const { return (word_ & kPendingBits) >> kPendingShift; }
+  // Inside a foreign region, and how deeply nested in foreign regions.
+  bool inForeign() const { return (word_ & kForeignBits) != 0; }
+  int32_t foreignDepth() const { return (word_ & kForeignBits) / kForeignOne; }
+
+  SelfWord withPending(int32_t nth) const {
+    return SelfWord((word_ & ~kPendingBits) | (nth << kPendingShift));
+  }
+  SelfWord withoutPending() const { return SelfWord(word_ & ~kPendingBits); }
+  // Set by Root::tryEnter when the thread becomes the root, cleared by
+  // Root::leave.
+  SelfWord withRootOwner() const { return SelfWord(word_ | kRootOwner); }
+  SelfWord withoutRootOwner() const { return SelfWord(word_ & ~kRootOwner); }
+  // Start and end a foreign region: one level deeper, one level out.
+  SelfWord enterForeign() const {
+    if (foreignDepth() >= kMaxNesting)
+      fatal("regions nested too deeply");
+    return SelfWord(word_ + kForeignOne);
+  }
+  SelfWord leaveForeign() const { return SelfWord(word_ - kForeignOne); }
+
+private:
+  static constexpr int32_t kSlotBits = 0xff;
+  static constexpr int32_t kRootOwner = 0x100;
+  static constexpr int32_t kPendingShift = 9;
+  static constexpr int32_t kPendingBits = 0x7f << kPendingShift;
+  static constexpr int32_t kForeignOne = 1 << 16;
+  static constexpr int32_t kForeignBits = 0x7fff * kForeignOne;
+  // Set iff the thread is a worker, or inside a region.
+  static constexpr int32_t kInPompBits = kSlotBits | kRootOwner | kForeignBits;
+  static_assert(kMaxNesting <= kForeignBits / kForeignOne,
+      "the foreign depth field must hold kMaxNesting");
+
+  int32_t word_;
+};
+
+#ifdef POMP_USE_PTHREAD_KEY
+// Created at init. Until then no thread has a slot, and the key must not be
+// read: its value would name a key of another library.
+POMP_CONSTINIT pthread_key_t selfKey{};
+POMP_CONSTINIT Atomic<int> selfKeyReady;
+
+inline SelfWord SelfWord::current() {
+  if (!selfKeyReady.load(Order::Acquire))
+    return SelfWord();
+  return SelfWord(int32_t(intptr_t(pthread_getspecific(selfKey))));
+}
+inline void SelfWord::set(SelfWord w) {
+  checkPthread(pthread_setspecific(selfKey, (void *)intptr_t(w.word_)),
+      "pthread_setspecific");
+}
+void SelfWord::createStorage() {
+  checkPthread(pthread_key_create(&selfKey, nullptr), "pthread_key_create");
+  selfKeyReady.store(1, Order::Release);
+}
+#else
+POMP_CONSTINIT thread_local int32_t selfTls = 0;
+
+inline SelfWord SelfWord::current() { return SelfWord(selfTls); }
+inline void SelfWord::set(SelfWord w) { selfTls = w.word_; }
+void SelfWord::createStorage() {}
+#endif
 
 // -----------------------------------------------------------------------------
 // Slot sets
@@ -37,7 +165,8 @@ public:
   int count() const { return __builtin_popcountll(bits_); }
   // The lowest id of a nonempty set.
   int lowest() const { return __builtin_ctzll(bits_); }
-  // The n lowest ids, or all of them if fewer.
+  // The subset made of the n smallest ids of this set, or the whole set if it
+  // has fewer than n. E.g. {2, 5, 9, 12}.lowest(2) is {2, 5}.
   SlotMask lowest(int n) const {
     uint64_t x = bits_, r = 0;
     for (; n > 0 && x; --n) {
@@ -113,84 +242,3 @@ public:
 private:
   Atomic<uint64_t> bits_;
 };
-
-// -----------------------------------------------------------------------------
-// Thread identity, one per-thread word: the slot of the calling thread (0 for
-// any non-worker), plus a root-owner flag while a non-worker runs regions as
-// slot 0. Every non-worker reads slot 0, so the flag is what tells the root of
-// the running regions from another host thread.
-//
-// The word also holds what belongs to the thread rather than to its slot,
-// which other non-workers share: the team size pushed by
-// __kmpc_push_num_threads for its next fork, and the depth of the regions it
-// runs inline while another thread owns slot 0 ("foreign" regions).
-// -----------------------------------------------------------------------------
-
-class SelfWord {
-public:
-  constexpr explicit SelfWord(int32_t word = 0) : word_(word) {}
-
-  // The calling thread's word, and its update.
-  static SelfWord current();
-  static void set(SelfWord w);
-  // Create the per-thread storage, once, before any thread has a slot.
-  static void createStorage();
-
-  int32_t slot() const { return word_ & kSlotBits; }
-  bool ownsRoot() const { return (word_ & kRootOwner) != 0; }
-  // A worker, or the owner of slot 0: the thread has a descriptor.
-  bool hasDescriptor() const { return (word_ & (kSlotBits | kRootOwner)) != 0; }
-  // A worker, or a thread inside a region.
-  bool inPomp() const { return (word_ & kInPompBits) != 0; }
-  int32_t pending() const { return (word_ & kPendingBits) >> kPendingShift; }
-  bool inForeign() const { return (word_ & kForeignBits) != 0; }
-  int32_t foreignDepth() const { return (word_ & kForeignBits) / kForeignOne; }
-
-  SelfWord withPending(int32_t nth) const {
-    return SelfWord((word_ & ~kPendingBits) | (nth << kPendingShift));
-  }
-  SelfWord withoutPending() const { return SelfWord(word_ & ~kPendingBits); }
-  SelfWord withRootOwner() const { return SelfWord(word_ | kRootOwner); }
-  SelfWord withoutRootOwner() const { return SelfWord(word_ & ~kRootOwner); }
-  SelfWord enterForeign() const { return SelfWord(word_ + kForeignOne); }
-  SelfWord leaveForeign() const { return SelfWord(word_ - kForeignOne); }
-
-private:
-  static constexpr int32_t kSlotBits = 0xff;
-  static constexpr int32_t kRootOwner = 0x100;
-  static constexpr int32_t kPendingShift = 9;
-  static constexpr int32_t kPendingBits = 0x7f << kPendingShift;
-  static constexpr int32_t kForeignOne = 1 << 16;
-  static constexpr int32_t kForeignBits = 0x7fff * kForeignOne;
-  // Set iff the thread is a worker, or inside a region.
-  static constexpr int32_t kInPompBits = kSlotBits | kRootOwner | kForeignBits;
-
-  int32_t word_;
-};
-
-#ifdef POMP_USE_PTHREAD_KEY
-// Created at init. Until then no thread has a slot, and the key must not be
-// read: its value would name a key of another library.
-POMP_CONSTINIT pthread_key_t selfKey{};
-POMP_CONSTINIT Atomic<int> selfKeyReady;
-
-inline SelfWord SelfWord::current() {
-  if (!selfKeyReady.load(Order::Acquire))
-    return SelfWord();
-  return SelfWord(int32_t(intptr_t(pthread_getspecific(selfKey))));
-}
-inline void SelfWord::set(SelfWord w) {
-  checkPthread(pthread_setspecific(selfKey, (void *)intptr_t(w.word_)),
-      "pthread_setspecific");
-}
-void SelfWord::createStorage() {
-  checkPthread(pthread_key_create(&selfKey, nullptr), "pthread_key_create");
-  selfKeyReady.store(1, Order::Release);
-}
-#else
-POMP_CONSTINIT thread_local int32_t selfTls = 0;
-
-inline SelfWord SelfWord::current() { return SelfWord(selfTls); }
-inline void SelfWord::set(SelfWord w) { selfTls = w.word_; }
-void SelfWord::createStorage() {}
-#endif

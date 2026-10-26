@@ -60,6 +60,7 @@ namespace {
 // Configuration
 // -----------------------------------------------------------------------------
 
+// Max thread defined in pomp.h, currently limited by the code scheme to 64.
 constexpr int kMaxThreads = POMP_MAX_THREADS;
 static_assert(kMaxThreads <= 64, "slots are bits of one 64-bit word");
 // Teams: one led by each slot at level 2, and the root's at level 1.
@@ -71,19 +72,21 @@ constexpr int kMaxArgs = 16;
 
 // Max nesting levels recorded; deeper ones are serialized and only counted.
 constexpr int kMaxDepth = 8;
+// Max nesting levels of any kind, on a region stack or in a foreign one;
+// deeper aborts. Far beyond any real use, and small enough to fit the
+// foreign depth of SelfWord.
+constexpr int kMaxNesting = 256;
 constexpr int kMaxActive = 2; // Max active (more than 1 thread) levels.
 // Spin iterations of any wait (idle, join, barrier) before it sleeps.
 constexpr long kDefaultSpin = 200000;
 constexpr long kYieldSpin = 4096; // Team-wait spin iterations before yield.
-// POMP_YIELD unset: today's policy, kept until z measurements decide (see
-// POMP.md): idle waits never yield, team waits yield on every spin after
-// kYieldSpin. Set, every wait yields once every POMP_YIELD spins (0: never).
-constexpr long kYieldUnset = -1;
 
 // Teams of at least this many threads use the tree barrier, smaller ones the
 // central one (POMP_TREE_BARRIER overrides it). Measured: on z17 the tree is
-// 41-70% faster from 16 threads on and on par at 8; on Apple M-series the
-// central barrier is faster up to 16 threads. See POMP.md.
+// 41-70% faster from 16 threads on and on par at 8; z/OS, on the same
+// hardware, takes the same default. On Apple M-series the tree is slower at
+// every size measured (up to 16 threads, about the core count). Other targets
+// are unmeasured and keep the central barrier. See POMP.md.
 #if defined(__s390x__) || defined(__MVS__)
 constexpr int kDefaultTreeBarrier = 5;
 #else
@@ -154,9 +157,15 @@ int pomp_wait_pool_empty(void) {
   return pool.waitEmpty();
 }
 
-int pomp_is_pool_open(void) { return !pool.isClosed(); }
+int pomp_is_pool_open(void) {
+  settings.ensureInit();
+  return !pool.isClosed();
+}
 
-int pomp_pool_size(void) { return pool.size(); }
+int pomp_pool_size(void) {
+  settings.ensureInit();
+  return pool.size();
+}
 
 // -----------------------------------------------------------------------------
 // __kmpc entry points
@@ -164,6 +173,11 @@ int pomp_pool_size(void) { return pool.size(); }
 
 extern "C" {
 
+// May be the first call into pomp: compilers emit it in the host function,
+// before push_num_threads, serialized_parallel or fork_call. No init needed:
+// a thread without a slot is slot 0, and before init no thread has one (only
+// pomp_enter_pool makes workers, and it inits first). Unlike libomp, which
+// registers the calling thread here, this is just a load of the thread's word.
 int32_t __kmpc_global_thread_num(void *) { return SelfWord::current().slot(); }
 
 void __kmpc_fork_call(void *, int32_t argc, Microtask fn, ...) {
@@ -258,6 +272,9 @@ void __kmpc_for_static_fini(void *, int32_t) {}
 // omp_* queries
 // -----------------------------------------------------------------------------
 
+// The queries of the calling thread's regions need no init: before it, no
+// thread is in a region nor has a descriptor (forks and serialized regions
+// init first), so they answer as outside of any region.
 int omp_get_thread_num(void) {
   RegionStack *regions = Thread::currentRegions();
   return regions && !SelfWord::current().inForeign() ? regions->topTid() : 0;
@@ -285,17 +302,28 @@ int omp_get_active_level(void) {
 
 int omp_in_parallel(void) { return omp_get_active_level() > 0; }
 
+// The thread limit is set once per process: by OMP_THREAD_LIMIT at init, or
+// else by the first pomp_open_pool(limit) with a limit in [1, 64]. With a valid
+// OMP_THREAD_LIMIT these two report it from the first call, before any open.
+// Until a limit is set they return 1, with one warning: every region runs on
+// one thread then, as pomp only uses threads the host lends it.
 int omp_get_max_threads(void) {
   int active = omp_get_active_level();
   settings.ensureInit();
   int n = settings.numThreads(active);
-  return n > 0 ? n : 1;
+  if (n > 0)
+    return n;
+  settings.warnNoLimit();
+  return 1;
 }
 
 int omp_get_thread_limit(void) {
   settings.ensureInit();
   int n = settings.limit();
-  return n > 0 ? n : 1;
+  if (n > 0)
+    return n;
+  settings.warnNoLimit();
+  return 1;
 }
 
 int omp_get_max_active_levels(void) {

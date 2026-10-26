@@ -27,6 +27,8 @@ inline void RegionStack::pushActive(const Level &l) {
 }
 
 inline void RegionStack::pushSerialized() {
+  if (depth_ >= kMaxNesting)
+    fatal("regions nested too deeply");
   if (depth_ < kMaxDepth)
     levels_[depth_] = Level{nullptr, 0, 1, MemberBarrier()};
   depth_++;

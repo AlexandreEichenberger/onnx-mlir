@@ -20,7 +20,6 @@
 //===----------------------------------------------------------------------===//
 
 #include <pthread.h>
-#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -67,27 +66,6 @@ inline void relax() {
   __asm__ volatile("" ::: "memory");
 #endif
 }
-
-// One iteration of a spin loop that also yields the CPU periodically: relax,
-// and every `every` iterations call sched_yield, which lets another thread
-// that shares the CPU (or its core, with SMT) run, and the scheduler move
-// this one. `every` 0 never yields. The countdown is a local, so that a
-// spin costs one decrement and one compare more than relax().
-class SpinYield {
-public:
-  explicit SpinYield(long every) : every_(every), left_(every) {}
-  void spin() {
-    relax();
-    if (left_ > 0 && --left_ == 0) {
-      sched_yield();
-      left_ = every_;
-    }
-  }
-
-private:
-  long every_;
-  long left_;
-};
 
 // Parse a positive integer; return -1 if the string is not one.
 long parseInt(const char *s, const char **end) {

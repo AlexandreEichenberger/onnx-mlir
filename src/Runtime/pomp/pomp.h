@@ -54,6 +54,14 @@ extern "C" {
 // The thread limit (initial thread included, in [1, POMP_MAX_THREADS]), or 0
 // while no limit is set (OMP_THREAD_LIMIT unset or invalid, and no
 // pomp_open_pool with a limit yet).
+//
+// The OpenMP queries see the same limit. With a valid OMP_THREAD_LIMIT,
+// omp_get_thread_limit and omp_get_max_threads report it from the first call,
+// before any pomp_open_pool. While no limit is set, they return 1, with one
+// warning on stderr per process: pomp only runs regions on threads the host
+// lends it, so every parallel region then runs on one thread. A host that sets
+// the limit with pomp_open_pool should do so before code that sizes its work
+// with these queries runs, or that code sees 1.
 int pomp_get_thread_limit(void);
 
 // Open the pool: threads may enter it, and parallel regions use the threads

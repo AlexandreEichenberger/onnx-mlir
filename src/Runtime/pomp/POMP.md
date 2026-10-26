@@ -35,6 +35,13 @@ near it:
   each fork passes exactly 1 argument.
 - clang passes one pointer per shared variable for zDNNx, and its largest region passes 5.
 
+**Nesting limit.** A thread can nest regions at most 256 levels deep, and aborts with a message
+beyond that. The limit applies equally to regions on its region stack and to foreign regions
+(S9), whose depth is kept in a field of the thread's per-thread word. Only the first 8 levels
+are recorded, and forks past them are serialized; the deeper ones are only counted. Real
+programs nest two or three levels; only unbounded recursion through parallel regions gets near
+the limit.
+
 Not supported, and absent from the archive so that their use fails at link time: reductions
 (`__kmpc_reduce*`), critical, atomic, single and master, tasks, dynamic and guided schedules,
 ordered, threadprivate, locks, cancellation, affinity, OMPT and offload. A static schedule kind
@@ -44,12 +51,11 @@ other than the two above aborts at run time.
 
 | Variable | Meaning |
 |---|---|
-| `OMP_THREAD_LIMIT` | In `[1, 64]`, initial thread included. Fixes the thread limit for the whole process, and takes precedence over any limit passed to `pomp_open_pool` (see "The thread limit"). If unset, the first `pomp_open_pool(limit)` gives it; until then the pool is closed and regions run on one thread. If set but invalid, it is ignored with a warning on stderr, as if unset. Nothing aborts |
+| `OMP_THREAD_LIMIT` | In `[1, 64]`, initial thread included. Fixes the thread limit for the whole process, and takes precedence over any limit passed to `pomp_open_pool` (see "The thread limit"). If unset, the first `pomp_open_pool(limit)` gives it; until then the pool is closed, regions run on one thread, and `omp_get_max_threads` and `omp_get_thread_limit` return 1, with one warning on stderr. If set but invalid, it is ignored with a warning on stderr, as if unset. Nothing aborts |
 | `OMP_NUM_THREADS` | `n` or `n1,n2`: default team size at levels 1 and 2, clamped to the limit once it is known. Default is the limit |
 | `OMP_MAX_ACTIVE_LEVELS` | 1 (default) or 2; 0 means 1 and larger values mean 2. As in libomp, a list in `OMP_NUM_THREADS` implies 2 |
 | `POMP_SPIN` | Spin iterations of any wait before it sleeps: an idle worker, the leader at the join, a thread in a barrier (default 200000; 0 sleeps immediately). Team waits yield after 4096 iterations of the spin |
-| `POMP_YIELD` | Under evaluation. Unset (the default): idle workers never yield while they spin, and team waits yield on every spin after 4096. Set to N: every wait yields once every N spins, as libomp does every 512 by default on Linux; 0 never yields |
-| `POMP_TREE_BARRIER` | Smallest team that uses the tree barrier instead of the central one. Default 5 on s390x, never elsewhere; 0 or 2 forces the tree, 65 forces central |
+| `POMP_TREE_BARRIER` | Smallest team that uses the tree barrier instead of the central one. Default 5 on s390x, never elsewhere; 0 or 2 forces the tree, 65 (`POMP_MAX_THREADS` + 1) forces central |
 
 ## Host interface (`pomp.h`)
 
@@ -501,8 +507,9 @@ run with one SMT thread per core gives the same ranking.
 fork/join at 4, 8 and 16 threads, against 0.40, 1.41 and 3.4 before. Adding sleeping team
 waits left them unchanged within noise: 0.40, 1.44 and 3.1–3.5 µs, with barriers at 0.18, 0.47
 and 0.74–0.94 µs. The tree barrier is
-*slower* there up to 16 threads (1.9 against 0.75 µs at 16), so the default keeps the central
-barrier on non-s390x targets.
+*slower* there at every size measured, up to 16 threads (1.9 against 0.75 µs at 16), so the
+default keeps the central barrier on non-s390x targets. Other targets, such as many-core x86 or
+AArch64 servers, were not measured.
 
 ## Language
 
@@ -817,6 +824,26 @@ OMP_THREAD_LIMIT=8 ./pomp_host_test reuse
 
 On macOS with Apple clang, use `-Xclang -fopenmp -I$(brew --prefix libomp)/include` for
 `-fopenmp`; no libomp is linked.
+
+## Tried and not kept: yielding while spinning, as libomp does
+
+libomp's spin waits call `sched_yield` once every 512 spins by default on Linux
+(`KMP_USE_YIELD=1`, `KMP_INIT_WAIT`/`KMP_NEXT_WAIT` in `kmp.h`); pomp's idle workers never yield,
+and its team waits yield on every spin only after 4096. As pomp loses about 2.8× from pinned to
+free threads where libomp loses nothing, a `POMP_YIELD=N` setting made every wait yield once
+every N spins. Measured on z17 with `test/run_z.sh` (µs, median of 5 runs):
+
+| Region overhead | pomp | N=512 | N=64 | libomp |
+|---|---|---|---|---|
+| T=2, free / pinned | 0.81 / 0.28 | 0.77 / 0.28 | 0.81 / 0.64 | 1.31 / 1.44 |
+| T=4, free / pinned | 1.32 / 0.47 | 1.36 / 0.47 | 1.31 / 1.05 | 1.85 / 1.63 |
+| T=8, free / pinned | 1.66 / 0.67 | 1.69 / 0.67 | 1.97 / 1.52 | 2.27 / 2.74 |
+| T=16, free / pinned | 2.30 / 1.60 | 2.36 / 1.61 | 2.58 / 2.22 | 2.76 / 3.42 |
+| 8x8 nested, free / pinned | 3.12 / 3.08 | 4.96 / 3.13 | 4.16 / 3.55 | 12.4 / 8.2 (hot teams) |
+
+Yielding does not close the gap: free runs are unchanged at N=512 and no better at N=64, and
+N=64 doubles the pinned cost, as a woken thread may find its CPU given away. The yield was
+removed; the gap between free and pinned threads is a matter of placement, not of spinning.
 
 ## Tried and not kept: team reuse from the Blue Gene/Q runtime
 

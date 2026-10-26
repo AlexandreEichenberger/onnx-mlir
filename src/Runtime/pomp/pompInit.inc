@@ -68,6 +68,19 @@ int Settings::setLimit(long limit) {
   return POMP_OK;
 }
 
+// pomp creates no threads: its workers are the host's threads lent through
+// pomp_enter_pool, and the limit says how many there can be. Without one, a
+// program that asks how many threads it may use gets 1, and is told why.
+void Settings::warnNoLimit() {
+  if (!noLimitSeen_.exchange(1))
+    fprintf(stderr,
+        "pomp: warning: omp_get_max_threads/omp_get_thread_limit return 1: "
+        "no thread limit is set yet (OMP_THREAD_LIMIT is unset or invalid, "
+        "and no pomp_open_pool(limit) with limit in [1, %d] has been called); "
+        "until one is, parallel regions run on one thread\n",
+        kMaxThreads);
+}
+
 void Settings::init() {
   const char *s, *end;
   long v;
@@ -107,11 +120,6 @@ void Settings::init() {
   s = getenv("POMP_SPIN");
   if (s && (v = parseInt(s, nullptr)) >= 0)
     spin_ = v;
-
-  yield_ = kYieldUnset;
-  s = getenv("POMP_YIELD");
-  if (s && (v = parseInt(s, nullptr)) >= 0)
-    yield_ = v;
 
   // OMP_THREAD_LIMIT, if set, must be valid. If it is not set, or not valid,
   // the pool starts closed, and the first open that gives a limit opens it.

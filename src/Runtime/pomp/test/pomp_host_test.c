@@ -253,8 +253,10 @@ static void test_late(long cycles) {
         ++served;
     }
     CHECK(pomp_pool_size() == 0);
-    // An entry after the close, before the next open: refused at once.
-    CHECK(pomp_enter_pool(1) == POMP_ERR_CLOSED);
+    // An entry after the close, before the next open: refused at once. With
+    // a limit of 1 there is no slot 1, and the entry is refused as out of
+    // range instead.
+    CHECK(pomp_enter_pool(1) == (limit > 1 ? POMP_ERR_CLOSED : POMP_ERR_SLOT));
     // While closed, regions run on the leader alone.
     CHECK(run_region() == 1);
   }
@@ -295,11 +297,13 @@ static void test_swap(long cycles) {
   }
   host_stop();
   // A former member as the initial thread: a fresh thread that ran
-  // pomp_enter_pool before.
+  // pomp_enter_pool before. With a limit of 1 there is no slot to enter.
   {
     pthread_t t;
-    pthread_create(&t, NULL, enter_once, (void *)(intptr_t)1);
-    pthread_join(t, NULL); // Pool is closed: refused, returns at once.
+    if (limit > 1) {
+      pthread_create(&t, NULL, enter_once, (void *)(intptr_t)1);
+      pthread_join(t, NULL); // Pool is closed: refused, returns at once.
+    }
     pthread_create(&t, NULL, leader_turn, NULL);
     pthread_join(t, NULL);
     CHECK(atomic_load(&leader_turn_done) == 1);

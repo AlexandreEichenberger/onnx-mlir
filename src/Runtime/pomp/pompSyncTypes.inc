@@ -23,14 +23,82 @@ class Team;
 class Thread;
 struct Level;
 
-// The team's synchronization is in three components, each a member of Team
-// with its code in a section of its own: TeamWait, the waits of members and
-// their wake-ups ("Waits inside a team"); TeamJoin, the end of a region
-// ("Join"); and TeamBarrier ("Barriers").
+// This file covers the synchronization of the threads of a team while they
+// run a region: the join at its end, and the barriers inside it.
+//
+// A worker also waits outside of any team: in the pool, for a team to
+// recruit it (Pool::waitWork, in pompPool.inc). After its done report at
+// the join of one region, it waits there for the next region it takes part
+// in, which may be of another team. It uses the same spin-then-sleep
+// protocol, but on pool words (`go`, `sleeping`), woken by the recruiter.
+// That wait is not covered here, and uses none of the types below: it has
+// its own code and its own mask of sleepers. It shares with them only the
+// thread's post, on which both sleep, and the thread's wake-up line, which
+// holds both its `go` and its MemberSync, used in turn.
+//
+// The rest of this file is about the team's synchronization, in two layers.
+//
+// What members wait for: two protocols, which differ in who waits.
+//   TeamJoin     the end of a region ("Join"). One way: each member other
+//                than the leader reports done, and only the leader waits. A
+//                member does not wait after its report; it goes back to the
+//                pool, whose idle wait (pompPool.inc) is the "release" of
+//                the join. Hence a done flag per member, which the leader
+//                polls, and no release step.
+//   TeamBarrier  a barrier inside the region (__kmpc_barrier, "Barriers").
+//                All to all: every member waits until all have arrived, and
+//                then all go on in the same region. Central counter for
+//                small teams, tree for large ones.
+//
+// How they wait: TeamWait ("Waits inside a team"), the one wait that both
+// use. Spin, yield, then sleep on the waiter's own post, with its bit set in
+// the team's `sleepers`. A protocol stores its flag first, then calls wake()
+// for the threads that read that flag, so no wake-up is lost. This is the
+// same protocol as the pool's idle wait, but on a word of the team: a team's
+// wake-ups look only at the team's members, and a thread is in at most one
+// wait at a time, idle or in a team.
+//
+// Where the state lives. A member is one of the team's nth threads: tid 0,
+// the leader, and the workers it recruited, tids 1 .. nth-1. Each protocol
+// has a team part and a member part, and needs both:
+//   Team part    one copy per team, in Team, shared by the members: what all
+//                of them must agree on.
+//   Member part  one copy per member, written only by that member, so that
+//                the writes are spread over lines of their own. Either
+//                private, or read by exactly one other thread:
+//     MemberBarrier  in the member's region-stack entry, private: its count
+//                    of barriers passed, and its links in the barrier tree.
+//     MemberSync     on the thread's wake-up line, the flags that one other
+//                    thread polls: `done`, for the leader at the join, and
+//                    TreeFlags, for the parent or children in the tree
+//                    barrier. The leader uses none. Per thread rather than
+//                    per team, as a thread is a non-leader member of at
+//                    most one team at a time.
+//
+// The two parts of each protocol:
+//
+//                    team part                    member part
+//   join             TeamJoin::region_: tags      MemberSync::done: one flag
+//                    `done`, so that a value of   per member, which the
+//                    an earlier region never      leader polls
+//                    matches
+//   central barrier  TeamBarrier::count_ and      MemberBarrier::passed: the
+//                    epoch_: the barrier itself,  member's barrier count,
+//                    written by every member      kept but not waited on
+//   tree barrier     Team::barSeq_ and the team   MemberBarrier (count, tree
+//                    tag: the base of the values  links) and TreeFlags: the
+//                    that the flags wait for      barrier itself, one writer
+//                                                 and one reader per flag
+//
+// The central barrier accepts contention on its shared lines, which is cheap
+// on a few cores. The tree and the join avoid it: per-member flags on
+// distinct lines are read in parallel, where one shared line is written in
+// turn.
 
-// Waits of a team's members, leader included, on flags of the team: spin,
-// then sleep on the thread's own post. A waker publishes what it waits for,
-// then wakes the waiters it may concern; see "Waits inside a team".
+// The wait primitive of the team's protocols (TeamJoin, TeamBarrier): wait
+// until a condition on a flag holds, then sleep if it takes too long. It
+// defines no flags of its own; `sleepers_` only records who sleeps, so that
+// a waker posts only to those threads. See "Waits inside a team".
 class TeamWait {
 public:
   // Wait, as `self`, until `cond` holds.
@@ -49,9 +117,13 @@ private:
   alignas(kCacheLine) AtomicMask sleepers_;
 };
 
-// The join: each member other than the leader reports done on its own sync
-// line (MemberSync::done), and the leader polls them. The values are tagged
-// with the region's number.
+// The end of a region: members report, the leader waits. Unlike a barrier,
+// the members do not wait for one another, or for the leader. Each member
+// other than the leader stores its done flag (MemberSync::done) and leaves
+// the team. The leader polls the flags one by one: loads of distinct lines
+// overlap, where increments of one counter would serialize. The values are
+// tagged with the region's number, so a flag left by an earlier region
+// never matches.
 class TeamJoin {
 public:
   // Leader, before waking the members.
@@ -69,6 +141,9 @@ private:
   uint64_t region_ = 0;
 };
 
+// A barrier inside a region. Unlike the join, every member waits, and all of
+// them continue in the region.
+//
 // Barrier state, in parts that each stay with the data they are used with:
 // TeamBarrier and Team::barSeq_ in the team, MemberBarrier in each member's
 // region-stack entry, and TreeFlags on each member's wake-up line. The design

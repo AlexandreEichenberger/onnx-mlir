@@ -17,8 +17,11 @@
 // -----------------------------------------------------------------------------
 // Waits inside a team (join, barriers)
 //
+// The wait primitive that the join and the barriers below both use; it
+// decides how to wait, they decide on what.
+//
 // The same protocol as the idle wait, with the team's `sleepers` word in place
-// of `sleeping`, and the bit of the waiter's tid. A thread is in at most one
+// of `sleeping`, and the bit of the waiter's slot. A thread is in at most one
 // wait at a time, so it sleeps on its own slot's post, and every post is
 // consumed by the wait that set the bit. A waker publishes what it waits for,
 // then calls TeamWait::wake; a seq_cst fence on each side orders the publish
@@ -52,24 +55,15 @@ private:
   uint64_t value_;
 };
 
-// Spin, then sleep after POMP_SPIN iterations in all. While spinning, yield,
-// which lets an oversubscribed waitee run: by default on every spin after
-// kYieldSpin, and with POMP_YIELD once every that many spins.
-//
-// Inlined: the condition is a load and a compare, and the spin loop is the
-// whole cost of a short wait.
+// Spin, then yield, which lets an oversubscribed waitee run, then sleep after
+// POMP_SPIN iterations in all.
 template <class Cond>
-__attribute__((always_inline)) inline void TeamWait::until(
-    Thread &self, Cond cond) {
+void TeamWait::until(Thread &self, Cond cond) {
   long i = 0;
-  long every = settings.yieldEvery();
-  SpinYield spinner(every == kYieldUnset ? 0 : every);
   SlotMask me = SlotMask::of(self.slot());
   while (!cond()) {
     if (i++ < settings.spin()) {
-      if (every != kYieldUnset)
-        spinner.spin();
-      else if (i < kYieldSpin)
+      if (i < kYieldSpin)
         relax();
       else
         sched_yield();

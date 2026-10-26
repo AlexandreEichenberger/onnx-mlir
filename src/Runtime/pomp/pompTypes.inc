@@ -34,7 +34,7 @@ struct Level {
 // tid and size, which are 0 and 1 outside of any region and in a serialized
 // one, or for its team membership, which only an active region has; how the
 // entries are kept is not theirs to see. Regions past kMaxDepth are only
-// counted: forks there are serialized.
+// counted: forks there are serialized. Past kMaxNesting, a push aborts.
 //
 // A worker starts at its leader's depth and active level (startAt): the
 // entries below that depth are the leader's, on the leader's own stack, and
@@ -304,6 +304,8 @@ public:
   int setLimit(long limit);
 
   int limit() const { return limit_.load(Order::Relaxed); }
+  // Warn once per process that no limit is set, so regions run on one thread.
+  void warnNoLimit();
   // The limit, ordered before the reads of the descriptors that follow.
   int limitAcquire() const { return limit_.load(Order::Acquire); }
   // Slots 0..limit-1.
@@ -315,8 +317,6 @@ public:
   }
   int maxActive() const { return maxActive_; }
   long spin() const { return spin_; }
-  // POMP_YIELD: spins between yields in every wait, or kYieldUnset.
-  long yieldEvery() const { return yield_; }
   int treeMin() const { return treeMin_; }
 
 private:
@@ -335,8 +335,8 @@ private:
   AtomicMask limitSlots_;
   Atomic<int> nthreads_[kMaxActive]; // Default team sizes.
   Atomic<int> limitMismatchSeen_;
+  Atomic<int> noLimitSeen_;
   long spin_ = 0;
-  long yield_ = kYieldUnset;
   int treeMin_ = 0; // Team size from which the tree barrier is used.
 };
 
