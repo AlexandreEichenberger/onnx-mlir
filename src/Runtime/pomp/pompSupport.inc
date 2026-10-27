@@ -278,7 +278,9 @@ struct CallTable<Args<N...>> {
 // Call `fn` with the gtid and tid pointers it takes, and argv[0..argc-1].
 void invoke(Microtask fn, int32_t gtid, int32_t tid, int argc, void **argv) {
   using Table = CallTable<FirstArgs<kMaxArgs + 1>::Type>;
-  if (argc < 0 || argc > kMaxArgs)
+  if (argc < 0)
+    fatal("negative argument count for an outlined function");
+  if (argc > kMaxArgs)
     fatal("too many arguments to an outlined function");
   Table::callers[argc](fn, &gtid, &tid, argv);
 }

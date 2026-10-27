@@ -184,7 +184,9 @@ void __kmpc_fork_call(void *, int32_t argc, Microtask fn, ...) {
   void *argv[kMaxArgs];
   va_list ap;
   settings.ensureInit();
-  if (argc < 0 || argc > kMaxArgs)
+  if (argc < 0)
+    fatal("negative argument count for an outlined function");
+  if (argc > kMaxArgs)
     fatal("too many arguments to an outlined function");
   va_start(ap, fn);
   for (int32_t i = 0; i < argc; ++i)

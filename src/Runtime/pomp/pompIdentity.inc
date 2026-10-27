@@ -228,9 +228,18 @@ public:
   SlotMask fetchSet(SlotMask m, Order o = Order::SeqCst) {
     return SlotMask::fromBits(bits_.fetchOr(m.bits(), o));
   }
+  // Remove the slots of `m`; return the whole set before.
   SlotMask fetchClear(SlotMask m, Order o = Order::SeqCst) {
     return SlotMask::fromBits(bits_.fetchAnd(~m.bits(), o));
   }
+  // Clear the slots of `m`; return those of them that this call cleared,
+  // that is, those that were set until now. Of threads that race to clear a
+  // slot, exactly one gets it back.
+  SlotMask clearAndReport(SlotMask m, Order o = Order::SeqCst) {
+    return fetchClear(m, o) & m;
+  }
+  // If the set is `expected`, replace it with `desired` and return true;
+  // else, or on a spurious failure, load the set into `expected`.
   bool compareExchangeWeak(SlotMask &expected, SlotMask desired,
       Order success = Order::SeqCst, Order failure = Order::SeqCst) {
     uint64_t e = expected.bits();

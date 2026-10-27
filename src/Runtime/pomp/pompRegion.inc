@@ -19,8 +19,10 @@
 // -----------------------------------------------------------------------------
 
 inline void RegionStack::pushActive(const Level &l) {
-  if (depth_ >= kMaxDepth || l.nth < 2)
-    fatal("internal: active region past the maximum depth or of one thread");
+  if (depth_ >= kMaxDepth)
+    fatal("internal: active region past the maximum depth");
+  if (l.nth < 2)
+    fatal("internal: active region of one thread");
   levels_[depth_] = l;
   depth_++;
   active_++;
@@ -30,7 +32,7 @@ inline void RegionStack::pushSerialized() {
   if (depth_ >= kMaxNesting)
     fatal("regions nested too deeply");
   if (depth_ < kMaxDepth)
-    levels_[depth_] = Level{nullptr, 0, 1, MemberTreeBarrier()};
+    levels_[depth_] = Level{nullptr, 0, 1, MemberBarrier()};
   depth_++;
 }
 
@@ -42,6 +44,9 @@ inline void RegionStack::pop() {
   if (depth_ < kMaxDepth && levels_[depth_].nth > 1)
     active_--;
 }
+
+// In queries below, the top is nullptr if there is none or it is past
+// kMaxDepth, we have by definition a serialized region.
 
 inline int32_t RegionStack::topTid() const {
   const Level *l = recordedTop();
@@ -135,7 +140,7 @@ void runForeign(Microtask fn, int32_t argc, void **argv) {
 }
 
 // -----------------------------------------------------------------------------
-// Fork / join
+// Team: Fork / join
 // -----------------------------------------------------------------------------
 
 Level Team::levelFor(int32_t tid) const {
@@ -143,7 +148,7 @@ Level Team::levelFor(int32_t tid) const {
   l.team = const_cast<Team *>(this);
   l.tid = tid;
   l.nth = nth_;
-  l.bar = tree_.enter(*this, tid);
+  l.bar = initMemberBarrier(tid);
   return l;
 }
 
@@ -179,7 +184,6 @@ void Team::launch(SlotMask workers, int32_t level, int32_t depth, Microtask fn,
   depth_ = depth;
   join_.startRegion();
   workers_ = workers;
-  central_.startRegion();
   if (level_ == 1 && settings.maxActive() > 1)
     partition();
 
@@ -191,9 +195,9 @@ void Team::launch(SlotMask workers, int32_t level, int32_t depth, Microtask fn,
   pool.wakeSleeping(workers);
 }
 
-void Team::join(Thread &leader, uint64_t bar) {
+void Team::join(Thread &leader, uint64_t uniqueBarrierId) {
   TeamJoin::wait(*this, leader);
-  tree_.endRegion(bar);
+  endLeaderBarrier(uniqueBarrierId);
 }
 
 void Team::runMember(Thread &self, int32_t slot, int32_t tid) {
@@ -245,9 +249,9 @@ void Thread::fork(
       workers, regions_.active() + 1, regions_.depth(), fn, argc, argv);
   regions_.pushActive(team->levelFor(0));
   invoke(fn, gtid, 0, argc, argv);
-  uint64_t bar = regions_.activeTop()->bar.passed;
+  uint64_t uniqueBarrierId = regions_.activeTop()->bar.currUniqueBarrierId;
   regions_.pop();
-  team->join(*this, bar);
+  team->join(*this, uniqueBarrierId);
   pool.returnWorkers(workers);
 }
 

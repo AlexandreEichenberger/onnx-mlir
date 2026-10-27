@@ -32,12 +32,23 @@
 // and sleeps again.
 // -----------------------------------------------------------------------------
 
+// The assignment, then the bump of `go` that publishes it (seq_cst).
+inline void Thread::assign(Team *team, int32_t tid) {
+  wake_.team = team;
+  wake_.tid = tid;
+  wake_.go.fetchAdd(1);
+}
+
+inline void Pool::wakeSleeping(SlotMask workers) {
+  wakeSleepers(sleeping_.load() & workers);
+}
+
 // Post to the sleepers among `workers` whose sleeping bit this call clears.
 // Return the number of posts.
 int Pool::wakeSleepers(SlotMask workers) {
   if (!workers)
     return 0;
-  SlotMask m = sleeping_.fetchClear(workers) & workers;
+  SlotMask m = sleeping_.clearAndReport(workers);
   for (int slot : m)
     threads[slot].post();
   return m.count();
@@ -74,8 +85,10 @@ bool Pool::waitWork(Thread &t, SlotMask self, uint64_t &last) {
     g = t.epoch();
     bool rel = bool(released_.load() & self);
     if (g != last || rel) {
-      // A waker that cleared the bit has posted, or will: consume it.
-      if (!(sleeping_.fetchClear(self) & self))
+      // Leave the sleepers. If a waker cleared our bit first, it has posted
+      // or will: wait for that post, so that it does not stay pending and
+      // end a later sleep of this thread.
+      if (!sleeping_.clearAndReport(self))
         t.waitPost();
       break;
     }
@@ -98,6 +111,17 @@ bool Pool::waitWork(Thread &t, SlotMask self, uint64_t &last) {
 
 SlotMask Pool::idle() const {
   return settings.limitSlots() - busy_.load(Order::Relaxed);
+}
+
+inline SlotMask Team::cachedPick(int want, SlotMask idle) const {
+  return cachedReq_ == want && cachedPick_ && !(cachedPick_ - idle)
+             ? cachedPick_
+             : SlotMask();
+}
+
+inline void Team::remember(int want, SlotMask pick) {
+  cachedReq_ = want;
+  cachedPick_ = pick;
 }
 
 SlotMask Pool::recruit(Team &team, int want, SlotMask prefer) {

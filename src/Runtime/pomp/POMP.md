@@ -541,7 +541,7 @@ namespace:
 |---|---|
 | `pompSupport.inc` | Code not specific to pomp: `POMP_CONSTINIT`, `fatal`, `relax`, `Atomic<T>`, `Mutex`, `Condition`, `ScopedLock<T>`, `Post`, and `invoke`, the call of an outlined function through its exact type |
 | `pompIdentity.inc` | Slot sets, and the per-thread word |
-| `pompSyncTypes.inc` | The types of the synchronization inside a team, which `Team` and `Thread` hold by value: `TeamWait`, `TeamJoin`, `TeamCentralBarrier`, `TeamTreeBarrier`, `MemberTreeBarrier`, `TreeFlags`, `MemberSync` |
+| `pompSyncTypes.inc` | The types of the synchronization inside a team, which `Team` and `Thread` hold by value: `TeamWait`, `TeamJoin`, `TeamCentralBarrier`, `TeamTreeBarrier`, `MemberBarrier`, `TreeFlags`, `MemberSync` |
 | `pompTypes.inc` | The descriptors and the globals: the region stack, `Team`, `Thread`, `Pool`, `Settings`, `Root` |
 | `pompInit.inc` | Settings from the environment, the thread limit and the allocation of the descriptors |
 | `pompPool.inc` | The idle wait, recruitment, and the host protocol of the pool |
@@ -699,31 +699,35 @@ line it was polling, and a leader that forks the same team again already holds t
 does not disturb a leader polling `done`. That is 1 line per slot for synchronization, where
 one line per member of each of the 65 teams would be 65.
 
-The values are tagged with the team, so that a value left in a line by a previous team never
-matches: value *n* of a team's counter is *n*·65 + the team's index (the leader's slot for a
-level-2 team, 64 for the root's). Every wait tests for equality, and nothing is ever reset.
-Counters are bumped before use, so no value is 0, which every line holds at first. A line keeps
+The values are unique ids, so that a value left in a line by an earlier region, barrier or
+team never matches. A team has two sequences of ids, one for its joins and one for its tree
+barriers, each seeded with the team's index (the leader's slot for a level-2 team, 64 for the
+root's); each new id is the last one plus 65, the number of teams. So every id of a team is its
+index modulo 65, and two teams never meet, and a team's ids only grow. Every wait tests for
+equality, and nothing is ever reset. Ids are advanced before use, so no id is 0, which every
+line holds at first. A line keeps
 its `done` until the leader has read it, as the leader returns its workers to the pool only
 after the join.
 
-**Barrier.** The compiler emits one after every worksharing loop. Each thread counts the
-barriers it has passed in its region-stack entry. That count starts from the team's count at
-the end of the previous region, which is the same for every member.
+**Barrier.** The compiler emits one after every worksharing loop. For the tree barrier, each
+thread keeps the unique id of its current barrier in its region-stack entry. The id starts from
+the id of the team's last barrier, the same for every member, and advances by 65 at each
+barrier.
 
 - *Central*, for teams below `POMP_TREE_BARRIER`: each arriving thread increments the team's
   counter. The last one resets it, bumps the barrier epoch and wakes any member that sleeps; the
   others wait until the epoch changes.
 - *Tree*, from `POMP_TREE_BARRIER` threads (default 5 on s390x): tid *t* is the parent of tids
-  4*t*+1 … 4*t*+4. A thread waits until each child's `arrive` holds the barrier's count,
+  4*t*+1 … 4*t*+4. A thread waits until each child's `arrive` holds the barrier's id,
   publishes its own `arrive`, and waits for its `release`. Thread 0 does not wait for a
   release. Each thread then sets its children's `release`. The depth is ⌈log₄ T⌉. Each member
   finds the slots of its parent and children once, on entry to the region, from the workers
   mask, so that a barrier does no lookup.
 
-**Join.** A member stores the region number into its `done`, with release ordering. After
+**Join.** A member stores the region's unique join id into its `done`, with release ordering. After
 that it touches only the team's `sleepers` word, to wake the leader if it sleeps; the leader's
-slot comes from the team's address. The leader waits for each member's `done` to hold that number. Then
-it records the team's barrier count for the next region, and owns the descriptor again. A
+slot comes from the team's address. The leader waits for each member's `done` to hold that id. Then
+it records the id of the team's last barrier for the next region, and owns the descriptor again. A
 member's wake-up may still be in flight when the leader starts its next region on the team and
 waits there. Like any post, it then only makes the leader re-check, and its bit is the one that
 the leader's new wait set, so the post is consumed by that wait.

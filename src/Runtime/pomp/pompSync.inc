@@ -30,9 +30,11 @@
 // condition.
 // -----------------------------------------------------------------------------
 
+// -----------------------------------------------------------------------------
 // Conditions of the waits, as function objects.
 
-// The flag holds exactly `value`.
+// The flag holds exactly `value`. Save the address (to be polled) and the
+// desired value.
 class FlagIs {
 public:
   FlagIs(const Atomic<uint64_t> &flag, uint64_t value)
@@ -44,7 +46,8 @@ private:
   uint64_t value_;
 };
 
-// The flag no longer holds `value`.
+// The flag no longer holds `value`,  Save the address (to be polled) and the
+// undesired value.
 class FlagLeaves {
 public:
   FlagLeaves(const Atomic<uint64_t> &flag, uint64_t value)
@@ -56,25 +59,34 @@ private:
   uint64_t value_;
 };
 
+// -----------------------------------------------------------------------------
+// TeamWait
+
 // Spin, then yield, which lets an oversubscribed waitee run, then sleep after
 // POMP_SPIN iterations in all.
 template <class Cond>
 void TeamWait::until(Thread &self, Cond cond) {
   long i = 0;
-  SlotMask me = SlotMask::of(self.slot());
+  SlotMask meMask = SlotMask::of(self.slot());
   while (!cond()) {
     if (i++ < settings.spin()) {
       if (i < kYieldSpin)
-        relax();
+        relax(); // Initially just relax to avoid yielding too early.
       else
-        sched_yield();
+        sched_yield(); // Then yield to let a waitee run, before sleeping.
       continue;
     }
-    sleepers_.fetchSet(me);
+    // Now sleep by (1) setting our bit in the mask; (2) fencing, so that a
+    // waker sees the bit or we see its publish; (3) testing cond again, to
+    // catch a waker that published before the bit was set (explanation
+    // below); (4) if cond still fails, waiting for the post and looping.
+    sleepers_.fetchSet(meMask);
     fence(Order::SeqCst);
     if (cond()) {
-      // A waker that cleared the bit has posted, or will: consume it.
-      if (!(sleepers_.fetchClear(me) & me))
+      // Leave the sleepers. If a waker cleared our bit first, it has posted
+      // or will: wait for that post, so that it does not stay pending and
+      // end a later sleep of this thread.
+      if (!sleepers_.clearAndReport(meMask))
         self.waitPost();
       break;
     }
@@ -87,7 +99,7 @@ void TeamWait::until(Thread &self, Cond cond) {
 inline SlotMask TeamWait::claimSleepers(SlotMask slots) {
   fence(Order::SeqCst);
   SlotMask s = sleepers_.load(Order::Relaxed) & slots;
-  return s ? sleepers_.fetchClear(s) & s : SlotMask();
+  return s ? sleepers_.clearAndReport(s) : SlotMask();
 }
 
 inline void TeamWait::wake(SlotMask slots) {
@@ -101,10 +113,10 @@ inline void TeamWait::wakeOne(int32_t slot) {
 }
 
 // -----------------------------------------------------------------------------
-// Join
+// TeamJoin
 //
 // The team calls it at three points of a region:
-//   Team::launch      startRegion   number the region
+//   Team::launch      startRegion   the region's unique join id
 //   Team::runMember   doneValue     on entry, and finish at the end
 //   Team::join        wait          the leader waits for every member
 // Polling one done flag per member: plain loads of distinct lines overlap,
@@ -112,8 +124,10 @@ inline void TeamWait::wakeOne(int32_t slot) {
 // member wakes the leader after its done flag.
 // -----------------------------------------------------------------------------
 
+inline void TeamJoin::startRegion() { currUniqueJoinId_ += kTeams; }
+
 inline uint64_t TeamJoin::doneValue(const Team &team) {
-  return team.tag(team.join_.region_);
+  return team.join_.currUniqueJoinId_;
 }
 
 // After the store, the leader may reuse the team; only the wake-up of the
@@ -121,8 +135,8 @@ inline uint64_t TeamJoin::doneValue(const Team &team) {
 // address, not from its contents. The line keeps `done` until the leader
 // reads it: the thread joins no other team before the leader returns it to
 // the pool, after the join.
-inline void TeamJoin::finish(Team &team, Thread &self, uint64_t value) {
-  self.sync().done.store(value, Order::Release);
+inline void TeamJoin::finish(Team &team, Thread &self, uint64_t done) {
+  self.sync().done.store(done, Order::Release);
   team.wait_.wakeOne(team.leaderSlot());
 }
 
@@ -140,10 +154,22 @@ inline void TeamJoin::wait(Team &team, Thread &leader) {
 // nowait, and for `#pragma omp barrier`; each member calls __kmpc_barrier,
 // which ends in Team::barrier.
 //
-// Two algorithms, chosen by team size (TeamTreeBarrier::usesTree), the same
-// for every member of a team, as all of them see the same size. Each has its
-// own state, below: TeamCentralBarrier, and TeamTreeBarrier with the
-// members' MemberTreeBarrier and TreeFlags.
+// Two algorithms, chosen by team size (Team::usesTreeBarriers), the same for
+// every member of a team, as all of them see the same size. Each has its own
+// state, below: TeamCentralBarrier, and TeamTreeBarrier with the members'
+// MemberBarrier and TreeFlags.
+//
+// The team calls into the barriers in three phases of a region, in this
+// order, and in each calls only the algorithm of its size, which touches only
+// its own state:
+//                                                     central    tree
+//   1. Team::levelFor  initMemberBarrier  each member  -          enter
+//   2. __kmpc_barrier  barrier            each member  wait       wait
+//   3. Team::join      endLeaderBarrier   leader       -          endRegion
+// Phase 1 runs in every member, leader included, unsynchronized: it reads
+// team fields that the wake-up published, and writes the member's own state.
+// Phase 3 runs after the join, which orders it after every member's last
+// barrier.
 //
 // Waiting. Every wait is TeamWait::until: spin, yield, then sleep with the
 // waiter's bit set in the team's `sleepers`. Every store that a waiter may
@@ -152,8 +178,32 @@ inline void TeamJoin::wait(Team &team, Thread &leader) {
 
 // The choice is by team size only, so that every member of a team makes the
 // same one.
-inline bool TeamTreeBarrier::usesTree(int32_t nth) {
+inline bool Team::usesTreeBarriers(int32_t nth) {
   return nth >= settings.treeMin();
+}
+
+// A team that uses the central barrier needs no member state: the default.
+inline MemberBarrier Team::initMemberBarrier(int32_t tid) const {
+  return usesTreeBarriers(nth_) ? tree_.enter(*this, tid) : MemberBarrier();
+}
+
+inline void Team::barrier(Thread &self, Level &top) {
+  if (usesTreeBarriers(top.nth))
+    TeamTreeBarrier::wait(*this, self, top);
+  else
+    central_.wait(*this, self, top);
+}
+
+inline void Team::endLeaderBarrier(uint64_t currUniqueBarrierId) {
+  if (usesTreeBarriers(nth_))
+    tree_.endRegion(currUniqueBarrierId);
+}
+
+// Both sequences, from the same seed: they are stored into different flags,
+// `done` and the tree flags, so they need not differ from each other.
+inline void Team::seedUniqueIds(int32_t index) {
+  join_.seed(index);
+  tree_.seed(index);
 }
 
 // -----------------------------------------------------------------------------
@@ -171,17 +221,11 @@ inline bool TeamTreeBarrier::usesTree(int32_t nth) {
 // members, as the epoch, read on arrival, tells each member which barrier
 // it waits for.
 //
-// Lifetime:
-//   Team::launch      startRegion   leader, before waking the members: reset
-//                                   the counter
-//   Team::barrier     wait          each member, at each barrier
+// Lifetime, for a team that uses it: only phase 2, `wait`. No setup: the
+// counter is 0 between barriers, as the last to arrive resets it, and so at
+// the start of every region, as a region ends only after every member has
+// left its last barrier. It starts at 0 too, as the descriptors are zeroed.
 // -----------------------------------------------------------------------------
-
-// No member is in a barrier of the team yet: the store needs no ordering
-// beyond the wake-up of the members, which publishes it.
-inline void TeamCentralBarrier::startRegion() {
-  count_.store(0, Order::Relaxed);
-}
 
 // The last member to arrive resets the count and bumps the generation, which
 // the others wait for.
@@ -196,10 +240,12 @@ inline void TeamCentralBarrier::wait(
     Team &team, Thread &self, const Level &top) {
   uint64_t epoch = epoch_.load(Order::Acquire);
   if (count_.fetchAdd(1, Order::AcqRel) == top.nth - 1) {
+    // Last to arrive: reset the count, bump the epoch, and wake the members.
     count_.store(0, Order::Relaxed);
     epoch_.store(epoch + 1, Order::Release);
     team.wait_.wake(team.members() - SlotMask::of(self.slot()));
   } else {
+    // Not last: wait for the epoch to move, which the last member does after.
     team.wait_.until(self, FlagLeaves(epoch_, epoch));
   }
 }
@@ -228,35 +274,41 @@ inline void TeamCentralBarrier::wait(
 // depth is log4(nth): 3 levels for 64 threads.
 //
 // State, kept with the data it is used with (see pompSyncTypes.inc):
-//   Team::tree_          TeamTreeBarrier: the count of barriers at the end
-//                        of the last region;
-//   Level::bar           MemberTreeBarrier, in the member's region-stack
-//                        entry: its count of barriers passed, and its tree
-//                        links;
+//   Team::tree_          TeamTreeBarrier: the unique id of the team's last
+//                        barrier, in any region;
+//   Level::bar           MemberBarrier, in the member's region-stack
+//                        entry: the unique id of its current barrier, and
+//                        its tree links;
 //   MemberSync::tree     TreeFlags, on the member's wake-up line: `arrive`
 //                        and `release`.
 //
-// Lifetime, the three points at which the team calls into the barrier:
-//   Team::levelFor    enter         each member, on entry to the region: its
-//                                   count, from the base, and its tree links
-//   Team::barrier     wait          each member, at each barrier
-//   Team::join        endRegion     leader, after the join: the base = its
-//                                   count, for the next region
+// Lifetime, the three phases, for a team that uses it:
+//   1. enter       each member, on entry to the region: its barrier id, the
+//                  team's last, and its tree links
+//   2. wait        each member, at each barrier: the next id, then the
+//                  barrier on it
+//   3. endRegion   leader, after the join: the team's last id = its own, for
+//                  the next region
 //
-// Values instead of resets. Each member counts the barriers it passed in the
-// team (MemberTreeBarrier::passed), and the k-th barrier waits for value k,
-// tagged with the team (Team::tag): a flag is never reset, it is overwritten
-// by the next barrier's value, and a value left by an earlier barrier, or by
-// another team that used the same thread, never matches. As all members pass
-// the same barriers, their counts agree; the count of the leader at the join
-// is the team's, and the next region starts from it, so the tags keep
-// growing across regions of the team rather than restarting at 1. Only tree
-// barriers count: in a region with the central barrier, the counts stay at
-// the base, which is enough, as only tree barriers store the values.
+// Values instead of resets. Each barrier waits for its unique id (see
+// "Unique ids" in pompSyncTypes.inc): a flag is never reset, it is
+// overwritten by the next barrier's id, and a value left by an earlier
+// barrier, or by another team that used the same thread, never matches.
+// Each member keeps the id in its own entry (currUniqueBarrierId), starts
+// from the team's last on entry, and advances it by kTeams at each barrier;
+// as all members pass the same barriers, their ids agree. The leader's id at
+// the join is the team's last, from which the next region continues, so the
+// ids keep growing across regions of the team rather than restarting. A
+// region in which the team uses the central barrier touches none of this:
+// the team's last id waits, unchanged, for the next region that uses the
+// tree.
+//
+// The team's last id only grows, so that a flag never sees a value twice: a
+// team's size may change from region to region, and with it the algorithm,
+// but the team's id is never lowered.
 // -----------------------------------------------------------------------------
 
-// The count starts from the team's at the end of the previous region, the
-// same for every member.
+// The id starts from the team's last, the same for every member.
 //
 // Tree links: the barrier needs slots, to reach the flags of other threads,
 // but the tree is built on tids. Tid 0 is the leader; tid t > 0 is the t-th
@@ -267,13 +319,11 @@ inline void TeamCentralBarrier::wait(
 // region, here, so that a barrier does no lookup. Example, 12 threads on
 // slots 0 (leader), 3, 5, 6, 8, ..: tid 1 is slot 3, its children are tids
 // 5..8, its parent tid 0, slot 0.
-inline MemberTreeBarrier TeamTreeBarrier::enter(
+inline MemberBarrier TeamTreeBarrier::enter(
     const Team &team, int32_t tid) const {
-  MemberTreeBarrier m;
-  m.passed = base_;
+  MemberBarrier m;
+  m.currUniqueBarrierId = lastUniqueBarrierId_;
   int32_t nth = team.nth_;
-  if (!usesTree(nth))
-    return m;
   SlotMask workers = team.workers_;
   int32_t first = kTreeArity * tid + 1;
   int32_t n = nth - first;
@@ -287,6 +337,12 @@ inline MemberTreeBarrier TeamTreeBarrier::enter(
                          : (workers - workers.lowest(ptid - 1)).lowest();
   }
   return m;
+}
+
+// Every member passed the same barriers. Written after the join, as members
+// read it on entry.
+inline void TeamTreeBarrier::endRegion(uint64_t currUniqueBarrierId) {
+  lastUniqueBarrierId_ = currUniqueBarrierId;
 }
 
 // Each thread waits for its children to arrive, reports its own arrival to
@@ -308,8 +364,8 @@ inline MemberTreeBarrier TeamTreeBarrier::enter(
 // `arrive` only after this barrier's `release`, which its parent sets only
 // after this barrier's `arrive`.
 void TeamTreeBarrier::wait(Team &team, Thread &self, Level &top) {
-  MemberTreeBarrier &m = top.bar;
-  uint64_t v = team.tag(++m.passed);
+  MemberBarrier &m = top.bar;
+  uint64_t v = m.currUniqueBarrierId += kTeams;
   // Gather: all of this member's subtree has arrived.
   for (int c : m.children)
     team.wait_.until(self, FlagIs(threads[c].sync().tree.arrive, v));

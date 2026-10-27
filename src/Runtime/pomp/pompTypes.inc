@@ -26,7 +26,7 @@ struct Level {
   Team *team = nullptr; // nullptr for a serialized (team of one) region.
   int32_t tid = 0;
   int32_t nth = 0;
-  MemberTreeBarrier bar;
+  MemberBarrier bar;
 };
 
 // A thread's regions, innermost on top, with the number of them that are
@@ -83,38 +83,35 @@ private:
 // by the members, and owned by the leader again after the join.
 class Team {
 public:
+  // At allocation: seed the team's unique ids, of its joins and tree
+  // barriers, with `index`, its index in `teams` (see "Unique ids"), which
+  // index() cannot give yet, as `teams` is set after.
+  void seedUniqueIds(int32_t index);
+
+  // Team actions:
+
   // Leader: describe the work for the workers in `workers`, assign them, and
   // wake them. Members start at the leader's depth, at active level `level`.
   void launch(SlotMask workers, int32_t level, int32_t depth, Microtask fn,
       int32_t argc, void **argv);
-  // Leader: wait for every member to finish, then pass `bar`, the leader's
-  // barrier count, to the next region.
-  void join(Thread &leader, uint64_t bar);
-  // Member `tid`, a worker of slot `slot`: run the work, then report done.
+  // Members: run the work as thread `self` in slot `slot` with assigned `tid`,
+  // then report done.
   void runMember(Thread &self, int32_t slot, int32_t tid);
-  // A barrier of the team, for the member at `top`: the algorithm of the
-  // team's size, the same for every member.
-  void barrier(Thread &self, Level &top) {
-    if (TeamTreeBarrier::usesTree(top.nth))
-      TeamTreeBarrier::wait(*this, self, top);
-    else
-      central_.wait(*this, self, top);
-  }
+  // Members: execute a barrier for the member at `top`.
+  void barrier(Thread &self, Level &top);
+  // Leader: wait for every member to finish, then pass `uniqueBarrierId`,
+  // the id of the leader's last barrier, to the next region.
+  void join(Thread &leader, uint64_t uniqueBarrierId);
 
+  // Team info:
+  // The number of threads in this team, leader included.
   int32_t size() const { return nth_; }
   // The region-stack entry of member `tid` in this region.
   Level levelFor(int32_t tid) const;
   // Reuse cache of the recruitment: the workers of the last request of
   // `want` workers, if all of them are among `idle`, or else none.
-  SlotMask cachedPick(int want, SlotMask idle) const {
-    return cachedReq_ == want && cachedPick_ && !(cachedPick_ - idle)
-               ? cachedPick_
-               : SlotMask();
-  }
-  void remember(int want, SlotMask pick) {
-    cachedReq_ = want;
-    cachedPick_ = pick;
-  }
+  SlotMask cachedPick(int want, SlotMask idle) const;
+  void remember(int want, SlotMask pick);
 
 private:
   // The components use the team's members, tags and waits.
@@ -126,22 +123,45 @@ private:
   // Every member, leader included.
   SlotMask members() const { return workers_ | SlotMask::of(leaderSlot()); }
   void partition();
-  // Value `n` of one of this team's counters, as stored in sync lines: n
-  // teams apart, plus the team's index, so that the values of two teams
-  // never meet. Counters start at 0 and are bumped before use, so a value is
-  // never 0, which a line holds at first.
-  uint64_t tag(uint64_t n) const { return n * kTeams + uint64_t(index()); }
   // Index of this team in `teams`, below kTeams: the leader's slot for a
   // level-2 team, the limit for the root's.
   int32_t index() const;
+  // Whether a team of `nth` threads uses the tree barrier, rather than the
+  // central one. Static, so that a barrier tests the size in the member's
+  // region-stack entry, and reads nothing of the team.
+  static bool usesTreeBarriers(int32_t nth);
+  // Barriers of the team, in three phases per region, each for the
+  // algorithm of the team's size only (see "Barriers" in pompSync.inc):
+  //   1. initMemberBarrier  each member, leader included, on entry;
+  //   2. barrier            each member, at each barrier of the region;
+  //   3. endLeaderBarrier   the leader, after the join.
+  // Phase 1 needs no synchronization among members, and phase 3 is ordered
+  // after every member's last barrier by the join.
+
+  // Phase 1 of the barriers. Member `tid`, leader included, on entry to the
+  // region: its barrier state. Members call it unsynchronized: it reads only
+  // team fields that the wake-up published, and writes only the member's own
+  // state.
+  MemberBarrier initMemberBarrier(int32_t tid) const;
+  // Phase 3 of the barriers. Leader, after the join: `currUniqueBarrierId`
+  // is the id of its last barrier, from which the next region continues.
+  // Kept in the team, not in the leader, because the leader's region-stack
+  // entry is gone after the region, and the root team's leader may change
+  // between regions. No member is in a barrier then, and none reads the id
+  // before the next region's wake-up.
+  void endLeaderBarrier(uint64_t currUniqueBarrierId);
+
+  // New cache line, forced: a Team starts one, as it is line-aligned (some
+  // of its members are). The fields up to central_ then take as many lines
+  // as they need: one where a line is 256 bytes (s390x), two where it is 128.
 
   // Work, written before the wake-up of the members.
   Microtask fn_ = nullptr;
   int32_t argc_ = 0;
   void *argv_[kMaxArgs] = {};
-  int32_t nth_ = 0;     // Team size, leader included.
-  int32_t level_ = 0;   // Active level of this team: 1 or 2.
-  int32_t depth_ = 0;   // Leader's nesting depth before this region.
+  int32_t nth_ = 0;   // Team size, leader included.
+  int32_t level_ = 0; // Active level of this team: 1 or 2.
+  int32_t depth_ = 0; // Leader's nesting depth before this region.
   TeamJoin join_;
   // Read by members on entry: with the fields they read then, not on lines
   // of its own as the central barrier is.
@@ -152,7 +172,10 @@ private:
   // Reuse cache: the last request and the workers it got.
   int32_t cachedReq_ = 0;
   SlotMask cachedPick_;
+  // New cache lines, forced: two, as `count_` and `epoch_` each start one
+  // (alignas in TeamCentralBarrier).
   TeamCentralBarrier central_;
+  // New cache line, forced: `sleepers_` starts one (alignas in TeamWait).
   TeamWait wait_;
 };
 
@@ -191,11 +214,7 @@ public:
   int32_t slot() const;
 
   // Recruiter: the assignment for the next wake-up, then the wake-up.
-  void assign(Team *team, int32_t tid) {
-    wake_.team = team;
-    wake_.tid = tid;
-    wake_.go.fetchAdd(1);
-  }
+  void assign(Team *team, int32_t tid);
   // Worker: the wake-up epoch, and the assignment it brings.
   uint64_t epoch(Order o = Order::SeqCst) const { return wake_.go.load(o); }
   Team &assignedTeam() const { return *wake_.team; }
@@ -245,16 +264,19 @@ private:
     MemberSync sync;
   };
   static_assert(sizeof(WakeLine) == kCacheLine, "one line");
+  // New cache line, forced: a Thread starts one, as WakeLine is line-aligned,
+  // and fills exactly one.
   WakeLine wake_;
 
-  // Owned by the thread itself, on lines of their own: the region stack is
-  // written at every barrier, while the leader may poll `sync`.
+  // New cache line, forced. Owned by the thread itself, on lines of their
+  // own: the region stack is written at every barrier, while the leader may
+  // poll `sync`. present_ and postReady_ follow on its last line.
   alignas(kCacheLine) RegionStack regions_;
   // kFree, kInPool or kLeaving. Read by another thread only when it enters
   // the pool as this slot.
   Atomic<int> present_;
   bool postReady_ = false; // See initPost.
-  // Sleep: only after a spin, on lines of its own.
+  // New cache line, forced. Sleep: only after a spin, on lines of its own.
   alignas(kCacheLine) Post post_;
 };
 
@@ -277,9 +299,7 @@ public:
   // The idle workers, as of a relaxed load.
   SlotMask idle() const;
   // Post to the sleepers among `workers`; see "Wake-up and sleep".
-  void wakeSleeping(SlotMask workers) {
-    wakeSleepers(sleeping_.load() & workers);
-  }
+  void wakeSleeping(SlotMask workers);
 
 private:
   bool waitWork(Thread &t, SlotMask self, uint64_t &last);
@@ -389,6 +409,6 @@ inline int32_t Team::leaderSlot() const {
   return i == settings.limit() ? 0 : i;
 }
 
+// Computations from the addresses of the descriptors, so no init needed.
 inline int32_t Team::index() const { return int32_t(this - teams); }
-
 inline int32_t Thread::slot() const { return int32_t(this - threads); }
