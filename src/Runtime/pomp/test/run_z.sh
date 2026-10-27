@@ -22,6 +22,7 @@
 #                                       # process may use); see "Placement"
 #   QUICK=1                             # shorter correctness runs
 #   ZB_MAP=1                            # also run pomp_zbench sections 1, 2
+#   PLACE_TRACE=1                       # also trace where threads run
 #
 # Builds pomp twice (with __thread, and with -DPOMP_USE_PTHREAD_KEY), runs the
 # tests against each, and times pomp against libomp.
@@ -319,19 +320,131 @@ if [ $HAVE_LIBOMP = 1 ]; then
   echo "plain libomp, which builds them again each region, is in the table above."
 fi
 
-note "placement: where threads run, empty fork/join (one run of 100000 per row)"
-echo "timed: each region timed alone. traced: each thread records its CPU in"
-echo "each region (slower), and regions are grouped by the farthest worker from"
-echo "the leader. Context switches are over the timed pass, all threads."
-for L in $LIMITS; do
-  for rt in $RUNTIMES; do
-    for place in free pinned; do
-      P=$([ $place = pinned ] && echo "POMP_TEST_CPUS=$CPUS")
-      echo "-- T=$L $rt $place"
-      env $LIBENV OMP_THREAD_LIMIT=$L OMP_NUM_THREADS=$L $P "$(exe $rt)" place 100000 2>&1
+# One row of the one-level table, saved for the best-of summary.
+one_row() { # T runtime place env-assignments...
+  local L=$1 rt=$2 place=$3 X b lo
+  shift 3
+  X=$(exe $rt)
+  b=$(runs5 env $LIBENV OMP_THREAD_LIMIT=$L OMP_NUM_THREADS=$L "$@" "$X" bench 100000)
+  lo=$(runs5 env $LIBENV OMP_THREAD_LIMIT=$L OMP_NUM_THREADS=$L "$@" "$X" loop 100000)
+  local fj ba re wo ov
+  fj=$(echo "$b" | med_of join)
+  ba=$(echo "$b" | med_of barrier)
+  re=$(echo "$lo" | med_of region)
+  wo=$(echo "$lo" | med_of work)
+  ov=$(echo "$lo" | med_of overhead)
+  printf '%-4s %-10s %-13s %9s %9s | %9s %9s %9s\n' $L $rt $place \
+    "$ov" "$ba" "$re" "$wo" "$fj"
+  echo "$ov $ba" > "$R/one-$L-$rt-$place"
+}
+
+# Placement, from the Linux topology: CPUs as a list; a CPU's core and chip.
+expand() { echo "$1" | tr ',' '\n' | while IFS=- read a b; do seq $a ${b:-$a}; done; }
+topo() { cat /sys/devices/system/cpu/cpu$1/topology/$2 2>/dev/null; }
+chip_of() { echo "$(topo $1 physical_package_id).$(topo $1 book_id).$(topo $1 drawer_id)"; }
+if [ -r /sys/devices/system/cpu/cpu0/topology/core_id ]; then
+  ALL=$(expand "$CPUS")
+  C0=$(echo "$ALL" | head -1)
+  # One CPU per core, in order: the first SMT thread of each core.
+  PERCORE=$(for c in $ALL; do
+    f=$(topo $c thread_siblings_list | sed 's/[-,].*//')
+    [ "$f" = "$c" ] && echo $c
+  done | paste -sd, -)
+  # A partner for CPU C0: its SMT sibling, a CPU of another core of its
+  # chip, and a CPU of another chip.
+  SIB= NEAR= FAR=
+  for c in $ALL; do
+    [ $c = $C0 ] && continue
+    if [ "$(chip_of $c)" != "$(chip_of $C0)" ]; then
+      FAR=${FAR:-$c}
+    elif [ "$(topo $c core_id)" = "$(topo $C0 core_id)" ]; then
+      SIB=${SIB:-$c}
+    else
+      NEAR=${NEAR:-$c}
+    fi
+  done
+
+  note "placement variants, one level, us per region (median of 5 runs of 100000)"
+  echo "pinned2: thread t on the t-th CPU of $CPUS (two threads per core, as 'pinned')."
+  echo "pinned1: thread t on the t-th of one CPU per core, $(echo $PERCORE | cut -c1-40)..."
+  echo "cores-close, cores-spread: libomp's own binding, OMP_PLACES=cores with"
+  echo "OMP_PROC_BIND=close or spread (pomp has no such binding)."
+  echo "The free and pinned rows above count in the best-of below."
+  printf '%-4s %-10s %-13s %9s %9s | %9s %9s %9s\n' T runtime place \
+    overhead barrier region work fork/join
+  for L in $LIMITS; do
+    for rt in $RUNTIMES; do
+      one_row $L $rt pinned1 POMP_TEST_CPUS=$PERCORE
+      if [ $rt = libomp ]; then
+        one_row $L $rt cores-close OMP_PLACES=cores OMP_PROC_BIND=close
+        one_row $L $rt cores-spread OMP_PLACES=cores OMP_PROC_BIND=spread
+      fi
     done
   done
-done
+  if [ $HAVE_LIBOMP = 1 ]; then
+    echo
+    echo "libomp's binding at T=4 (OMP_DISPLAY_AFFINITY), close then spread:"
+    for b in close spread; do
+      env $LIBENV OMP_THREAD_LIMIT=4 OMP_NUM_THREADS=4 OMP_PLACES=cores \
+        OMP_PROC_BIND=$b OMP_DISPLAY_AFFINITY=true \
+        OMP_AFFINITY_FORMAT="  $b: thread %n on CPUs %A" \
+        "$(exe libomp)" bench 10 2>&1 | grep "^  $b:" | sort -u
+    done
+
+    note "best placement of each runtime (us; ratio = libomp/pomp)"
+    echo "Each runtime at its own best place, among those above."
+    for metric in overhead barrier; do
+      echo
+      echo "$metric"
+      printf '%-4s %10s %-13s | %10s %-13s %6s\n' T libomp place pomp place ratio
+      for L in $LIMITS; do
+        set -- $(for rt in libomp pomp; do
+          for f in "$R"/one-$L-$rt-*; do
+            read o b < "$f"
+            v=$([ $metric = overhead ] && echo $o || echo $b)
+            echo "$v ${f##*/one-$L-$rt-}"
+          done | sort -n | head -1
+        done)
+        printf '%-4s %10s %-13s | %10s %-13s %6s\n' $L $1 $2 $3 $4 "$(ratio $3 $1)"
+      done
+    done
+  fi
+
+  note "T=2, worker placed by distance from the leader (CPU $C0), us (median of 5)"
+  echo "Both threads pinned. sibling: the leader's SMT sibling; chip: another core"
+  echo "of its chip; other: another chip."
+  printf '%-10s %-8s %5s %9s %9s %9s %9s\n' runtime worker cpu overhead fork/join barrier work
+  for rt in $RUNTIMES; do
+    for w in sibling:$SIB chip:$NEAR other:$FAR; do
+      c=${w#*:}
+      [ -n "$c" ] || continue
+      E="env $LIBENV OMP_THREAD_LIMIT=2 OMP_NUM_THREADS=2 POMP_TEST_CPUS=$C0,$c"
+      b=$(runs5 $E "$(exe $rt)" bench 100000)
+      lo=$(runs5 $E "$(exe $rt)" loop 100000)
+      printf '%-10s %-8s %5s %9s %9s %9s %9s\n' $rt ${w%%:*} $c \
+        "$(echo "$lo" | med_of overhead)" "$(echo "$b" | med_of join)" \
+        "$(echo "$b" | med_of barrier)" "$(echo "$lo" | med_of work)"
+    done
+  done
+fi
+
+# Where free and pinned threads run (section 6 of POMP_Z_Tuning.md), settled:
+# PLACE_TRACE=1 runs it again.
+if [ "${PLACE_TRACE:-0}" = 1 ]; then
+  note "placement: where threads run, empty fork/join (one run of 100000 per row)"
+  echo "timed: each region timed alone. traced: each thread records its CPU in"
+  echo "each region (slower), and regions are grouped by the farthest worker from"
+  echo "the leader. Context switches are over the timed pass, all threads."
+  for L in $LIMITS; do
+    for rt in $RUNTIMES; do
+      for place in free pinned; do
+        P=$([ $place = pinned ] && echo "POMP_TEST_CPUS=$CPUS")
+        echo "-- T=$L $rt $place"
+        env $LIBENV OMP_THREAD_LIMIT=$L OMP_NUM_THREADS=$L $P "$(exe $rt)" place 100000 2>&1
+      done
+    done
+  done
+fi
 
 ZB_TS=$(echo $LIMITS | tr ' ' ',')
 # Sections 1 and 2 (atomics, line transfer by topology) are settled: see
@@ -342,6 +455,8 @@ if [ "${ZB_MAP:-0}" = 1 ]; then
 fi
 note "pomp_zbench, sections 4 and 6 (fork/join designs; F is pomp today)"
 POMP_ZB_SECTIONS=4,6 "$B/pomp_zbench" $ZB_TS 2>&1 | sed -n '/^4\./,/^done/p' | sed '$d'
+note "pomp_zbench, section 7 (a waiting thread next to a computing one)"
+POMP_ZB_SECTIONS=7 "$B/pomp_zbench" 2>&1 | sed -n '/^7\./,/^done/p' | sed '$d'
 note "pomp_zbench, section 4, body = 2000 iterations"
 POMP_ZB_SECTIONS=4 POMP_ZB_WORK=2000 "$B/pomp_zbench" $ZB_TS 2>&1 |
   sed -n '/^4\./,/^done/p' | sed '$d'

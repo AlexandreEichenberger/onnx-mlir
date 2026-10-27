@@ -76,6 +76,7 @@ If the LPAR has more than 64 CPUs, also try a run restricted to one drawer, for 
 | 4. Fork/join designs | Which wake-up and join design to implement (see below) |
 | 5. Barrier designs | Whether a tree barrier pays off at these T |
 | 6. Anatomy of a region | Where F's region time goes: the wake loop, the workers' wake-up, and the leader's join after the last worker is done; and which worker is last |
+| 7. SMT interference | How much a waiting thread (asleep, spinning, spinning and yielding, spinning with a backoff) slows a computing one on its SMT sibling, another core of its chip, or another chip |
 
 Fork/join designs in section 4, all with spinning workers and an empty body unless
 `POMP_ZB_WORK` is set:

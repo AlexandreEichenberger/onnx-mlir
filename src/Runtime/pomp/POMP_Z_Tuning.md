@@ -29,13 +29,14 @@ last. How to run the tools: [test/ZBENCH.md](test/ZBENCH.md).
   Debug build, so the comparison is fair.
 - Times are medians, in µs or ns per region.
 
-## 1. pomp against libomp (runs at pomp f45b331d8, 509ff0353 and fbae69c24)
+## 1. pomp against libomp (runs at pomp f45b331d8, 509ff0353, fbae69c24 and 7d6fe3917)
 
 All runs: 552 stress runs with no failure, and digests that match libomp's. pomp's numbers agree
 within about 5% across the runs. The third run (fbae69c24) changes only libomp's free numbers by
 more: nested hot teams move 10–15% (8x8 14.4 µs against 12.4–12.9, 8x4 7.3 against 7.9–8.5), and
 the T=16 barrier rises from 0.75–0.78 to 0.94 µs. Those libomp free numbers are noisy, and the
-ratios that use them (8x8 free 4.6x, T=16 barrier free 1.4x) carry that noise.
+ratios that use them (8x8 free 4.6x, T=16 barrier free 1.4x) carry that noise. The fourth run
+(7d6fe3917) confirms it: pomp again within 5%, libomp's 8x8 hot free back down to 11.1 µs (3.3x).
 
 Overhead of a region with one static loop, as the ratio libomp / pomp:
 
@@ -55,12 +56,15 @@ Conclusions:
   like scheduler noise, and libomp shows it as well.
 - The pinned T=2 ratios (5.5x) are the least representative. CPUs 0 and 1 are SMT siblings
   (section 5), but a line moves between them no faster than between two cores of the same chip
-  (42 against 36–40 ns), so it is not a cheaper transfer that helps pomp there. A likelier cause
-  of pomp's 3x gap between pinned and free at T=2 is that free threads land on other chips
-  (about 75 ns away) or migrate. The free numbers are still the safer ones to quote.
-- libomp gets slower when pinned (T=16: 3.4 µs pinned, 2.6 µs free).
-- Open: libomp's `work` column is about 1.5x pomp's when pinned, for the same loop on the
-  same CPUs. Overhead subtracts `work`, so the ratios hold, but the cause is not known.
+  (42 against 36–40 ns), so it is not a cheaper transfer that helps pomp there. Section 6
+  explains pomp's 3x gap between pinned and free: free, Linux puts every worker on another chip,
+  without migrating it. The free numbers are still the safer ones to quote.
+- libomp gets slower when pinned (T=16: 3.4 µs pinned, 2.6 µs free). Section 6: pinned packs two
+  threads per core, free spreads them one per core, and libomp loses more to sharing a core than
+  it gains from the shorter distance.
+- libomp's `work` column is about 1.5x pomp's when pinned, for the same loop on the same CPUs.
+  Overhead subtracts `work`, so the ratios hold. Likely cause (section 6, not yet measured
+  directly): libomp's workers keep spinning on the leader's SMT sibling while it computes.
 - pomp's pinned overhead jumps from 0.65 to 1.6 µs between T=8 and T=16. Section 5 explains
   it: CPUs 0–11 are one chip, so T=16 is the first size with workers on another chip.
 
@@ -153,6 +157,8 @@ Conclusions:
   their wake-up first, so their 75 ns transfers overlap the near ones instead of coming last.
   At T up to 8 every worker is on the leader's chip and L equals J. **This is the one change
   worth making in pomp.**
+  Run 7d6fe3917 confirms it: T=16 region 0.293 against 0.382 µs for I, and 3.85 against
+  4.04 µs with a body of 2000.
 - With pomp's layout, the done flag sits on the line the leader just wrote, so the join tail
   at T=4 and 8 is about 75 ns, against 45–53 ns for F. The region is still shorter overall.
 
@@ -178,6 +184,41 @@ Conclusions:
 - A wake order or tree that follows the topology needs only one level: the leader's chip, and
   the rest.
 
+## 6. Where threads run, free and pinned (`pomp_test place`; run 7d6fe3917)
+
+The question: why does free placement cost pomp so much more than libomp (T=2 overhead: pomp
+0.27 µs pinned against 0.84 free; libomp 1.47 against 1.38)? The test times empty fork/join
+regions one by one, then records each thread's CPU in every region.
+
+Empty fork/join, p50 µs per region, and where the workers were:
+
+| T | pomp pinned | pomp free | libomp pinned | libomp free | pinned: workers | free: workers |
+|---|---|---|---|---|---|---|
+| 2 | 0.140 | 0.515 | 0.808 | 0.822 | SMT sibling | 100% other chip |
+| 4 | 0.223 | 0.661 | 0.865 | 1.032 | same chip | 100% other chip |
+| 8 | 0.309 | 0.861 | 1.397 | 1.198 | same chip | 86% other chip |
+| 16 | 0.750 | 1.060 | 1.581 | 1.509 | 27% other chip | 81–89% other chip |
+
+In every row: no migration (at most 0.01 per 1000 regions), almost no context switches, all CPUs
+horizontally polarized, and no outliers, except libomp free at T=16 (16 involuntary switches per
+1000 regions, 1.7% of regions over twice the median, likely its `sched_yield`).
+
+Conclusions:
+- **Free placement is not noisy, it is far.** Linux spreads the team one thread per core, and
+  onto other chips: at T=2 the worker is on another chip in 100% of regions. It does not move it
+  and does not preempt it. The cost is steady (p99 within 20% of p50).
+- **pomp pays for the distance, libomp barely does.** pomp's time is mostly line transfers, so
+  doubling their distance (38 to 75 ns) costs it 0.38 µs at T=2. That is more than the
+  difference in latency times the transfers we count per region; the cause of the rest is open.
+- **Pinned, two threads share each core, and that hurts libomp.** Pinned uses CPUs 0, 1, 2, ...
+  in order, both SMT threads of each core. libomp is slower pinned than free at T=8 and 16,
+  although every worker is closer, and its `work` is 1.45x slower pinned. pomp, which runs few
+  instructions per region, gains more from the distance than it loses to the shared core.
+- This supports the concern that SMT siblings waste compute, for libomp at least; it is not yet
+  measured for pomp's spinning threads next to a thread that computes.
+- **The two effects are mixed in "pinned" and "free"**: pinned is near and shares cores; free is
+  far and does not. Separating them needs placements that change one at a time (open items).
+
 ## Open items
 
 - **Put L's order in pomp:** in `Team::leaderLaunch`, wake the workers on other chips first.
@@ -190,11 +231,16 @@ Conclusions:
   rarely the one polled last.
 - Time a region that starts with the workers asleep: the cost of posting to sleepers is not
   measured yet.
-- Find the cause of libomp's larger pinned `work`.
-- Find why pomp at T=2 is 3x faster pinned than free, while libomp is not. The `place` test
-  (`pomp_test place`, run by `run_z.sh` for both runtimes, free and pinned) records each
-  thread's CPU in every region, migrations, context switches and CPU polarization, and times
-  regions by how far the farthest worker is from the leader.
-- Whether spinning threads slow an SMT sibling that computes: libomp's pinned `work` is 1.45x
-  pomp's, which may be its spinning workers next to the leader. A zbench section to measure
-  it directly is not written yet.
+- **Separate distance from SMT sharing** (in `run_z.sh`, next run): T=2 with the worker on the
+  leader's SMT sibling, another core of its chip, and another chip; and every T with one thread
+  per core (`pinned1`) against two (`pinned`). Both runtimes.
+- **Each runtime at its best placement** (in `run_z.sh`, next run): libomp also with its own
+  binding, `OMP_PLACES=cores` with `OMP_PROC_BIND=close` and `spread`; a summary takes each
+  runtime's best place.
+- Explain pomp's 0.38 µs at T=2 on another chip: count the lines that move per region (`go`,
+  done, the team's fields, `busy_`).
+- Whether spinning threads slow an SMT sibling that computes (zbench section 7, next run): one
+  thread computes while a partner on its SMT sibling, its chip or another chip is asleep, spins
+  as pomp does, spins and yields as libomp does, or spins with a backoff.
+- Since Linux spreads free threads across chips, consider whether pomp should recommend (or
+  the host apply) a placement on the leader's chip.

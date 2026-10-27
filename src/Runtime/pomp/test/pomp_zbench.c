@@ -25,7 +25,7 @@
 //   POMP_ZB_ONE_PER_CORE=1        Use only the first SMT thread of each core.
 //   POMP_ZB_ITERS=50000           Regions (and barriers) per measurement.
 //   POMP_ZB_WORK=0                Dummy loop iterations per thread per region.
-//   POMP_ZB_SECTIONS=1,2,3,4,5,6  Sections to run.
+//   POMP_ZB_SECTIONS=1,2,3,4,5,6,7  Sections to run.
 //
 // Please send back the whole output, plus the output of `lscpu` and
 // `lscpu -e`. Run on an otherwise idle LPAR if possible.
@@ -64,6 +64,10 @@
 //      wake-up, when the last one is done, and how long the leader's join
 //      takes after that; which worker is last; and the wake loop alone, with
 //      no worker spinning.
+//   7. SMT interference: one thread computes while a partner waits on its
+//      SMT sibling, on another core of its chip, or on another chip; the
+//      partner is asleep, spins as pomp does, spins and yields as libomp
+//      does, or spins with a backoff. The slowdown of the computing thread.
 //
 //===----------------------------------------------------------------------===//
 
@@ -913,6 +917,145 @@ static void bench_anatomy(const int *ts, int nts, long iters) {
 }
 
 // -----------------------------------------------------------------------------
+// 7. SMT interference
+// -----------------------------------------------------------------------------
+
+enum { P_ASLEEP, P_SPIN, P_SPIN_YIELD, P_SPIN_BACKOFF, NPMODES };
+static const char *pmode_name[NPMODES] = {
+    "asleep", "spin", "spin+yield", "spin+backoff"};
+static line_t s7_stop;
+static atomic_int s7_ready;
+static int s7_mode;
+static pthread_mutex_t s7_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t s7_cv = PTHREAD_COND_INITIALIZER;
+static float s7_a[1024];
+
+// A waiting thread: asleep, or polling a line that does not change, as a
+// worker waits for its wake-up. spin+yield yields every 256 polls, about as
+// often as libomp (KMP_USE_YIELD=1); spin+backoff waits between polls.
+static void *s7_partner(void *arg) {
+  pin((int)(intptr_t)arg);
+  atomic_store(&s7_ready, 1);
+  if (s7_mode == P_ASLEEP) {
+    pthread_mutex_lock(&s7_mu);
+    while (!atomic_load(&s7_stop.v))
+      pthread_cond_wait(&s7_cv, &s7_mu);
+    pthread_mutex_unlock(&s7_mu);
+    return NULL;
+  }
+  for (long n = 0; !atomic_load_explicit(&s7_stop.v, memory_order_acquire);
+       ++n) {
+    relax();
+    if (s7_mode == P_SPIN_YIELD && n % 256 == 255)
+      sched_yield();
+    else if (s7_mode == P_SPIN_BACKOFF)
+      for (int k = 0; k < 64; ++k)
+        __asm__ volatile("" ::: "memory");
+  }
+  return NULL;
+}
+
+static pthread_t s7_start(int mode, int cpu) {
+  pthread_t th;
+  s7_mode = mode;
+  atomic_store(&s7_stop.v, 0);
+  atomic_store(&s7_ready, 0);
+  pthread_create(&th, NULL, s7_partner, (void *)(intptr_t)cpu);
+  while (!atomic_load(&s7_ready))
+    relax();
+  return th;
+}
+
+static void s7_end(pthread_t th) {
+  pthread_mutex_lock(&s7_mu);
+  atomic_store(&s7_stop.v, 1);
+  pthread_cond_broadcast(&s7_cv);
+  pthread_mutex_unlock(&s7_mu);
+  pthread_join(th, NULL);
+}
+
+// ns per 1024 elements: 0, the loop of pomp_test's `loop` (a[i] *= s); 1, a
+// dependent chain of integer multiply-adds.
+static double s7_kernel(int k, long reps) {
+  volatile float vs = 1.0f;
+  float s = vs;
+  uint64_t x = 1;
+  double t0 = now();
+  for (long r = 0; r < reps; ++r) {
+    if (k == 0) {
+      for (int i = 0; i < 1024; ++i)
+        s7_a[i] *= s;
+      __asm__ volatile("" ::: "memory");
+    } else {
+      for (int i = 0; i < 1024; ++i) {
+        x = x * 6364136223846793005ull + 1442695040888963407ull;
+        __asm__("" : "+r"(x));
+      }
+    }
+  }
+  sink += x;
+  return (now() - t0) / reps * 1e9;
+}
+
+static int s7_same_chip(int a, int b) {
+  return read_topo(a, "physical_package_id") ==
+             read_topo(b, "physical_package_id") &&
+         read_topo(a, "book_id") == read_topo(b, "book_id") &&
+         read_topo(a, "drawer_id") == read_topo(b, "drawer_id");
+}
+
+static void bench_smt(void) {
+  static const char *pname[3] = {"SMT sibling", "same chip", "other chip"};
+  static const char *kname[2] = {"fp loop", "int chain"};
+  int c0 = cpus[0], part[3] = {-1, -1, -1};
+  long reps = 20000;
+  printf("\n7. SMT interference: one thread computes on CPU %d while a "
+         "partner waits\n   (ns per 1024 elements alone; then the time with "
+         "the partner, as a ratio)\n",
+      c0);
+  if (!pinned || read_topo(c0, "core_id") < 0) {
+    printf("  needs pinning and the Linux topology\n");
+    return;
+  }
+  for (int i = 1; i < ncpus; ++i) {
+    int c = cpus[i], chip = s7_same_chip(c0, c);
+    int p = !chip ? 2
+            : read_topo(c, "core_id") == read_topo(c0, "core_id") ? 0
+                                                                   : 1;
+    if (part[p] < 0)
+      part[p] = c;
+  }
+  printf("  %-10s %-11s %4s %8s", "kernel", "partner", "cpu", "alone");
+  for (int m = 0; m < NPMODES; ++m)
+    printf(" %12s", pmode_name[m]);
+  printf("\n");
+  for (int k = 0; k < 2; ++k) {
+    double v[REPS], alone;
+    s7_kernel(k, reps / 10);
+    for (int r = 0; r < REPS; ++r)
+      v[r] = s7_kernel(k, reps);
+    alone = median(v, REPS);
+    for (int p = 0; p < 3; ++p) {
+      if (part[p] < 0)
+        continue;
+      printf("  %-10s %-11s %4d %8.1f", kname[k], pname[p], part[p], alone);
+      fflush(stdout);
+      for (int m = 0; m < NPMODES; ++m) {
+        for (int r = 0; r < REPS; ++r) {
+          pthread_t th = s7_start(m, part[p]);
+          s7_kernel(k, reps / 10);
+          v[r] = s7_kernel(k, reps);
+          s7_end(th);
+        }
+        printf(" %11.2fx", median(v, REPS) / alone);
+        fflush(stdout);
+      }
+      printf("\n");
+    }
+  }
+}
+
+// -----------------------------------------------------------------------------
 // 5. Barrier designs
 // -----------------------------------------------------------------------------
 
@@ -1024,14 +1167,14 @@ int main(int argc, char **argv) {
   int ts[16], nts = 0;
   long iters = 50000;
   const char *s;
-  int sections = 0x7e;
+  int sections = 0xfe;
 
   get_cpus();
   calibrate_ticks();
   if ((s = getenv("POMP_ZB_SECTIONS"))) {
     sections = 0;
     for (; *s; ++s)
-      if (*s >= '1' && *s <= '6')
+      if (*s >= '1' && *s <= '7')
         sections |= 1 << (*s - '0');
   }
   if ((s = getenv("POMP_ZB_ITERS")))
@@ -1093,6 +1236,9 @@ int main(int argc, char **argv) {
     bench_barrier(ts, nts, iters);
   if (sections & 1 << 6)
     bench_anatomy(ts, nts, iters);
+  fflush(stdout);
+  if (sections & 1 << 7)
+    bench_smt();
   printf("\ndone\n");
   return 0;
 }
