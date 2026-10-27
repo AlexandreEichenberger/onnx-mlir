@@ -25,6 +25,7 @@
 //   POMP_ZB_ONE_PER_CORE=1        Use only the first SMT thread of each core.
 //   POMP_ZB_ITERS=50000           Regions (and barriers) per measurement.
 //   POMP_ZB_WORK=0                Dummy loop iterations per thread per region.
+//   POMP_ZB_SECTIONS=1,2,3,4,5,6  Sections to run.
 //
 // Please send back the whole output, plus the output of `lscpu` and
 // `lscpu -e`. Run on an otherwise idle LPAR if possible.
@@ -43,10 +44,19 @@
 //        E  4-ary tree wake + 4-ary tree join (similar to libomp)
 //        F  per-worker epoch wake + per-worker assignment + done flags
 //           (pomp today)
+//        F' F, waking the workers in reverse order: the last woken is the
+//           first one the leader polls, the worst case for its in-order scan
+//        G  F, with the leader sweeping a mask of the workers not yet done
+//           instead of waiting on each in turn
+//        G' G, waking the workers in reverse order
+//        H  F, with done bytes packed 8 to a line
 //   5. Barrier designs, per barrier, with T threads:
 //        central  counter + epoch word (pomp today)
 //        tree+bc  4-ary tree gather + broadcast epoch word
 //        tree+tr  4-ary tree gather + 4-ary tree release
+//   6. Anatomy of F, F', G, G' regions: when the workers see the wake-up,
+//      when the last one is done, and how long the leader's join takes after
+//      that; and which worker is last.
 //
 //===----------------------------------------------------------------------===//
 
@@ -90,6 +100,35 @@ static double now(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+// A clock that is cheap to read and the same on every CPU (TOD clock on Z).
+static inline uint64_t ticks(void) {
+#if defined(__s390x__)
+  uint64_t t;
+  __asm__ volatile("stckf %0" : "=Q"(t) : : "cc");
+  return t;
+#elif defined(__x86_64__)
+  uint32_t lo, hi;
+  __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+  return ((uint64_t)hi << 32) | lo;
+#elif defined(__aarch64__)
+  uint64_t t;
+  __asm__ volatile("isb\n\tmrs %0, cntvct_el0" : "=r"(t));
+  return t;
+#else
+  return (uint64_t)(now() * 1e9);
+#endif
+}
+
+static double ns_per_tick;
+
+static void calibrate_ticks(void) {
+  double t0 = now();
+  uint64_t k0 = ticks();
+  while (now() - t0 < 0.02)
+    ;
+  ns_per_tick = (now() - t0) * 1e9 / (double)(ticks() - k0);
 }
 
 static int cmp_double(const void *a, const void *b) {
@@ -382,6 +421,10 @@ enum {
   M_XOR_TREE,
   M_TREE_TREE,
   M_EPOCH_FLAGS,
+  M_EPOCH_FLAGS_REV,
+  M_EPOCH_SWEEP,
+  M_EPOCH_SWEEP_REV,
+  M_EPOCH_BYTES,
   NMODELS
 };
 static const char *model_name[NMODELS] = {
@@ -391,7 +434,14 @@ static const char *model_name[NMODELS] = {
     "D xor word + 4-ary tree join",
     "E 4-ary tree wake + tree join (libomp-like)",
     "F epoch/worker + done flags (pomp today)",
+    "F' F, waking in reverse order",
+    "G epoch/worker + done flags, sweep pending",
+    "G' G, waking in reverse order",
+    "H epoch/worker + done bytes, 8 per line",
 };
+
+// Models A and F on: per-worker epoch wake and assignment.
+static int is_epoch(int m) { return m == M_EPOCH || m >= M_EPOCH_FLAGS; }
 
 static line_t go_[MAXT], done_[MAXT], wake_[MAXT];
 static struct {
@@ -402,6 +452,13 @@ static struct {
   _Alignas(CL) void (*fn)(int);
 } team;
 static line_t arrived, activate, stopf;
+static line_t dbytes_[MAXT / 8];
+static uint64_t dbytes_mask[MAXT / 8];
+// Section 6: when each worker saw its wake-up and when it was done.
+static struct {
+  _Alignas(CL) uint64_t go, fin;
+} stamp_[MAXT];
+static int stamping;
 static atomic_int nready;
 static int T, model;
 static uint64_t fullmask;
@@ -431,9 +488,8 @@ static void *fj_worker(void *arg) {
     void (*fn)(int);
     int tid;
     // Wait for the next region.
-    switch (model) {
+    switch (is_epoch(model) ? M_EPOCH : model) {
     case M_EPOCH:
-    case M_EPOCH_FLAGS:
       while (atomic_load_explicit(&go_[w].v, memory_order_acquire) == r) {
         if (STOPPED())
           return NULL;
@@ -459,9 +515,13 @@ static void *fj_worker(void *arg) {
       expect ^= bit;
     }
     ++r;
-    fn = model == M_EPOCH || model == M_EPOCH_FLAGS ? asg[w].fn : team.fn;
-    tid = model == M_EPOCH || model == M_EPOCH_FLAGS ? asg[w].tid : w;
+    if (stamping)
+      stamp_[w].go = ticks();
+    fn = is_epoch(model) ? asg[w].fn : team.fn;
+    tid = is_epoch(model) ? asg[w].tid : w;
     fn(tid);
+    if (stamping)
+      stamp_[w].fin = ticks();
     // Signal the end of the region.
     switch (model) {
     case M_EPOCH:
@@ -470,7 +530,14 @@ static void *fj_worker(void *arg) {
       break;
     case M_XOR_FLAGS:
     case M_EPOCH_FLAGS:
+    case M_EPOCH_FLAGS_REV:
+    case M_EPOCH_SWEEP:
+    case M_EPOCH_SWEEP_REV:
       atomic_store_explicit(&done_[w].v, r, memory_order_release);
+      break;
+    case M_EPOCH_BYTES:
+      __atomic_store_n((uint8_t *)&dbytes_[w / 8].v + w % 8, (uint8_t)r,
+          __ATOMIC_RELEASE);
       break;
     default:
       tree_join(w, r);
@@ -479,16 +546,18 @@ static void *fj_worker(void *arg) {
   }
 }
 
-static void fj_region(uint64_t r) {
-  switch (model) {
-  case M_EPOCH:
-  case M_EPOCH_FLAGS:
-    for (int w = 1; w < T; ++w) {
+static void fj_fork(uint64_t r) {
+  switch (is_epoch(model) ? M_EPOCH : model) {
+  case M_EPOCH: {
+    int rev = model == M_EPOCH_FLAGS_REV || model == M_EPOCH_SWEEP_REV;
+    for (int i = 1; i < T; ++i) {
+      int w = rev ? T - i : i;
       asg[w].fn = body;
       asg[w].tid = w;
       atomic_fetch_add(&go_[w].v, 1);
     }
     break;
+  }
   case M_TREE_TREE:
     team.fn = body;
     for (int c = 1; c <= 4 && c < T; ++c)
@@ -498,7 +567,24 @@ static void fj_region(uint64_t r) {
     team.fn = body;
     atomic_fetch_xor(&activate.v, fullmask);
   }
-  body(0);
+}
+
+// Each done flag is read until it is seen done, and then never again.
+static void sweep_join(uint64_t r) {
+  uint64_t pending = fullmask;
+  for (;;) {
+    for (uint64_t p = pending; p; p &= p - 1) {
+      int w = __builtin_ctzll(p);
+      if (atomic_load_explicit(&done_[w].v, memory_order_acquire) == r)
+        pending &= ~((uint64_t)1 << w);
+    }
+    if (!pending)
+      return;
+    relax();
+  }
+}
+
+static void fj_join(uint64_t r) {
   switch (model) {
   case M_EPOCH:
   case M_XOR_CTR:
@@ -508,13 +594,32 @@ static void fj_region(uint64_t r) {
     break;
   case M_XOR_FLAGS:
   case M_EPOCH_FLAGS:
+  case M_EPOCH_FLAGS_REV:
     for (int w = 1; w < T; ++w)
       while (atomic_load_explicit(&done_[w].v, memory_order_acquire) != r)
         relax();
     break;
+  case M_EPOCH_SWEEP:
+  case M_EPOCH_SWEEP_REV:
+    sweep_join(r);
+    break;
+  case M_EPOCH_BYTES: {
+    uint64_t want = (r & 0xff) * 0x0101010101010101ull;
+    for (int g = 0; g * 8 < T; ++g)
+      while ((atomic_load_explicit(&dbytes_[g].v, memory_order_acquire) &
+                 dbytes_mask[g]) != (want & dbytes_mask[g]))
+        relax();
+    break;
+  }
   default:
     tree_join(0, r);
   }
+}
+
+static void fj_region(uint64_t r) {
+  fj_fork(r);
+  body(0);
+  fj_join(r);
 }
 
 static void reset_lines(void) {
@@ -523,34 +628,54 @@ static void reset_lines(void) {
     atomic_store(&done_[i].v, 0);
     atomic_store(&wake_[i].v, 0);
   }
+  for (int g = 0; g < MAXT / 8; ++g) {
+    union {
+      uint64_t u;
+      uint8_t b[8];
+    } m = {0};
+    for (int i = 0; i < 8; ++i)
+      if (8 * g + i >= 1 && 8 * g + i < T)
+        m.b[i] = 0xff;
+    dbytes_mask[g] = m.u;
+    atomic_store(&dbytes_[g].v, 0);
+  }
   atomic_store(&arrived.v, 0);
   atomic_store(&activate.v, 0);
   atomic_store(&stopf.v, 0);
   atomic_store(&nready, 0);
 }
 
-// Time per region in us.
-static double fj_run(int m, int t, long iters) {
-  pthread_t th[MAXT];
-  uint64_t r = 0;
-  double t0, el;
+static pthread_t fj_th[MAXT];
+
+static void fj_start(int m, int t) {
   model = m;
   T = t;
   fullmask = (T >= 64 ? ~(uint64_t)0 : (((uint64_t)1 << T) - 1)) & ~1ull;
   reset_lines();
   for (int w = 1; w < T; ++w)
-    pthread_create(&th[w], NULL, fj_worker, (void *)(intptr_t)w);
+    pthread_create(&fj_th[w], NULL, fj_worker, (void *)(intptr_t)w);
   while (atomic_load(&nready) != T - 1)
     relax();
+}
+
+static void fj_stop(void) {
+  atomic_store(&stopf.v, 1);
+  for (int w = 1; w < T; ++w)
+    pthread_join(fj_th[w], NULL);
+}
+
+// Time per region in us.
+static double fj_run(int m, int t, long iters) {
+  uint64_t r = 0;
+  double t0, el;
+  fj_start(m, t);
   for (long i = 0; i < 2000; ++i)
     fj_region(++r);
   t0 = now();
   for (long i = 0; i < iters; ++i)
     fj_region(++r);
   el = now() - t0;
-  atomic_store(&stopf.v, 1);
-  for (int w = 1; w < T; ++w)
-    pthread_join(th[w], NULL);
+  fj_stop();
   return el / iters * 1e6;
 }
 
@@ -574,6 +699,79 @@ static void bench_forkjoin(const int *ts, int nts, long iters) {
     }
     printf("\n");
   }
+}
+
+// -----------------------------------------------------------------------------
+// 6. Anatomy of a region
+// -----------------------------------------------------------------------------
+
+enum { A_FORK, A_WAKE1, A_WAKEN, A_DONE, A_TAIL, A_REGION, NA };
+
+static void fj_anatomy(int m, int t, long iters) {
+  double sum[NA] = {0}, sumlast = 0;
+  long first = 0, end = 0;
+  uint64_t r = 0;
+  stamping = 1;
+  fj_start(m, t);
+  for (long i = 0; i < 2000 + iters; ++i) {
+    uint64_t t0, tf, tj, g1 = ~(uint64_t)0, gn = 0, fin = 0;
+    int last = 1;
+    t0 = ticks();
+    fj_fork(++r);
+    tf = ticks();
+    body(0);
+    fj_join(r);
+    tj = ticks();
+    if (i < 2000)
+      continue;
+    for (int w = 1; w < T; ++w) {
+      uint64_t g = stamp_[w].go, f = stamp_[w].fin;
+      g1 = g < g1 ? g : g1;
+      gn = g > gn ? g : gn;
+      if (f > fin) {
+        fin = f;
+        last = w;
+      }
+    }
+    // Signed: the clocks of two CPUs may differ by a tick.
+    sum[A_FORK] += (double)(int64_t)(tf - t0);
+    sum[A_WAKE1] += (double)(int64_t)(g1 - t0);
+    sum[A_WAKEN] += (double)(int64_t)(gn - t0);
+    sum[A_DONE] += (double)(int64_t)(fin - t0);
+    sum[A_TAIL] += (double)(int64_t)(tj - fin);
+    sum[A_REGION] += (double)(int64_t)(tj - t0);
+    sumlast += last;
+    first += last == 1;
+    end += last == T - 1;
+  }
+  fj_stop();
+  stamping = 0;
+  printf("  %-3.*s %4d", (int)strcspn(model_name[m], " "), model_name[m], t);
+  for (int k = 0; k < NA; ++k)
+    printf(" %8.0f", sum[k] / iters * ns_per_tick);
+  printf(" | %6.1f %5.0f%% %5.0f%%\n", sumlast / iters, 100.0 * first / iters,
+      100.0 * end / iters);
+  fflush(stdout);
+}
+
+static void bench_anatomy(const int *ts, int nts, long iters) {
+  static const int ms[] = {
+      M_EPOCH_FLAGS, M_EPOCH_FLAGS_REV, M_EPOCH_SWEEP, M_EPOCH_SWEEP_REV};
+  printf("\n6. Anatomy of a region, body = %ld dummy iterations (ns after the "
+         "leader starts\n   waking; mean of %ld regions)\n",
+      work_iters, iters);
+  printf("   fork: the leader's wake loop. woken 1st/last: first and last "
+         "worker to see\n   its wake-up. done last: last worker's done store. "
+         "tail: from there to the\n   end of the leader's join. last w: "
+         "which worker is done last (mean), and how\n   often it is worker 1 "
+         "(polled first) or T-1 (polled last).\n");
+  printf("  %-3s %4s %8s %8s %8s %8s %8s %8s | %6s %6s %6s\n", "", "T",
+      "fork", "woken1st", "wokenlst", "donelast", "tail", "region", "last w",
+      "w=1", "w=T-1");
+  for (int j = 0; j < 4; ++j)
+    for (int i = 0; i < nts; ++i)
+      if (ts[i] > 1)
+        fj_anatomy(ms[j], ts[i], iters);
 }
 
 // -----------------------------------------------------------------------------
@@ -688,8 +886,16 @@ int main(int argc, char **argv) {
   int ts[16], nts = 0;
   long iters = 50000;
   const char *s;
+  int sections = 0x7e;
 
   get_cpus();
+  calibrate_ticks();
+  if ((s = getenv("POMP_ZB_SECTIONS"))) {
+    sections = 0;
+    for (; *s; ++s)
+      if (*s >= '1' && *s <= '6')
+        sections |= 1 << (*s - '0');
+  }
   if ((s = getenv("POMP_ZB_ITERS")))
     iters = atol(s);
   if ((s = getenv("POMP_ZB_WORK")))
@@ -734,14 +940,21 @@ int main(int argc, char **argv) {
   printf("\n");
   fflush(stdout);
 
-  bench_primitives();
+  if (sections & 1 << 1)
+    bench_primitives();
   fflush(stdout);
-  bench_pingpong();
+  if (sections & 1 << 2)
+    bench_pingpong();
   fflush(stdout);
-  bench_contention(ts, nts);
+  if (sections & 1 << 3)
+    bench_contention(ts, nts);
   fflush(stdout);
-  bench_forkjoin(ts, nts, iters);
-  bench_barrier(ts, nts, iters);
+  if (sections & 1 << 4)
+    bench_forkjoin(ts, nts, iters);
+  if (sections & 1 << 5)
+    bench_barrier(ts, nts, iters);
+  if (sections & 1 << 6)
+    bench_anatomy(ts, nts, iters);
   printf("\ndone\n");
   return 0;
 }

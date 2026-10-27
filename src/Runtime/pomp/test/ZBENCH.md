@@ -17,7 +17,7 @@ free and pinned the same way (`CPUS`, default those allowed to the process):
 - one level, team sizes `LIMITS` (default 2 4 8 16): empty fork/join, barrier, loop region;
 - nested, shapes `NESTS` (default 4x4 4x8 8x4 8x8): an outer team whose members each fork an
   inner team that runs a loop;
-- `pomp_zbench` section 4.
+- `pomp_zbench` sections 4 and 6, with an empty body and with `POMP_ZB_WORK=2000`.
 
 Please send the whole output with `lscpu -e`.
 
@@ -64,6 +64,7 @@ If the LPAR has more than 64 CPUs, also try a run restricted to one drawer, for 
 | `POMP_ZB_ONE_PER_CORE` | `1` keeps only the first SMT thread of each core |
 | `POMP_ZB_ITERS` | Regions and barriers per measurement (default 50000) |
 | `POMP_ZB_WORK` | Dummy loop iterations each thread runs per region (default 0) |
+| `POMP_ZB_SECTIONS` | Sections to run (`4,6`); default 1–6 |
 
 ## What each section tells us
 
@@ -74,6 +75,7 @@ If the LPAR has more than 64 CPUs, also try a run restricted to one drawer, for 
 | 3. Contended `fetch_add` | How badly T threads hitting one line serialize: the cost of a counter join or a central barrier |
 | 4. Fork/join designs | Which wake-up and join design to implement (see below) |
 | 5. Barrier designs | Whether a tree barrier pays off at these T |
+| 6. Anatomy of a region | Where F's region time goes: the wake loop, the workers' wake-up, and the leader's join after the last worker is done; and which worker is last |
 
 Fork/join designs in section 4, all with spinning workers and an empty body unless
 `POMP_ZB_WORK` is set:
@@ -86,6 +88,25 @@ Fork/join designs in section 4, all with spinning workers and an empty body unle
 | D | one XOR on a shared activate word | 4-ary tree | |
 | E | 4-ary tree | 4-ary tree | close to libomp's default |
 | F | one epoch per worker + per-worker assignment | per-worker done flags, polled by the leader | pomp today |
+| F' | as F, waking workers T-1 down to 1 | as F | the last woken is polled first: the worst order for F's scan |
+| G | as F | the leader sweeps a mask of the workers not yet done, reading each flag until it is done and never again | |
+| G' | as G, waking workers T-1 down to 1 | as G | |
+| H | as F | done bytes, 8 to a line; the leader reads one word per 8 workers | |
+
+F against F' shows how much the order of F's scan costs; G against F' shows how much the sweep
+recovers. Section 6 times F, F', G and G' with a clock every CPU shares (`STCKF` on Z), as ns
+after the leader starts waking:
+
+| Column | Meaning |
+|---|---|
+| fork | the leader's wake loop |
+| woken1st, wokenlst | when the first and the last worker see their wake-up |
+| donelast | when the last worker is done, before its done store |
+| tail | from `donelast` to the end of the leader's join: what the join adds to the critical path |
+| region | the whole region, as the leader sees it |
+| last w, w=1, w=T-1 | which worker is done last: the mean, and how often it is the first or the last one F polls |
+
+Set `POMP_ZB_SECTIONS` (for example `4,6`) to run only some sections.
 
 ## Reference: macOS, 18-core Apple Silicon (not pinned)
 

@@ -318,8 +318,12 @@ if [ $HAVE_LIBOMP = 1 ]; then
   echo "plain libomp, which builds them again each region, is in the table above."
 fi
 
-note "pomp_zbench, section 4 (fork/join designs; F is pomp today)"
-"$B/pomp_zbench" $(echo $LIMITS | tr ' ' ',') 2>&1 | sed -n '/^4\./,/^5\./p' | sed '$d'
+note "pomp_zbench, sections 4 and 6 (fork/join designs; F is pomp today)"
+ZB_TS=$(echo $LIMITS | tr ' ' ',')
+POMP_ZB_SECTIONS=4,6 "$B/pomp_zbench" $ZB_TS 2>&1 | sed -n '/^4\./,/^done/p' | sed '$d'
+note "pomp_zbench, sections 4 and 6, body = 2000 iterations"
+POMP_ZB_SECTIONS=4,6 POMP_ZB_WORK=2000 "$B/pomp_zbench" $ZB_TS 2>&1 |
+  sed -n '/^4\./,/^done/p' | sed '$d'
 
 note "summary: $fail failures"
 exit $((fail != 0))
