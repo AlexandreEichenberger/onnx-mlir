@@ -232,6 +232,41 @@ private:
   Lockable &lockable_;
 };
 
+// Counters of sleeps and wake-ups, built with -DPOMP_STATS only (read by
+// pomp_get_stats). Relaxed increments of shared counters: for diagnosis, not
+// for timing runs.
+enum StatKind {
+  kStatRegions,    // Forks of a team of more than one thread.
+  kStatIdleSleeps, // An idle worker went to sleep, waiting for work.
+  kStatTeamSleeps, // A join or barrier wait went to sleep.
+  kStatPosts,      // Posts, by any waker.
+  kStatForkPosts,  // Posts by a leader waking its workers at a fork.
+  kStatPostNs,     // Time inside post(), in ns.
+  kStatSleepNs,    // Time asleep (waitPost), in ns.
+  kStats
+};
+#ifdef POMP_STATS
+inline uint64_t nowNs() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return uint64_t(ts.tv_sec) * 1000000000u + uint64_t(ts.tv_nsec);
+}
+POMP_CONSTINIT uint64_t statCounters[kStats] = {};
+inline void stat(StatKind k, uint64_t n = 1) {
+  __atomic_fetch_add(&statCounters[k], n, __ATOMIC_RELAXED);
+}
+#define POMP_STAT(k) stat(k)
+#define POMP_STAT_TIME(k, stmt)                                                \
+  do {                                                                         \
+    uint64_t t0_ = nowNs();                                                    \
+    stmt;                                                                      \
+    stat(k, nowNs() - t0_);                                                    \
+  } while (0)
+#else
+#define POMP_STAT(k) ((void)0)
+#define POMP_STAT_TIME(k, stmt) stmt
+#endif
+
 // A binary flag to sleep on. A post only means "re-check your condition".
 class Post {
 public:

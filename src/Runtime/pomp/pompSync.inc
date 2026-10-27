@@ -66,6 +66,7 @@ void TeamWait::until(Thread &self, Cond cond) {
     }
     // Sleep: set our bit, fence (pairs with the waker's, in claimSleepers:
     // either it sees the bit or we see its publish), and re-check.
+    POMP_STAT(kStatTeamSleeps);
     sleepers_.fetchSet(meMask);
     fence(Order::SeqCst);
     if (cond()) {

@@ -123,6 +123,12 @@ int pomp_is_pool_open(void);
 // returning to the host.
 int pomp_pool_size(void);
 
+// Diagnosis: copy up to `n` of pomp's sleep and wake-up counters into
+// `counts` and return how many; 0 unless pomp is built with -DPOMP_STATS. In
+// order: regions forked with workers, idle sleeps, team-wait sleeps, posts,
+// posts at forks, ns spent posting, ns spent asleep.
+int pomp_get_stats(unsigned long long *counts, int n);
+
 #ifdef __cplusplus
 }
 #endif

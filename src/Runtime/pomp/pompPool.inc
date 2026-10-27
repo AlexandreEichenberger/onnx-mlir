@@ -30,7 +30,12 @@ inline void Thread::assign(Team *team, int32_t tid) {
 }
 
 inline void Pool::wakeSleeping(SlotMask workers) {
+#ifdef POMP_STATS
+  stat(kStatRegions);
+  stat(kStatForkPosts, uint64_t(wakeSleepers(sleeping_.load() & workers)));
+#else
   wakeSleepers(sleeping_.load() & workers);
+#endif
 }
 
 // Post to the sleepers among `workers` whose sleeping bit this call clears.
@@ -74,6 +79,7 @@ bool Pool::waitWork(Thread &t, SlotMask self, uint64_t &last) {
   // bit: no wake-up is lost.
   uint64_t g;
   for (;;) {
+    POMP_STAT(kStatIdleSleeps);
     sleeping_.fetchSet(self);
     g = t.epoch();
     bool rel = bool(released_.load() & self);

@@ -73,6 +73,11 @@ for v in tls key; do
     $CC $OPT test/pomp_host_test.c "$B/$v/pomp.o" -pthread \
       -o "$B/$v/pomp_host_test" || { echo "build of pomp-$v failed"; exit 1; }
 done
+# pomp with sleep and wake-up counters, for diagnosis only (not timed).
+mkdir -p "$B/stats"
+$CXX $CXXOPT -DPOMP_STATS -Wall -c pomp.cpp -o "$B/stats/pomp.o" &&
+  $CC "$B/pomp_test.o" "$B/stats/pomp.o" -pthread -o "$B/stats/pomp_test" ||
+  { echo "build of pomp-stats failed"; exit 1; }
 
 # libomp, for the digests and the timings. If it is not on the linker's path,
 # look in the lib directories of $CC's installation. Without it, only the
@@ -260,6 +265,24 @@ for S in 0 5 20 50 100 200000; do
       "$(exe pomp)" nestbench 50000 $n1 $n2 | med_of overhead)"
   done
   printf '%-8s %9s %9s %9s %9s %9s %9s\n' $S $row
+done
+
+note "pomp sleeps and wake-ups per region (pomp built with counters; one run each)"
+echo "idle: a worker slept waiting for the next region; team: a join or barrier"
+echo "wait slept; posts: wake-ups sent (at forks: by the leader's fork)."
+for S in 5 20 100 200000; do
+  for w in "bench 8" "bench 16" "nest 8x8"; do
+    set -- $w
+    if [ $1 = nest ]; then
+      n1=${2%x*} n2=${2#*x}
+      out=$(env POMP_SPIN=$S OMP_MAX_ACTIVE_LEVELS=2 OMP_THREAD_LIMIT=$((n1 * n2)) \
+        "$B/stats/pomp_test" nestbench 20000 $n1 $n2 2>&1)
+    else
+      out=$(env POMP_SPIN=$S OMP_THREAD_LIMIT=$2 OMP_NUM_THREADS=$2 \
+        "$B/stats/pomp_test" bench 20000 2>&1)
+    fi
+    echo "POMP_SPIN=$S $1 $2: $(echo "$out" | sed -n 's/^stats: //p')"
+  done
 done
 
 note "nested, outer x inner threads, us per outer region (median of 5 runs of 50000)"
@@ -558,6 +581,8 @@ if [ "${ZB_MAP:-0}" = 1 ]; then
 fi
 note "pomp_zbench, sections 4 and 6 (fork/join designs; F is pomp today)"
 POMP_ZB_SECTIONS=4,6 "$B/pomp_zbench" $ZB_TS 2>&1 | sed -n '/^4\./,/^done/p' | sed '$d'
+note "pomp_zbench, section 8 (waking sleeping workers)"
+POMP_ZB_SECTIONS=8 "$B/pomp_zbench" $ZB_TS 2>&1 | sed -n '/^8\./,/^done/p' | sed '$d'
 note "pomp_zbench, section 7 (a waiting thread next to a computing one)"
 POMP_ZB_SECTIONS=7 "$B/pomp_zbench" 2>&1 | sed -n '/^7\./,/^done/p' | sed '$d'
 note "pomp_zbench, section 4, body = 2000 iterations"

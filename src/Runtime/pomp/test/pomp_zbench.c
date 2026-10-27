@@ -25,7 +25,7 @@
 //   POMP_ZB_ONE_PER_CORE=1        Use only the first SMT thread of each core.
 //   POMP_ZB_ITERS=50000           Regions (and barriers) per measurement.
 //   POMP_ZB_WORK=0                Dummy loop iterations per thread per region.
-//   POMP_ZB_SECTIONS=1,2,3,4,5,6,7  Sections to run.
+//   POMP_ZB_SECTIONS=1,2,3,4,5,6,7,8  Sections to run.
 //
 // Please send back the whole output, plus the output of `lscpu` and
 // `lscpu -e`. Run on an otherwise idle LPAR if possible.
@@ -68,6 +68,10 @@
 //      SMT sibling, on another core of its chip, or on another chip; the
 //      partner is asleep, spins as pomp does, spins and yields as libomp
 //      does, or spins with a backoff. The slowdown of the computing thread.
+//   8. Waking sleeping workers: the cost of one post and the delay until the
+//      sleeper runs, for a pthread mutex + condition (pomp's Post) and, on
+//      Linux, a futex; then waking T-1 sleepers per region, the leader
+//      posting to each in turn, or through a 4-ary tree of posts.
 //
 //===----------------------------------------------------------------------===//
 
@@ -81,6 +85,10 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#endif
 
 #if defined(__s390x__)
 #define CL 256
@@ -1056,6 +1064,215 @@ static void bench_smt(void) {
 }
 
 // -----------------------------------------------------------------------------
+// 8. Waking sleepers
+// -----------------------------------------------------------------------------
+
+// A binary post: mutex + condition, as pomp's Post, or a futex word.
+typedef struct {
+  _Alignas(CL) pthread_mutex_t mu;
+  pthread_cond_t cv;
+  int posted;
+  _Atomic int fword; // Futex: 1 posted, 0 not.
+} zpost_t;
+
+static int s8_futex;
+static zpost_t s8_post[MAXT];
+
+static void zp_init(zpost_t *p) {
+  pthread_mutex_init(&p->mu, NULL);
+  pthread_cond_init(&p->cv, NULL);
+  p->posted = 0;
+  atomic_store(&p->fword, 0);
+}
+
+static void zp_post(zpost_t *p) {
+#ifdef __linux__
+  if (s8_futex) {
+    if (atomic_exchange(&p->fword, 1) == 0)
+      syscall(SYS_futex, &p->fword, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+    return;
+  }
+#endif
+  pthread_mutex_lock(&p->mu);
+  p->posted = 1;
+  pthread_cond_signal(&p->cv);
+  pthread_mutex_unlock(&p->mu);
+}
+
+static void zp_wait(zpost_t *p) {
+#ifdef __linux__
+  if (s8_futex) {
+    while (atomic_exchange(&p->fword, 0) == 0)
+      syscall(SYS_futex, &p->fword, FUTEX_WAIT_PRIVATE, 0, NULL, NULL, 0);
+    return;
+  }
+#endif
+  pthread_mutex_lock(&p->mu);
+  while (!p->posted)
+    pthread_cond_wait(&p->cv, &p->mu);
+  p->posted = 0;
+  pthread_mutex_unlock(&p->mu);
+}
+
+// Every worker sleeps on its post each region; the leader wakes them (tree
+// 0: in turn; 1: it posts to its 4 children, each woken worker to its own),
+// then waits for every done flag, spinning.
+static int s8_tree, s8_T;
+static line_t s8_done[MAXT], s8_stop;
+static uint64_t s8_woke[MAXT]; // Ticks when each worker woke, last region.
+
+static void *s8_worker(void *arg) {
+  int w = (int)(intptr_t)arg;
+  pin(cpus[w]);
+  atomic_fetch_add(&nready, 1);
+  for (uint64_t r = 1;; ++r) {
+    zp_wait(&s8_post[w]);
+    s8_woke[w] = ticks();
+    if (atomic_load_explicit(&s8_stop.v, memory_order_acquire))
+      return NULL;
+    if (s8_tree)
+      for (int c = 4 * w + 1; c <= 4 * w + 4 && c < s8_T; ++c)
+        zp_post(&s8_post[c]);
+    atomic_store_explicit(&s8_done[w].v, r, memory_order_release);
+  }
+}
+
+// us per region, and mean ns from the leader's first post until the last
+// worker woke.
+static void s8_run(int t, int tree, int futex, long iters, double *us,
+    double *last) {
+  pthread_t th[MAXT];
+  s8_T = t;
+  s8_tree = tree;
+  s8_futex = futex;
+  atomic_store(&s8_stop.v, 0);
+  atomic_store(&nready, 0);
+  for (int w = 0; w < MAXT; ++w) {
+    zp_init(&s8_post[w]);
+    atomic_store(&s8_done[w].v, 0);
+  }
+  for (int w = 1; w < t; ++w)
+    pthread_create(&th[w], NULL, s8_worker, (void *)(intptr_t)w);
+  while (atomic_load(&nready) != t - 1)
+    relax();
+  double sumlast = 0, t0 = 0;
+  for (long i = 0; i < iters + 200; ++i) {
+    uint64_t r = (uint64_t)i + 1;
+    if (i == 200)
+      t0 = now();
+    // Let every worker fall asleep, as after a wait longer than the spin.
+    struct timespec ts = {0, 20000};
+    nanosleep(&ts, NULL);
+    uint64_t k0 = ticks(), kl = 0;
+    if (tree)
+      for (int c = 1; c <= 4 && c < t; ++c)
+        zp_post(&s8_post[c]);
+    else
+      for (int w = 1; w < t; ++w)
+        zp_post(&s8_post[w]);
+    for (int w = 1; w < t; ++w) {
+      while (atomic_load_explicit(&s8_done[w].v, memory_order_acquire) != r)
+        relax();
+      kl = s8_woke[w] > kl ? s8_woke[w] : kl;
+    }
+    if (i >= 200)
+      sumlast += (double)(int64_t)(kl - k0) * ns_per_tick;
+  }
+  // The 20 us sleeps are subtracted: us is the region's own cost.
+  *us = ((now() - t0) / iters) * 1e6;
+  *last = sumlast / iters;
+  atomic_store(&s8_stop.v, 1);
+  for (int w = 1; w < t; ++w)
+    zp_post(&s8_post[w]);
+  for (int w = 1; w < t; ++w)
+    pthread_join(th[w], NULL);
+}
+
+// One post to a sleeping partner: ns in the poster, and until it runs.
+static void s8_single(int futex, int cpu, double *post_ns, double *wake_ns) {
+  pthread_t th;
+  s8_T = 2;
+  s8_tree = 0;
+  s8_futex = futex;
+  atomic_store(&s8_stop.v, 0);
+  atomic_store(&nready, 0);
+  zp_init(&s8_post[1]);
+  atomic_store(&s8_done[1].v, 0);
+  int saved = cpus[1];
+  cpus[1] = cpu;
+  pthread_create(&th, NULL, s8_worker, (void *)(intptr_t)1);
+  while (atomic_load(&nready) != 1)
+    relax();
+  double sp = 0, sw = 0;
+  long n = 2000;
+  for (long i = 0; i < n + 100; ++i) {
+    struct timespec ts = {0, 50000};
+    nanosleep(&ts, NULL);
+    uint64_t k0 = ticks();
+    zp_post(&s8_post[1]);
+    uint64_t k1 = ticks();
+    while (atomic_load_explicit(&s8_done[1].v, memory_order_acquire) !=
+           (uint64_t)i + 1)
+      relax();
+    if (i >= 100) {
+      sp += (double)(int64_t)(k1 - k0) * ns_per_tick;
+      sw += (double)(int64_t)(s8_woke[1] - k0) * ns_per_tick;
+    }
+  }
+  atomic_store(&s8_stop.v, 1);
+  zp_post(&s8_post[1]);
+  pthread_join(th, NULL);
+  cpus[1] = saved;
+  *post_ns = sp / n;
+  *wake_ns = sw / n;
+}
+
+static void bench_wake(const int *ts, int nts) {
+  int nf = 1;
+#ifdef __linux__
+  nf = 2;
+#endif
+  static const char *fname[2] = {"mutex+cond", "futex"};
+  printf("\n8. Waking sleeping workers\n");
+  printf("  One post to a sleeping thread (ns): in the poster; until the "
+         "sleeper runs\n");
+  printf("  %-11s %-12s %10s %12s\n", "mechanism", "sleeper on", "post",
+      "until runs");
+  for (int f = 0; f < nf; ++f) {
+    int near = ncpus > 2 ? cpus[2] : cpus[1 % ncpus];
+    int far = ncpus > 12 ? cpus[12] : near;
+    int where[2] = {near, far};
+    static const char *wname[2] = {"CPU 2", "CPU 12"};
+    for (int k = 0; k < 2; ++k) {
+      double p, w;
+      s8_single(f, where[k], &p, &w);
+      printf("  %-11s %-12s %10.0f %12.0f\n", fname[f], wname[k], p, w);
+    }
+  }
+  printf("  Waking T-1 sleeping workers, per region: us, and ns until the "
+         "last one runs\n");
+  printf("  %-11s %-8s", "mechanism", "order");
+  for (int i = 0; i < nts; ++i)
+    printf(" %8d %8s", ts[i], "last ns");
+  printf("\n");
+  for (int f = 0; f < nf; ++f)
+    for (int tree = 0; tree < 2; ++tree) {
+      printf("  %-11s %-8s", fname[f], tree ? "tree" : "serial");
+      fflush(stdout);
+      for (int i = 0; i < nts; ++i) {
+        double us = 0, last = 0;
+        if (ts[i] > 1)
+          s8_run(ts[i], tree, f, 2000, &us, &last);
+        printf(" %8.2f %8.0f", us, last);
+        fflush(stdout);
+      }
+      printf("\n");
+    }
+  printf("  (us per region includes a 20 us sleep of the leader before each "
+         "wake-up)\n");
+}
+
+// -----------------------------------------------------------------------------
 // 5. Barrier designs
 // -----------------------------------------------------------------------------
 
@@ -1167,14 +1384,14 @@ int main(int argc, char **argv) {
   int ts[16], nts = 0;
   long iters = 50000;
   const char *s;
-  int sections = 0xfe;
+  int sections = 0x1fe;
 
   get_cpus();
   calibrate_ticks();
   if ((s = getenv("POMP_ZB_SECTIONS"))) {
     sections = 0;
     for (; *s; ++s)
-      if (*s >= '1' && *s <= '7')
+      if (*s >= '1' && *s <= '8')
         sections |= 1 << (*s - '0');
   }
   if ((s = getenv("POMP_ZB_ITERS")))
@@ -1239,6 +1456,9 @@ int main(int argc, char **argv) {
   fflush(stdout);
   if (sections & 1 << 7)
     bench_smt();
+  fflush(stdout);
+  if (sections & 1 << 8)
+    bench_wake(ts, nts);
   printf("\ndone\n");
   return 0;
 }

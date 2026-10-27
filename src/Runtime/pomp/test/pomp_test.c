@@ -947,6 +947,23 @@ static void test_nestbench(long iters, int n1, int n2) {
       (region - work) * 1e6);
 }
 
+// With pomp built with -DPOMP_STATS: sleeps and wake-ups per region, over
+// the whole run (warm-up included).
+static void print_stats(void) {
+#ifdef POMP
+  unsigned long long c[7];
+  if (pomp_get_stats(c, 7) < 7 || !c[0])
+    return;
+  double r = (double)c[0];
+  printf("stats: %llu regions; per region: idle sleeps %.2f, team-wait sleeps "
+         "%.2f, posts %.2f (at forks %.2f); per post %.0f ns posting; "
+         "per sleep %.0f ns asleep\n",
+      c[0], c[1] / r, c[2] / r, c[3] / r, c[4] / r,
+      c[3] ? (double)c[5] / c[3] : 0.0,
+      c[1] + c[2] ? (double)c[6] / (c[1] + c[2]) : 0.0);
+#endif
+}
+
 int main(int argc, char **argv) {
   const char *test = argc > 1 ? argv[1] : "static";
   long n = argc > 2 ? atol(argv[2]) : 0;
@@ -982,6 +999,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "unknown test %s\n", test);
     return 1;
   }
+  print_stats();
   release_all();
   return 0;
 }

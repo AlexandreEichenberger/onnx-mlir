@@ -183,8 +183,11 @@ public:
   const RegionStack &regions() const { return regions_; }
 
   // Sleep.
-  void post() { post_.post(); }
-  void waitPost() { post_.wait(); }
+  void post() {
+    POMP_STAT(kStatPosts);
+    POMP_STAT_TIME(kStatPostNs, post_.post());
+  }
+  void waitPost() { POMP_STAT_TIME(kStatSleepNs, post_.wait()); }
   void clearPost() { post_.clear(); }
 
   // Take this slot if no thread is in the pool as it; `observed` gets the

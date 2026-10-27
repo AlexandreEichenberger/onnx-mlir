@@ -162,6 +162,19 @@ int pomp_pool_size(void) {
   return pool.size();
 }
 
+int pomp_get_stats(unsigned long long *counts, int n) {
+#ifdef POMP_STATS
+  int k = n < kStats ? n : kStats;
+  for (int i = 0; i < k; ++i)
+    counts[i] = __atomic_load_n(&statCounters[i], __ATOMIC_RELAXED);
+  return k;
+#else
+  (void)counts;
+  (void)n;
+  return 0;
+#endif
+}
+
 // -----------------------------------------------------------------------------
 // __kmpc entry points
 // -----------------------------------------------------------------------------

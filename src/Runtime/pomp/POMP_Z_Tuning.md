@@ -349,6 +349,12 @@ Conclusions:
 
 ## Open items
 
+- **Measure the wake-up path** (next run): pomp built with `-DPOMP_STATS` counts sleeps and posts
+  per region (`pomp_get_stats`), at `POMP_SPIN` 5, 20, 100 and 200000 µs, for T=8, 16 and nested
+  8x8. zbench part 8 times one post (mutex + condition against futex) and waking T-1 sleepers in
+  turn against through a 4-ary tree. Expected if the T=16 slowdown is a cascade (sleeping makes
+  forks slow, slow forks make waits long enough to sleep): about 15 posts per region at 5 µs,
+  near 0 at T=8.
 - **Choose pomp's spin** (section 6): 5 µs suits uneven work next to a computing sibling, but
   makes T=16 and nested regions 2–8x slower. Next run sweeps `POMP_SPIN` 0–100 µs on those. Then
   decide among: one longer default (the shortest that keeps them fast, if it stays good next to
