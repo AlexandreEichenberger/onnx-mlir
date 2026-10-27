@@ -117,6 +117,11 @@ Section 6 first prints the one-way latency from the leader's CPU to each worker'
 
 Set `POMP_ZB_SECTIONS` (for example `4,6`) to run only some sections.
 
+By default, sections 4 and 6 time only E (libomp-like), F (the earlier reference), I (pomp's
+layout) and L (the candidate); the other designs are settled (see `../POMP_Z_Tuning.md`). Build
+with `-DPOMP_ZB_ALL_DESIGNS` to time them all again. `run_z.sh` skips sections 1 and 2 unless
+`ZB_MAP=1`.
+
 ## Reference: macOS, 18-core Apple Silicon (not pinned)
 
 Fork/join, µs per region:

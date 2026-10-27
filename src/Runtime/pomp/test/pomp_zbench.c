@@ -59,6 +59,7 @@
 //        central  counter + epoch word (pomp today)
 //        tree+bc  4-ary tree gather + broadcast epoch word
 //        tree+tr  4-ary tree gather + 4-ary tree release
+//   By default only E, F, I and L are timed; -DPOMP_ZB_ALL_DESIGNS times all.
 //   6. Anatomy of F, F', G', I, J, K, L regions: when the workers see the
 //      wake-up, when the last one is done, and how long the leader's join
 //      takes after that; which worker is last; and the wake loop alone, with
@@ -454,6 +455,18 @@ static const char *model_name[NMODELS] = {
     "L J, farthest workers woken first",
 };
 
+// The designs still timed by default: E for libomp's design, F for the earlier
+// runs, I for pomp today, L for the candidate. The others are settled (see
+// POMP_Z_Tuning.md); build with -DPOMP_ZB_ALL_DESIGNS to time them again.
+#ifdef POMP_ZB_ALL_DESIGNS
+static int timed(int m) { return m >= 0; }
+#else
+static int timed(int m) {
+  return m == M_TREE_TREE || m == M_EPOCH_FLAGS || m == M_LINE ||
+         m == M_LINE_FAR;
+}
+#endif
+
 // Models I on: one line per worker.
 static int is_line(int m) { return m >= M_LINE; }
 // Models A and F to H: per-worker epoch wake and assignment.
@@ -788,6 +801,8 @@ static void bench_forkjoin(const int *ts, int nts, long iters) {
     printf(" %8d", ts[i]);
   printf("\n");
   for (int m = 0; m < NMODELS; ++m) {
+    if (!timed(m))
+      continue;
     printf("  %-45s", model_name[m]);
     fflush(stdout);
     for (int i = 0; i < nts; ++i) {
@@ -893,7 +908,7 @@ static void bench_anatomy(const int *ts, int nts, long iters) {
       "w=1", "w=T-1", "alone");
   for (int j = 0; j < nms; ++j)
     for (int i = 0; i < nts; ++i)
-      if (ts[i] > 1)
+      if (ts[i] > 1 && timed(ms[j]) && ms[j] != M_TREE_TREE)
         fj_anatomy(ms[j], ts[i], iters);
 }
 

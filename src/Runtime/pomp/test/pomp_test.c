@@ -29,6 +29,9 @@
 //                the runtime's overhead per region
 //   nestbench N1 N2 : nested region, N1 outer threads each forking N2; prints
 //                the region, work and overhead as `loop` does
+//   place      : empty fork/join regions, timed one by one, then traced:
+//                where each thread runs, and the time of a region by how far
+//                its farthest worker is from the leader (Linux)
 //
 // POMP_TEST_CPUS=0-7 (Linux) pins thread t of the run to the t-th CPU listed:
 // the pool threads under pomp, and libomp's threads, in tid order, under
@@ -39,6 +42,7 @@
 #ifdef __linux__
 #define _GNU_SOURCE
 #include <sched.h>
+#include <sys/resource.h>
 #endif
 #include <inttypes.h>
 #include <omp.h>
@@ -605,6 +609,227 @@ static void test_loop(long iters) {
 }
 
 // -----------------------------------------------------------------------------
+// place: where the threads of an empty fork/join region run, and how the
+// time of a region depends on it. Two passes of iters regions each:
+//   1. timed: each region timed alone, nothing else recorded;
+//   2. traced: each thread records its CPU (sched_getcpu) in every region, and
+//      each region is classified by where its farthest worker is from the
+//      leader: on its core (an SMT sibling), on its chip, or elsewhere.
+// Pass 2 is slowed by the trace (its cost per call is printed), so only the
+// comparisons within it count. Also reports, from getrusage, the context
+// switches of every team thread over pass 1, and the polarization of the CPUs
+// used (Linux on Z).
+// -----------------------------------------------------------------------------
+
+#ifdef __linux__
+#define PLACE_MAXCPU 1024
+// Per CPU: core and chip ids, -2 if not read yet, -1 if unknown.
+static int cpu_core[PLACE_MAXCPU], cpu_chip[PLACE_MAXCPU];
+static char cpu_pol[PLACE_MAXCPU];
+
+static int read_sysfs(int cpu, const char *name, char *buf, int len) {
+  char path[256];
+  FILE *f;
+  int ok;
+  snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/%s", cpu, name);
+  if (!(f = fopen(path, "r")))
+    return 0;
+  ok = fgets(buf, len, f) != NULL;
+  fclose(f);
+  return ok;
+}
+
+static int read_topo_id(int cpu, const char *name) {
+  char buf[64], path[64];
+  snprintf(path, sizeof(path), "topology/%s", name);
+  return read_sysfs(cpu, path, buf, sizeof(buf)) ? atoi(buf) : -1;
+}
+
+static void load_cpu(int c) {
+  char buf[64];
+  if (cpu_core[c] != -2)
+    return;
+  cpu_core[c] = read_topo_id(c, "core_id");
+  // A chip: the same package in the same book and drawer.
+  cpu_chip[c] = read_topo_id(c, "physical_package_id") +
+                1000 * read_topo_id(c, "book_id") +
+                1000000 * read_topo_id(c, "drawer_id");
+  // vertical high / medium / low, or horizontal: h, m, l, z (horizontal).
+  cpu_pol[c] = '?';
+  if (read_sysfs(c, "polarization", buf, sizeof(buf)))
+    cpu_pol[c] = !strncmp(buf, "vertical:high", 13)     ? 'h'
+                 : !strncmp(buf, "vertical:medium", 15) ? 'm'
+                 : !strncmp(buf, "vertical:low", 12)    ? 'l'
+                 : !strncmp(buf, "horizontal", 10)      ? 'z'
+                                                        : '?';
+}
+
+// 0: the same CPU, 1: an SMT sibling, 2: the same chip, 3: elsewhere.
+static int distance(int a, int b) {
+  if (a < 0 || b < 0 || a >= PLACE_MAXCPU || b >= PLACE_MAXCPU)
+    return 3;
+  load_cpu(a);
+  load_cpu(b);
+  if (a == b)
+    return 0;
+  if (cpu_chip[a] != cpu_chip[b])
+    return 3;
+  return cpu_core[a] == cpu_core[b] ? 1 : 2;
+}
+
+static int cmp_float(const void *a, const void *b) {
+  float x = *(const float *)a, y = *(const float *)b;
+  return x < y ? -1 : x > y;
+}
+
+// Median, 90th and 99th percentiles of v[0..n) in us, sorting v.
+static void pct(float *v, long n, float *p50, float *p90, float *p99) {
+  qsort(v, n, sizeof(float), cmp_float);
+  *p50 = n ? v[n / 2] : 0;
+  *p90 = n ? v[n * 9 / 10] : 0;
+  *p99 = n ? v[n * 99 / 100] : 0;
+}
+
+static void test_place(long iters) {
+  int nth = num_threads;
+  float *t1 = malloc(sizeof(float) * iters);
+  float *t2 = malloc(sizeof(float) * iters);
+  int *cpu = malloc(sizeof(int) * iters * nth);
+  long csw0[64][2], csw1[64][2];
+  long i, slow = 0;
+  double sum = 0;
+  for (i = 0; i < PLACE_MAXCPU; ++i)
+    cpu_core[i] = cpu_chip[i] = -2;
+
+  // Warm up.
+  for (i = 0; i < 1000; ++i) {
+#pragma omp parallel num_threads(nth)
+    { __asm__ volatile("" ::: "memory"); }
+  }
+  // Pass 1, with each thread's context switches around it.
+#pragma omp parallel num_threads(nth)
+  {
+    struct rusage ru;
+    int t = omp_get_thread_num();
+    getrusage(RUSAGE_THREAD, &ru);
+    csw0[t][0] = ru.ru_nvcsw;
+    csw0[t][1] = ru.ru_nivcsw;
+  }
+  for (i = 0; i < iters; ++i) {
+    double a = now();
+#pragma omp parallel num_threads(nth)
+    { __asm__ volatile("" ::: "memory"); }
+    t1[i] = (float)((now() - a) * 1e6);
+    sum += t1[i];
+  }
+#pragma omp parallel num_threads(nth)
+  {
+    struct rusage ru;
+    int t = omp_get_thread_num();
+    getrusage(RUSAGE_THREAD, &ru);
+    csw1[t][0] = ru.ru_nvcsw;
+    csw1[t][1] = ru.ru_nivcsw;
+  }
+
+  // Pass 2.
+  double c0 = now();
+  for (i = 0; i < 100000; ++i)
+    cpu[0] = sched_getcpu();
+  double ccost = (now() - c0) / 100000 * 1e9;
+  for (i = 0; i < iters; ++i) {
+    double a = now();
+#pragma omp parallel num_threads(nth)
+    cpu[i * nth + omp_get_thread_num()] = sched_getcpu();
+    t2[i] = (float)((now() - a) * 1e6);
+  }
+
+  // Pass 1: the distribution of region times.
+  float p50, p90, p99;
+  pct(t1, iters, &p50, &p90, &p99);
+  for (i = 0; i < iters; ++i)
+    slow += t1[i] > 2 * p50;
+  printf("place: %d threads, %ld regions, sched_getcpu %.0f ns\n", nth, iters,
+      ccost);
+  printf("  timed:  us/region p50 %.3f p90 %.3f p99 %.3f mean %.3f;"
+         " %.1f%% over 2x p50\n",
+      p50, p90, p99, sum / iters, 100.0 * slow / iters);
+  long v = 0, inv = 0;
+  for (int t = 0; t < nth; ++t) {
+    v += csw1[t][0] - csw0[t][0];
+    inv += csw1[t][1] - csw0[t][1];
+  }
+  printf("  timed:  context switches per 1000 regions, all threads:"
+         " voluntary %.2f involuntary %.2f\n",
+      1000.0 * v / iters, 1000.0 * inv / iters);
+
+  // Pass 2: where the threads ran.
+  long far[4] = {0}, wd[4] = {0}, mig[2] = {0};
+  float *byd[4];
+  long nbyd[4] = {0};
+  for (int d = 0; d < 4; ++d)
+    byd[d] = malloc(sizeof(float) * iters);
+  static char used[PLACE_MAXCPU];
+  int ncpu = 0, npol[5] = {0};
+  for (i = 0; i < iters; ++i) {
+    int *c = &cpu[i * nth], fd = 0;
+    for (int t = 0; t < nth; ++t) {
+      if (c[t] >= 0 && c[t] < PLACE_MAXCPU && !used[c[t]]) {
+        used[c[t]] = 1;
+        ++ncpu;
+      }
+      if (i && c[t] != cpu[(i - 1) * nth + t])
+        ++mig[t != 0];
+      if (t) {
+        int d = distance(c[0], c[t]);
+        ++wd[d];
+        fd = d > fd ? d : fd;
+      }
+    }
+    ++far[fd];
+    byd[fd][nbyd[fd]++] = t2[i];
+  }
+  for (int c = 0; c < PLACE_MAXCPU; ++c)
+    if (used[c]) {
+      load_cpu(c);
+      const char *k = "hmlz?";
+      ++npol[strchr(k, cpu_pol[c]) - k];
+    }
+  long nw = iters * (nth - 1);
+  printf("  traced: %d CPUs used (polarization: %d vh, %d vm, %d vl, "
+         "%d horizontal, %d unknown);\n"
+         "          migrations per 1000 regions: leader %.2f, each worker "
+         "%.2f\n",
+      ncpu, npol[0], npol[1], npol[2], npol[3], npol[4],
+      1000.0 * mig[0] / iters,
+      nth > 1 ? 1000.0 * mig[1] / iters / (nth - 1) : 0.0);
+  printf("  traced: workers from the leader: same CPU %.1f%%, SMT sibling "
+         "%.1f%%, same chip %.1f%%, other chip %.1f%%\n",
+      100.0 * wd[0] / nw, 100.0 * wd[1] / nw, 100.0 * wd[2] / nw,
+      100.0 * wd[3] / nw);
+  static const char *dn[4] = {"same CPU", "SMT sibling", "same chip",
+      "other chip"};
+  for (int d = 0; d < 4; ++d) {
+    if (!nbyd[d])
+      continue;
+    pct(byd[d], nbyd[d], &p50, &p90, &p99);
+    printf("  traced: farthest worker on %-11s %5.1f%% of regions,"
+           " us/region p50 %.3f p90 %.3f p99 %.3f\n",
+        dn[d], 100.0 * far[d] / iters, p50, p90, p99);
+  }
+  for (int d = 0; d < 4; ++d)
+    free(byd[d]);
+  free(t1);
+  free(t2);
+  free(cpu);
+}
+#else
+static void test_place(long iters) {
+  (void)iters;
+  printf("place: Linux only\n");
+}
+#endif
+
+// -----------------------------------------------------------------------------
 // nestbench: the zDNNx shape, an outer team of n1 whose members each fork an
 // inner team of n2, then an inner loop and barrier. Needs
 // OMP_MAX_ACTIVE_LEVELS=2 and a limit of at least n1 * n2.
@@ -683,6 +908,8 @@ int main(int argc, char **argv) {
     test_loop(n ? n : 100000);
   else if (!strcmp(test, "bench"))
     test_bench(n ? n : 100000);
+  else if (!strcmp(test, "place"))
+    test_place(n ? n : 100000);
   else if (!strcmp(test, "nestbench"))
     test_nestbench(n ? n : 100000, argc > 3 ? atoi(argv[3]) : 4,
         argc > 4 ? atoi(argv[4]) : 4);

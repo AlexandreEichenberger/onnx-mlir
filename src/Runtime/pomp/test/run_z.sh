@@ -21,6 +21,7 @@
 #   CPUS=                               # CPUs to pin to (default: those this
 #                                       # process may use); see "Placement"
 #   QUICK=1                             # shorter correctness runs
+#   ZB_MAP=1                            # also run pomp_zbench sections 1, 2
 #
 # Builds pomp twice (with __thread, and with -DPOMP_USE_PTHREAD_KEY), runs the
 # tests against each, and times pomp against libomp.
@@ -318,13 +319,31 @@ if [ $HAVE_LIBOMP = 1 ]; then
   echo "plain libomp, which builds them again each region, is in the table above."
 fi
 
+note "placement: where threads run, empty fork/join (one run of 100000 per row)"
+echo "timed: each region timed alone. traced: each thread records its CPU in"
+echo "each region (slower), and regions are grouped by the farthest worker from"
+echo "the leader. Context switches are over the timed pass, all threads."
+for L in $LIMITS; do
+  for rt in $RUNTIMES; do
+    for place in free pinned; do
+      P=$([ $place = pinned ] && echo "POMP_TEST_CPUS=$CPUS")
+      echo "-- T=$L $rt $place"
+      env $LIBENV OMP_THREAD_LIMIT=$L OMP_NUM_THREADS=$L $P "$(exe $rt)" place 100000 2>&1
+    done
+  done
+done
+
 ZB_TS=$(echo $LIMITS | tr ' ' ',')
-note "pomp_zbench, sections 1 and 2 (atomics; line transfer by topology)"
-POMP_ZB_SECTIONS=1,2 "$B/pomp_zbench" $ZB_TS 2>&1 | sed -n '/^1\./,/^done/p' | sed '$d'
+# Sections 1 and 2 (atomics, line transfer by topology) are settled: see
+# POMP_Z_Tuning.md. ZB_MAP=1 runs them again.
+if [ "${ZB_MAP:-0}" = 1 ]; then
+  note "pomp_zbench, sections 1 and 2 (atomics; line transfer by topology)"
+  POMP_ZB_SECTIONS=1,2 "$B/pomp_zbench" $ZB_TS 2>&1 | sed -n '/^1\./,/^done/p' | sed '$d'
+fi
 note "pomp_zbench, sections 4 and 6 (fork/join designs; F is pomp today)"
 POMP_ZB_SECTIONS=4,6 "$B/pomp_zbench" $ZB_TS 2>&1 | sed -n '/^4\./,/^done/p' | sed '$d'
-note "pomp_zbench, sections 4 and 6, body = 2000 iterations"
-POMP_ZB_SECTIONS=4,6 POMP_ZB_WORK=2000 "$B/pomp_zbench" $ZB_TS 2>&1 |
+note "pomp_zbench, section 4, body = 2000 iterations"
+POMP_ZB_SECTIONS=4 POMP_ZB_WORK=2000 "$B/pomp_zbench" $ZB_TS 2>&1 |
   sed -n '/^4\./,/^done/p' | sed '$d'
 
 note "summary: $fail failures"
