@@ -320,13 +320,15 @@ if [ $HAVE_LIBOMP = 1 ]; then
   echo "plain libomp, which builds them again each region, is in the table above."
 fi
 
-# One row of the one-level table, saved for the best-of summary.
+# One row of the one-level table, saved for the best-of summary. ONE_PRE, if
+# set, is a command to run the test under (taskset).
+ONE_PRE=
 one_row() { # T runtime place env-assignments...
   local L=$1 rt=$2 place=$3 X b lo
   shift 3
   X=$(exe $rt)
-  b=$(runs5 env $LIBENV OMP_THREAD_LIMIT=$L OMP_NUM_THREADS=$L "$@" "$X" bench 100000)
-  lo=$(runs5 env $LIBENV OMP_THREAD_LIMIT=$L OMP_NUM_THREADS=$L "$@" "$X" loop 100000)
+  b=$(runs5 $ONE_PRE env $LIBENV OMP_THREAD_LIMIT=$L OMP_NUM_THREADS=$L "$@" "$X" bench 100000)
+  lo=$(runs5 $ONE_PRE env $LIBENV OMP_THREAD_LIMIT=$L OMP_NUM_THREADS=$L "$@" "$X" loop 100000)
   local fj ba re wo ov
   fj=$(echo "$b" | med_of join)
   ba=$(echo "$b" | med_of barrier)
@@ -350,6 +352,13 @@ if [ -r /sys/devices/system/cpu/cpu0/topology/core_id ]; then
     f=$(topo $c thread_siblings_list | sed 's/[-,].*//')
     [ "$f" = "$c" ] && echo $c
   done | paste -sd, -)
+  # The CPUs of C0's chip, and one per core of them.
+  CHIP=$(for c in $ALL; do [ "$(chip_of $c)" = "$(chip_of $C0)" ] && echo $c; done |
+    paste -sd, -)
+  CHIP1=$(echo "$PERCORE" | tr ',' '\n' | while read c; do
+    [ "$(chip_of $c)" = "$(chip_of $C0)" ] && echo $c; done | paste -sd, -)
+  NCHIP=$(echo "$CHIP" | tr ',' '\n' | wc -l)
+  NCHIP1=$(echo "$CHIP1" | tr ',' '\n' | wc -l)
   # A partner for CPU C0: its SMT sibling, a CPU of another core of its
   # chip, and a CPU of another chip.
   SIB= NEAR= FAR=
@@ -365,16 +374,26 @@ if [ -r /sys/devices/system/cpu/cpu0/topology/core_id ]; then
   done
 
   note "placement variants, one level, us per region (median of 5 runs of 100000)"
-  echo "pinned2: thread t on the t-th CPU of $CPUS (two threads per core, as 'pinned')."
   echo "pinned1: thread t on the t-th of one CPU per core, $(echo $PERCORE | cut -c1-40)..."
+  echo "chip-free: not pinned, but the process limited (taskset) to the leader's"
+  echo "  chip, CPUs $CHIP; only for T <= $NCHIP."
+  echo "chip1-free: the same, one CPU per core of the chip, $CHIP1; T <= $NCHIP1."
   echo "cores-close, cores-spread: libomp's own binding, OMP_PLACES=cores with"
   echo "OMP_PROC_BIND=close or spread (pomp has no such binding)."
-  echo "The free and pinned rows above count in the best-of below."
+  echo "The free and pinned (two threads per core) rows above count in the best-of below."
   printf '%-4s %-10s %-13s %9s %9s | %9s %9s %9s\n' T runtime place \
     overhead barrier region work fork/join
   for L in $LIMITS; do
     for rt in $RUNTIMES; do
       one_row $L $rt pinned1 POMP_TEST_CPUS=$PERCORE
+      if command -v taskset >/dev/null; then
+        if [ $L -le $NCHIP ]; then
+          ONE_PRE="taskset -c $CHIP" one_row $L $rt chip-free
+        fi
+        if [ $L -le $NCHIP1 ]; then
+          ONE_PRE="taskset -c $CHIP1" one_row $L $rt chip1-free
+        fi
+      fi
       if [ $rt = libomp ]; then
         one_row $L $rt cores-close OMP_PLACES=cores OMP_PROC_BIND=close
         one_row $L $rt cores-spread OMP_PLACES=cores OMP_PROC_BIND=spread
