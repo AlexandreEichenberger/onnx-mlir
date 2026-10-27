@@ -445,6 +445,69 @@ if [ -r /sys/devices/system/cpu/cpu0/topology/core_id ]; then
         "$(echo "$b" | med_of barrier)" "$(echo "$lo" | med_of work)"
     done
   done
+
+  # SMT interference at a join or a barrier, with uneven work: does a thread
+  # that waits slow the work of its SMT sibling more than spinning saves?
+  note "uneven work: a waiting thread next to a computing one, us per phase (median of 5)"
+  echo "Even tids run LONG passes of work, odd tids SHORT (one pass: 1024 floats,"
+  echo "about 0.08 us), then all meet; join,ldr-short swaps them, so the leader,"
+  echo "short, waits at the join next to a long worker."
+  echo "  join: one region per phase. barrier: 10 barriers per region."
+  echo "  sibling: tids 2k, 2k+1 on the two SMT threads of one core (CPUs ${C0},${SIB}...);"
+  echo "  own core: every thread on a core of its own, same chip."
+  echo "  alone: the LONG work with one thread. excess = phase - alone: the runtime's"
+  echo "  overhead plus the slowdown of the long work by its waiting sibling."
+  echo "Wait policies: pomp POMP_SPIN = spins before sleeping (default 200000; 0"
+  echo "sleeps at once); libomp KMP_BLOCKTIME = time spinning before sleeping."
+  # CPUs for T threads: pairs of SMT siblings, or one per core, on C0's chip.
+  PAIRS=$(for c in $(echo "$CHIP1" | tr ',' ' '); do
+    echo "$c,$(expand "$(topo $c thread_siblings_list)" | grep -vx $c | head -1)"
+  done | paste -sd, -)
+  printf '%-2s %-8s %-14s %-9s %-6s %-20s %9s %9s\n' T place sync long/shrt runtime \
+    policy phase excess
+  for sz in 250/25/1000 2500/250/100; do
+    lg=$(echo $sz | cut -d/ -f1) sh=$(echo $sz | cut -d/ -f2) it=$(echo $sz | cut -d/ -f3)
+    for rt in $RUNTIMES; do
+      eval "alone_$rt=\$(runs5 env $LIBENV OMP_THREAD_LIMIT=1 OMP_NUM_THREADS=1 \
+        POMP_TEST_CPUS=$C0 \"\$(exe $rt)\" imbal $it $lg $sh | med_of phase)"
+    done
+    for T in 2 4; do
+      for place in sibling own-core; do
+        if [ $place = sibling ]; then
+          P=$(echo "$PAIRS" | cut -d, -f1-$T)
+        else
+          P=$(echo "$CHIP1" | cut -d, -f1-$T)
+        fi
+        [ $(echo "$P" | tr ',' '\n' | grep -c .) = $T ] || continue
+        for sync in "join even" "join odd" "barrier even"; do
+          case $sync in
+          "join even") sname=join ;;
+          "join odd") sname=join,ldr-short ;;
+          *) sname=barrier ;;
+          esac
+          for rt in $RUNTIMES; do
+            if [ $rt = pomp ]; then
+              POLS="POMP_SPIN=200000 POMP_SPIN=20000 POMP_SPIN=2000 POMP_SPIN=0"
+            else
+              POLS="KMP_BLOCKTIME=200 KMP_BLOCKTIME=20us KMP_BLOCKTIME=0"
+            fi
+            eval "al=\$alone_$rt"
+            for pol in $POLS; do
+              ph=$(runs5 env $LIBENV OMP_THREAD_LIMIT=$T OMP_NUM_THREADS=$T \
+                POMP_TEST_CPUS=$P $pol "$(exe $rt)" imbal $it $lg $sh $sync |
+                med_of phase)
+              ex=$(awk -v a="$ph" -v b="$al" 'BEGIN { printf "%.2f", a - b }')
+              printf '%-2s %-8s %-14s %-9s %-6s %-20s %9s %9s\n' $T $place \
+                $sname $lg/$sh $rt $pol "$ph" "$ex"
+            done
+          done
+        done
+      done
+    done
+    for rt in $RUNTIMES; do
+      eval "echo \"alone, $lg passes, $rt: \$alone_$rt us\""
+    done
+  done
 fi
 
 # Where free and pinned threads run (section 6 of POMP_Z_Tuning.md), settled:

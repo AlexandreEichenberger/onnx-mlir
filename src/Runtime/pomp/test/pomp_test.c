@@ -29,6 +29,10 @@
 //                the runtime's overhead per region
 //   nestbench N1 N2 : nested region, N1 outer threads each forking N2; prints
 //                the region, work and overhead as `loop` does
+//   imbal N LONG SHORT [join|barrier] [even|odd] : N regions in which the
+//                even (or odd) tids run LONG passes of work and the others
+//                SHORT, then meet at the join or at 10 barriers; prints the
+//                time per phase (work and wait)
 //   place      : empty fork/join regions, timed one by one, then traced:
 //                where each thread runs, and the time of a region by how far
 //                its farthest worker is from the leader (Linux)
@@ -830,6 +834,63 @@ static void test_place(long iters) {
 #endif
 
 // -----------------------------------------------------------------------------
+// imbal: SMT interference at a join or a barrier. In each region the threads
+// of even tid run `lng` passes of work and those of odd tid `shrt` (with
+// `odd`, the reverse: the leader is short), then meet at the join, or at a
+// barrier `phases` times per region. With POMP_TEST_CPUS listing both SMT
+// threads of each core in turn, tids 2k and 2k+1 share a core: every long
+// thread computes next to a short one that waits. Prints the time of a
+// phase. Against the same run with one thread (the long work alone, its
+// sibling idle), the excess is the runtime's overhead plus the slowdown of
+// the long work by its waiting sibling.
+// -----------------------------------------------------------------------------
+
+static float imb_data[64][1024];
+
+// One pass: the loop of `loop`, on 1024 floats in L1.
+__attribute__((noinline)) static void imb_work(float *a, long passes, float s) {
+  for (long p = 0; p < passes; ++p) {
+    for (int i = 0; i < 1024; ++i)
+      a[i] *= s;
+    __asm__ volatile("" ::: "memory");
+  }
+}
+
+static void test_imbal(long iters, long lng, long shrt, int barrier, int odd) {
+  int phases = barrier ? 10 : 1;
+  volatile float vs = 1.0f;
+  float s = vs;
+  double t0 = 0;
+  long i;
+  int nth = 0;
+  for (i = 0; i < iters / 10 + 10 + iters; ++i) {
+    if (i == iters / 10 + 10)
+      t0 = now();
+#pragma omp parallel
+    {
+      int t = omp_get_thread_num();
+      long w = (t & 1) == odd ? lng : shrt;
+      if (t == 0)
+        nth = omp_get_num_threads();
+      float *a = imb_data[t & 63];
+      if (barrier) {
+        for (int k = 0; k < phases; ++k) {
+          imb_work(a, w, s);
+#pragma omp barrier
+        }
+      } else {
+        imb_work(a, w, s);
+      }
+    }
+  }
+  double phase = (now() - t0) / iters / phases;
+  printf("imbal: %d threads, %s, long %ld short %ld passes on %s tids, "
+         "phase %.3f us\n",
+      nth, barrier ? "barrier" : "join", lng, shrt, odd ? "odd" : "even",
+      phase * 1e6);
+}
+
+// -----------------------------------------------------------------------------
 // nestbench: the zDNNx shape, an outer team of n1 whose members each fork an
 // inner team of n2, then an inner loop and barrier. Needs
 // OMP_MAX_ACTIVE_LEVELS=2 and a limit of at least n1 * n2.
@@ -908,6 +969,10 @@ int main(int argc, char **argv) {
     test_loop(n ? n : 100000);
   else if (!strcmp(test, "bench"))
     test_bench(n ? n : 100000);
+  else if (!strcmp(test, "imbal"))
+    test_imbal(n ? n : 1000, argc > 3 ? atol(argv[3]) : 2500,
+        argc > 4 ? atol(argv[4]) : 250, argc > 5 && !strcmp(argv[5], "barrier"),
+        argc > 6 && !strcmp(argv[6], "odd"));
   else if (!strcmp(test, "place"))
     test_place(n ? n : 100000);
   else if (!strcmp(test, "nestbench"))
