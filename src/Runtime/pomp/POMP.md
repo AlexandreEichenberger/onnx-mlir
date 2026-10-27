@@ -200,7 +200,8 @@ recruits it, and it returns to the host normally. A thread joins a cycle only by
 ### Supported scenarios
 
 Each scenario has a test in `test/pomp_host_test.c`. All of them pass at thread limits 2, 3, 4,
-8, 16 and 17, with `POMP_SPIN` set to 0, 30 and 200000 and both barrier kinds, and run clean
+8, 16 and 17, with `POMP_SPIN` set to 0, 30 and 200000 (iterations, before it became µs; `run_z.sh`
+now uses 0, 5 and 200000 µs) and both barrier kinds, and run clean
 under ThreadSanitizer.
 
 **S1. Fresh threads per inference, killed after use** (`fresh`).
@@ -807,14 +808,14 @@ entering the pool standing in for the host) and libomp, so their outputs can be 
 |---|---|---|
 | `pomp_test static` | Owner of every iteration for 5 IV types × 13 trip counts × 4 steps × chunked, for every team size up to the limit | Digest identical to libomp at limits 1, 2, 3, 4, 5, 8, 16 |
 | `pomp_test nested` | Team size at each level of the zDNNx 3-level `if` nest; `collapse(4)` | Identical to libomp with nesting off, `OMP_NUM_THREADS=4,4`, and `OMP_MAX_ACTIVE_LEVELS=2` (including partial 4/2 teams at limit 8) |
-| `pomp_test stress N` | Many regions of varying size with a barrier | 200000 regions, no errors, at `POMP_SPIN` 200000, 50 and 0 |
+| `pomp_test stress N` | Many regions of varying size with a barrier | 200000 regions, no errors, at `POMP_SPIN` 200000, 50 and 0 (iterations, before it became µs); on z now 0, 5 and 200000 µs |
 | `pomp_test barriers N` | 1–5 barrier pairs per region, team sizes 1 to the limit: after each barrier, every thread must see every other thread's write from before it | No errors at limits 1, 2, 3, 4, 5, 8, 16 and 17, with `POMP_TREE_BARRIER` 0, 2, 5 and 65; also under ThreadSanitizer |
 | `pomp_test cycles N` | Enter, run 10 regions, close: the per-inference pattern | 20000 cycles, no errors; about 200 µs per cycle at limit 8, mostly `pthread_create`/`join` in the test host |
 | `pomp_test bench`, `loop`, `nestbench N n1 n2` | Timings: empty fork/join and barrier; one loop region; an outer team of n1 whose members each fork n2 threads for a loop. `POMP_TEST_CPUS` pins thread t to the t-th CPU listed, for pomp and libomp alike | See `test/run_z.sh`, which runs them against libomp |
-| `pomp_host_test <scenario>` | Host protocol scenarios S1–S13 above, and `latency` (leader time in `pomp_close_pool`) | All pass at limits 2, 3, 4, 8, 16 and 17, `POMP_SPIN` 0, 30 and 200000, both barrier kinds, with 1500-cycle soak runs; no ThreadSanitizer reports. Limit 1 is not a supported test configuration: `late` and `swap` assume a slot 1 exists |
+| `pomp_host_test <scenario>` | Host protocol scenarios S1–S13 above, and `latency` (leader time in `pomp_close_pool`) | All pass at limits 2, 3, 4, 8, 16 and 17, `POMP_SPIN` 0, 30 and 200000 (iterations, before it became µs; `run_z.sh` now uses 0, 5 and 200000 µs), both barrier kinds, with 1500-cycle soak runs; no ThreadSanitizer reports. Limit 1 is not a supported test configuration: `late` and `swap` assume a slot 1 exists |
 | `pomp_irbuilder_test` | Code from `-fopenmp-enable-irbuilder`, the OpenMPIRBuilder path MLIR uses, which calls `__kmpc_global_thread_num` on workers | Correct at limits 1, 4, 18; also with `POMP_USE_PTHREAD_KEY` |
-| `test/run_sweep.sh` | Builds both thread-slot variants and runs the tests above (except the timings) at limits 1 to 64, `POMP_TREE_BARRIER` 2, 5 and 65, `POMP_SPIN` 0 and 200000; at 1 active level, and at 2 (`barriers2`, `lockstep`, `nested`, `nestbench` shapes 2x2 to 8x8, host `nest` and `steal`) | 3228 runs, no failures |
-| ThreadSanitizer | `static`, `nested` (both nesting modes), `stress`, `barriers`, `cycles`, and all of `pomp_host_test`, with both barrier kinds and `POMP_SPIN` 0 and 30 | No reports |
+| `test/run_sweep.sh` | Builds both thread-slot variants and runs the tests above (except the timings) at limits 1 to 64, `POMP_TREE_BARRIER` 2, 5 and 65, `POMP_SPIN` 0 and 200000 (µs since the change; the 3228 runs below were with iterations); at 1 active level, and at 2 (`barriers2`, `lockstep`, `nested`, `nestbench` shapes 2x2 to 8x8, host `nest` and `steal`) | 3228 runs, no failures |
+| ThreadSanitizer | `static`, `nested` (both nesting modes), `stress`, `barriers`, `cycles`, and all of `pomp_host_test`, with both barrier kinds and `POMP_SPIN` 0 and 30 (iterations, before it became µs) | No reports |
 
 Measured costs against libomp are in "Cost compared with libomp" in the example section above.
 

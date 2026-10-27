@@ -241,6 +241,27 @@ for L in $LIMITS; do
   done
 done
 
+# The spin time of pomp's waits against the cost of regions where nothing
+# computes while threads wait: back-to-back regions, nested regions.
+note "pomp spin time (POMP_SPIN, us), us per region (median of 5 runs)"
+echo "One level: overhead and fork/join, at T=8 and 16. Nested: overhead, 4x4 and 8x8."
+printf '%-8s %9s %9s %9s %9s %9s %9s\n' POMP_SPIN "ov T=8" "fj T=8" "ov T=16" "fj T=16" \
+  "nest 4x4" "nest 8x8"
+for S in 0 5 20 50 100 200000; do
+  row=
+  for L in 8 16; do
+    E="env OMP_THREAD_LIMIT=$L OMP_NUM_THREADS=$L POMP_SPIN=$S"
+    row="$row $(runs5 $E "$(exe pomp)" loop 100000 | med_of overhead)"
+    row="$row $(runs5 $E "$(exe pomp)" bench 100000 | med_of join)"
+  done
+  for sh in 4x4 8x8; do
+    n1=${sh%x*} n2=${sh#*x}
+    row="$row $(runs5 env POMP_SPIN=$S OMP_MAX_ACTIVE_LEVELS=2 OMP_THREAD_LIMIT=$((n1 * n2)) \
+      "$(exe pomp)" nestbench 50000 $n1 $n2 | med_of overhead)"
+  done
+  printf '%-8s %9s %9s %9s %9s %9s %9s\n' $S $row
+done
+
 note "nested, outer x inner threads, us per outer region (median of 5 runs of 50000)"
 echo "Each outer member forks an inner team that runs one loop and its barrier."
 echo "overhead = region - work; work = one inner thread's share of the loop."
