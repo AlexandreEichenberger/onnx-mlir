@@ -268,6 +268,8 @@ void forkCall(Microtask fn, int32_t argc, void **argv) {
   }
   // We are now forking the work with w.slot() as the leader.
   threads[w.slot()].fork(w.slot(), want, fn, argc, argv);
+  // If the leader took the root for itself, now that we have finished the fork,
+  // release the root for other level-1 region to take it again.
   if (entry == Root::Entry::Taken)
     root.leave();
 }

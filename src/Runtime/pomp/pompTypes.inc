@@ -208,7 +208,9 @@ private:
   // Wake-up and team words, on one line, used in turn: the recruiter writes
   // it only while the thread is idle, the team only while it runs the work.
   struct alignas(kCacheLine) WakeLine {
-    // The epoch the pool thread waits on.
+    // The epoch the pool thread waits on. Incremented by 1 by
+    // the recruiter, then by 1 by the team after the join. The pool thread
+    // spins on it, then sleeps if it does not change.
     Atomic<uint64_t> go;
     // Assignment, written before `go`.
     Team *team = nullptr;

@@ -17,7 +17,7 @@ free and pinned the same way (`CPUS`, default those allowed to the process):
 - one level, team sizes `LIMITS` (default 2 4 8 16): empty fork/join, barrier, loop region;
 - nested, shapes `NESTS` (default 4x4 4x8 8x4 8x8): an outer team whose members each fork an
   inner team that runs a loop;
-- `pomp_zbench` sections 4 and 6, with an empty body and with `POMP_ZB_WORK=2000`.
+- `pomp_zbench` sections 1 and 2, then 4 and 6 with an empty body and with `POMP_ZB_WORK=2000`.
 
 Please send the whole output with `lscpu -e`.
 
@@ -92,9 +92,15 @@ Fork/join designs in section 4, all with spinning workers and an empty body unle
 | G | as F | the leader sweeps a mask of the workers not yet done, reading each flag until it is done and never again | |
 | G' | as G, waking workers T-1 down to 1 | as G | |
 | H | as F | done bytes, 8 to a line; the leader reads one word per 8 workers | |
+| I | as F, with epoch, assignment and done flag on one line per worker | per-worker done flags, on that line | pomp's layout |
+| J | as I, storing the epoch (release) instead of a seq_cst `fetch_add` | as I | |
+| K | as J, prefetching every worker's line for store first | as I | |
+| L | as J, waking the workers farthest from the leader first | as I | farthest by section 2's latency |
 
 F against F' shows how much the order of F's scan costs; G against F' shows how much the sweep
-recovers. Section 6 times F, F', G and G' with a clock every CPU shares (`STCKF` on Z), as ns
+recovers. I to L attack the wake loop: I against F is the cost of a second line per worker,
+J against I that of the serializing `fetch_add`, K against J whether the line transfers can be
+started together, and L against J whether starting the farthest ones first helps. Section 6 times F, F', G and G' with a clock every CPU shares (`STCKF` on Z), as ns
 after the leader starts waking:
 
 | Column | Meaning |
@@ -105,6 +111,9 @@ after the leader starts waking:
 | tail | from `donelast` to the end of the leader's join: what the join adds to the critical path |
 | region | the whole region, as the leader sees it |
 | last w, w=1, w=T-1 | which worker is done last: the mean, and how often it is the first or the last one F polls |
+| alone | the wake loop with no worker spinning, its lines in the leader's cache: its instructions alone |
+
+Section 6 first prints the one-way latency from the leader's CPU to each worker's, which L uses.
 
 Set `POMP_ZB_SECTIONS` (for example `4,6`) to run only some sections.
 

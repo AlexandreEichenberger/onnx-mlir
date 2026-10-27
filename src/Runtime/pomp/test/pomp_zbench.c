@@ -50,13 +50,19 @@
 //           instead of waiting on each in turn
 //        G' G, waking the workers in reverse order
 //        H  F, with done bytes packed 8 to a line
+//        I  F, with each worker's epoch, assignment and done flag on one line
+//           (as pomp lays them out)
+//        J  I, with a release store of the epoch instead of a fetch_add
+//        K  J, prefetching every worker's line for store before the stores
+//        L  J, waking the workers farthest from the leader first
 //   5. Barrier designs, per barrier, with T threads:
 //        central  counter + epoch word (pomp today)
 //        tree+bc  4-ary tree gather + broadcast epoch word
 //        tree+tr  4-ary tree gather + 4-ary tree release
-//   6. Anatomy of F, F', G, G' regions: when the workers see the wake-up,
-//      when the last one is done, and how long the leader's join takes after
-//      that; and which worker is last.
+//   6. Anatomy of F, F', G', I, J, K, L regions: when the workers see the
+//      wake-up, when the last one is done, and how long the leader's join
+//      takes after that; which worker is last; and the wake loop alone, with
+//      no worker spinning.
 //
 //===----------------------------------------------------------------------===//
 
@@ -425,6 +431,10 @@ enum {
   M_EPOCH_SWEEP,
   M_EPOCH_SWEEP_REV,
   M_EPOCH_BYTES,
+  M_LINE,
+  M_LINE_STORE,
+  M_LINE_PREFETCH,
+  M_LINE_FAR,
   NMODELS
 };
 static const char *model_name[NMODELS] = {
@@ -438,10 +448,18 @@ static const char *model_name[NMODELS] = {
     "G epoch/worker + done flags, sweep pending",
     "G' G, waking in reverse order",
     "H epoch/worker + done bytes, 8 per line",
+    "I go+assignment+done on one line (as pomp)",
+    "J I, release store instead of fetch_add",
+    "K J, prefetch lines for store first",
+    "L J, farthest workers woken first",
 };
 
-// Models A and F on: per-worker epoch wake and assignment.
-static int is_epoch(int m) { return m == M_EPOCH || m >= M_EPOCH_FLAGS; }
+// Models I on: one line per worker.
+static int is_line(int m) { return m >= M_LINE; }
+// Models A and F to H: per-worker epoch wake and assignment.
+static int is_epoch(int m) {
+  return m == M_EPOCH || (m >= M_EPOCH_FLAGS && !is_line(m));
+}
 
 static line_t go_[MAXT], done_[MAXT], wake_[MAXT];
 static struct {
@@ -451,6 +469,17 @@ static struct {
 static struct {
   _Alignas(CL) void (*fn)(int);
 } team;
+static struct {
+  _Alignas(CL) _Atomic uint64_t go;
+  void (*fn)(int);
+  int tid;
+  _Atomic uint64_t done;
+} wl_[MAXT];
+// Order in which the leader wakes the workers, and each worker's one-way
+// latency from the leader (ns; for L).
+static int wake_order[MAXT];
+static double lat_[MAXT];
+static int lat_known;
 static line_t arrived, activate, stopf;
 static line_t dbytes_[MAXT / 8];
 static uint64_t dbytes_mask[MAXT / 8];
@@ -488,9 +517,16 @@ static void *fj_worker(void *arg) {
     void (*fn)(int);
     int tid;
     // Wait for the next region.
-    switch (is_epoch(model) ? M_EPOCH : model) {
+    switch (is_epoch(model) ? M_EPOCH : is_line(model) ? M_LINE : model) {
     case M_EPOCH:
       while (atomic_load_explicit(&go_[w].v, memory_order_acquire) == r) {
+        if (STOPPED())
+          return NULL;
+        relax();
+      }
+      break;
+    case M_LINE:
+      while (atomic_load_explicit(&wl_[w].go, memory_order_acquire) == r) {
         if (STOPPED())
           return NULL;
         relax();
@@ -517,8 +553,8 @@ static void *fj_worker(void *arg) {
     ++r;
     if (stamping)
       stamp_[w].go = ticks();
-    fn = is_epoch(model) ? asg[w].fn : team.fn;
-    tid = is_epoch(model) ? asg[w].tid : w;
+    fn = is_epoch(model) ? asg[w].fn : is_line(model) ? wl_[w].fn : team.fn;
+    tid = is_epoch(model) ? asg[w].tid : is_line(model) ? wl_[w].tid : w;
     fn(tid);
     if (stamping)
       stamp_[w].fin = ticks();
@@ -539,6 +575,12 @@ static void *fj_worker(void *arg) {
       __atomic_store_n((uint8_t *)&dbytes_[w / 8].v + w % 8, (uint8_t)r,
           __ATOMIC_RELEASE);
       break;
+    case M_LINE:
+    case M_LINE_STORE:
+    case M_LINE_PREFETCH:
+    case M_LINE_FAR:
+      atomic_store_explicit(&wl_[w].done, r, memory_order_release);
+      break;
     default:
       tree_join(w, r);
       atomic_store_explicit(&done_[w].v, r, memory_order_release);
@@ -547,6 +589,21 @@ static void *fj_worker(void *arg) {
 }
 
 static void fj_fork(uint64_t r) {
+  if (is_line(model)) {
+    if (model == M_LINE_PREFETCH)
+      for (int i = 1; i < T; ++i)
+        __builtin_prefetch(&wl_[wake_order[i]], 1, 3);
+    for (int i = 1; i < T; ++i) {
+      int w = wake_order[i];
+      wl_[w].fn = body;
+      wl_[w].tid = w;
+      if (model == M_LINE)
+        atomic_fetch_add(&wl_[w].go, 1);
+      else
+        atomic_store_explicit(&wl_[w].go, r, memory_order_release);
+    }
+    return;
+  }
   switch (is_epoch(model) ? M_EPOCH : model) {
   case M_EPOCH: {
     int rev = model == M_EPOCH_FLAGS_REV || model == M_EPOCH_SWEEP_REV;
@@ -603,6 +660,14 @@ static void fj_join(uint64_t r) {
   case M_EPOCH_SWEEP_REV:
     sweep_join(r);
     break;
+  case M_LINE:
+  case M_LINE_STORE:
+  case M_LINE_PREFETCH:
+  case M_LINE_FAR:
+    for (int w = 1; w < T; ++w)
+      while (atomic_load_explicit(&wl_[w].done, memory_order_acquire) != r)
+        relax();
+    break;
   case M_EPOCH_BYTES: {
     uint64_t want = (r & 0xff) * 0x0101010101010101ull;
     for (int g = 0; g * 8 < T; ++g)
@@ -627,6 +692,8 @@ static void reset_lines(void) {
     atomic_store(&go_[i].v, 0);
     atomic_store(&done_[i].v, 0);
     atomic_store(&wake_[i].v, 0);
+    atomic_store(&wl_[i].go, 0);
+    atomic_store(&wl_[i].done, 0);
   }
   for (int g = 0; g < MAXT / 8; ++g) {
     union {
@@ -647,11 +714,44 @@ static void reset_lines(void) {
 
 static pthread_t fj_th[MAXT];
 
-static void fj_start(int m, int t) {
+// One-way latency from the leader's CPU to each worker's, measured once.
+static void measure_latencies(void) {
+  long saved = pp_iters;
+  if (lat_known)
+    return;
+  pp_iters = 20000;
+  for (int w = 1; w < MAXT && w < ncpus; ++w)
+    lat_[w] = pingpong(cpus[w]);
+  pp_iters = saved;
+  lat_known = 1;
+}
+
+// Workers 1 to T-1, in index order, or for L farthest first.
+static void set_wake_order(void) {
+  for (int i = 1; i < T; ++i)
+    wake_order[i] = i;
+  if (model != M_LINE_FAR)
+    return;
+  measure_latencies();
+  for (int i = 2; i < T; ++i)
+    for (int j = i; j > 1 && lat_[wake_order[j]] > lat_[wake_order[j - 1]];
+         --j) {
+      int x = wake_order[j];
+      wake_order[j] = wake_order[j - 1];
+      wake_order[j - 1] = x;
+    }
+}
+
+static void fj_setup(int m, int t) {
   model = m;
   T = t;
   fullmask = (T >= 64 ? ~(uint64_t)0 : (((uint64_t)1 << T) - 1)) & ~1ull;
+  set_wake_order();
   reset_lines();
+}
+
+static void fj_start(int m, int t) {
+  fj_setup(m, t);
   for (int w = 1; w < T; ++w)
     pthread_create(&fj_th[w], NULL, fj_worker, (void *)(intptr_t)w);
   while (atomic_load(&nready) != T - 1)
@@ -707,6 +807,19 @@ static void bench_forkjoin(const int *ts, int nts, long iters) {
 
 enum { A_FORK, A_WAKE1, A_WAKEN, A_DONE, A_TAIL, A_REGION, NA };
 
+// The wake loop with no worker spinning, its lines in the leader's cache: the
+// cost of its instructions alone (ns).
+static double fork_alone(int m, int t, long iters) {
+  uint64_t r = 0, t0;
+  fj_setup(m, t);
+  for (long i = 0; i < 2000; ++i)
+    fj_fork(++r);
+  t0 = ticks();
+  for (long i = 0; i < iters; ++i)
+    fj_fork(++r);
+  return (double)(ticks() - t0) / iters * ns_per_tick;
+}
+
 static void fj_anatomy(int m, int t, long iters) {
   double sum[NA] = {0}, sumlast = 0;
   long first = 0, end = 0;
@@ -749,14 +862,15 @@ static void fj_anatomy(int m, int t, long iters) {
   printf("  %-3.*s %4d", (int)strcspn(model_name[m], " "), model_name[m], t);
   for (int k = 0; k < NA; ++k)
     printf(" %8.0f", sum[k] / iters * ns_per_tick);
-  printf(" | %6.1f %5.0f%% %5.0f%%\n", sumlast / iters, 100.0 * first / iters,
-      100.0 * end / iters);
+  printf(" | %6.1f %5.0f%% %5.0f%% | %6.0f\n", sumlast / iters,
+      100.0 * first / iters, 100.0 * end / iters, fork_alone(m, t, iters));
   fflush(stdout);
 }
 
 static void bench_anatomy(const int *ts, int nts, long iters) {
-  static const int ms[] = {
-      M_EPOCH_FLAGS, M_EPOCH_FLAGS_REV, M_EPOCH_SWEEP, M_EPOCH_SWEEP_REV};
+  static const int ms[] = {M_EPOCH_FLAGS, M_EPOCH_FLAGS_REV, M_EPOCH_SWEEP_REV,
+      M_LINE, M_LINE_STORE, M_LINE_PREFETCH, M_LINE_FAR};
+  int nms = sizeof(ms) / sizeof(ms[0]), tmax = 0;
   printf("\n6. Anatomy of a region, body = %ld dummy iterations (ns after the "
          "leader starts\n   waking; mean of %ld regions)\n",
       work_iters, iters);
@@ -764,11 +878,20 @@ static void bench_anatomy(const int *ts, int nts, long iters) {
          "worker to see\n   its wake-up. done last: last worker's done store. "
          "tail: from there to the\n   end of the leader's join. last w: "
          "which worker is done last (mean), and how\n   often it is worker 1 "
-         "(polled first) or T-1 (polled last).\n");
-  printf("  %-3s %4s %8s %8s %8s %8s %8s %8s | %6s %6s %6s\n", "", "T",
+         "(polled first) or T-1 (polled last).\n   alone: the wake loop with "
+         "no worker spinning (its instructions only).\n");
+  for (int i = 0; i < nts; ++i)
+    tmax = ts[i] > tmax ? ts[i] : tmax;
+  measure_latencies();
+  printf("   one-way ns from the leader (CPU %d), workers 1 to %d:", cpus[0],
+      tmax - 1);
+  for (int w = 1; w < tmax; ++w)
+    printf(" %.0f", lat_[w]);
+  printf("\n");
+  printf("  %-3s %4s %8s %8s %8s %8s %8s %8s | %6s %6s %6s | %6s\n", "", "T",
       "fork", "woken1st", "wokenlst", "donelast", "tail", "region", "last w",
-      "w=1", "w=T-1");
-  for (int j = 0; j < 4; ++j)
+      "w=1", "w=T-1", "alone");
+  for (int j = 0; j < nms; ++j)
     for (int i = 0; i < nts; ++i)
       if (ts[i] > 1)
         fj_anatomy(ms[j], ts[i], iters);
