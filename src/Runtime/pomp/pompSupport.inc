@@ -52,6 +52,43 @@ inline void checkPthread(int rc, const char *call) {
     fatal("pthread call failed: ", call);
 }
 
+// A monotonic clock in microseconds, cheap enough to read every few dozen
+// spins: STCKF on Linux on Z, the vDSO's clock_gettime elsewhere.
+inline uint64_t nowUs() {
+#if defined(__s390x__) && defined(__linux__)
+  uint64_t t;
+  __asm__ volatile("stckf %0" : "=Q"(t) : : "cc");
+  return t >> 12; // Bit 51 of the TOD clock is 1 us.
+#else
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return uint64_t(ts.tv_sec) * 1000000u + uint64_t(ts.tv_nsec) / 1000u;
+#endif
+}
+
+// The spin of a wait: more() is true until `limitUs` microseconds after its
+// first clock read, which comes kSpinClockStride calls in, so that waits
+// shorter than that never read the clock. A limit of 0 never spins.
+class SpinBudget {
+public:
+  explicit SpinBudget(long limitUs) : limitUs_(uint64_t(limitUs)) {}
+  bool more() {
+    if (limitUs_ == 0)
+      return false;
+    if (++n_ % kSpinClockStride)
+      return true;
+    uint64_t t = nowUs();
+    if (n_ == kSpinClockStride)
+      start_ = t;
+    return t - start_ < limitUs_;
+  }
+
+private:
+  uint64_t limitUs_;
+  uint64_t start_ = 0;
+  long n_ = 0;
+};
+
 inline void relax() {
 #if defined(__x86_64__) || defined(__i386__)
   __asm__ volatile("pause" ::: "memory");

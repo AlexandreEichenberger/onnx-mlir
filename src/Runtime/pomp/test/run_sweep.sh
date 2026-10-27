@@ -19,7 +19,7 @@
 # Builds pomp twice (with __thread, and with -DPOMP_USE_PTHREAD_KEY). For each
 # build and limit, runs every test with POMP_TREE_BARRIER 2 (tree barrier from
 # 2 threads), 5 (the default) and 65 (central only), and POMP_SPIN 0 (sleep)
-# and 200000 (spin). A run fails if it exits nonzero, or prints a nonzero
+# and 200000 (spin 0.2 s). A run fails if it exits nonzero, or prints a nonzero
 # `bad` or `errors` count, or `short teams` in nestbench. Limits above the
 # CPU count oversubscribe, and are slow with POMP_SPIN=200000.
 #

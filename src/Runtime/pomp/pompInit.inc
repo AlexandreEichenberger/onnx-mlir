@@ -82,10 +82,10 @@ void Settings::init() {
   if (s && (v = parseInt(s, nullptr)) >= 0)
     treeMin_ = int(v);
 
-  spin_ = kDefaultSpin;
+  spinUs_ = kDefaultSpinUs;
   s = getenv("POMP_SPIN");
   if (s && (v = parseInt(s, nullptr)) >= 0)
-    spin_ = v;
+    spinUs_ = v;
 
   s = getenv("OMP_THREAD_LIMIT");
   if (s) {

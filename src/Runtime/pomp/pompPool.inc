@@ -59,7 +59,7 @@ void Pool::wakeReleased(int n) {
 // Wait for work or for release. Return true for work, with `last` updated to
 // the new epoch, and false when a release has claimed this thread.
 bool Pool::waitWork(Thread &t, SlotMask self, uint64_t &last) {
-  for (long i = 0; i < settings.spin(); ++i) {
+  for (SpinBudget spin(settings.spinUs()); spin.more();) {
     uint64_t g = t.epoch(Order::Acquire);
     if (g != last) {
       last = g;

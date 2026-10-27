@@ -41,6 +41,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 namespace {
 
@@ -62,9 +63,14 @@ constexpr int kMaxDepth = 8;
 // Max nesting levels of any kind; deeper aborts. Fits SelfWord's foreign depth.
 constexpr int kMaxNesting = 256;
 constexpr int kMaxActive = 2; // Max active (more than 1 thread) levels.
-// Spin iterations of any wait (idle, join, barrier) before it sleeps.
-constexpr long kDefaultSpin = 200000;
-constexpr long kYieldSpin = 4096; // Team-wait spin iterations before yield.
+// Microseconds any wait (idle, join, barrier) spins before it sleeps. On z,
+// a thread spinning next to an SMT sibling that computes slows it by about
+// 30%, while sleeping costs 1-3 us per wake-up: spin for about that long.
+// See POMP_Z_Tuning.md, "Spin or sleep".
+constexpr long kDefaultSpinUs = 5;
+// Spin iterations between two reads of the clock.
+constexpr long kSpinClockStride = 64;
+constexpr long kYieldSpin = 4096; // spinUntil iterations before yield.
 
 // Teams of at least this many threads use the tree barrier, smaller ones the
 // central one (POMP_TREE_BARRIER overrides). On z17 the tree is 41-70% faster

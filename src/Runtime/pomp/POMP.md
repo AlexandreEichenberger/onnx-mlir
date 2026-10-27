@@ -54,7 +54,7 @@ other than the two above aborts at run time.
 | `OMP_THREAD_LIMIT` | In `[1, 64]`, initial thread included. Fixes the thread limit for the whole process, and takes precedence over `pomp_set_thread_limit` (see "The thread limit"). If unset, the first valid `pomp_set_thread_limit(limit)` gives it; until then the pool is closed, regions run on one thread, and `omp_get_max_threads` and `omp_get_thread_limit` return 1, with one warning on stderr. If set but invalid, it is ignored with a warning on stderr, as if unset. Nothing aborts |
 | `OMP_NUM_THREADS` | `n` or `n1,n2`: default team size at levels 1 and 2, clamped to the limit once it is known. Default is the limit |
 | `OMP_MAX_ACTIVE_LEVELS` | 1 (default) or 2; 0 means 1 and larger values mean 2. As in libomp, a list in `OMP_NUM_THREADS` implies 2 |
-| `POMP_SPIN` | Spin iterations of any wait before it sleeps: an idle worker, the leader at the join, a thread in a barrier (default 200000; 0 sleeps immediately). Team waits yield after 4096 iterations of the spin |
+| `POMP_SPIN` | Microseconds any wait spins before it sleeps: an idle worker, the leader at the join, a thread in a barrier (default 5; 0 sleeps immediately). Waits never yield. On z, a spinning thread slows an SMT sibling that computes by about 30%, while a wake-up from sleep costs 1–3 µs, hence the short default (see `POMP_Z_Tuning.md`) |
 | `POMP_TREE_BARRIER` | Smallest team that uses the tree barrier instead of the central one. Default 5 on s390x, never elsewhere; 0 or 2 forces the tree, 65 (`POMP_MAX_THREADS` + 1) forces central |
 
 ## Host interface (`pomp.h`)
@@ -232,7 +232,7 @@ pool thread. It is never required for correctness.
 open; N-1 threads enter once; run M inferences; close once
 ```
 
-Between inferences the workers stay in the pool: they spin for `POMP_SPIN` iterations and then
+Between inferences the workers stay in the pool: they spin for `POMP_SPIN` microseconds and then
 sleep, with no cost to the leader beyond the fork. Closing after every K inferences is S2.
 
 **S4. Entries racing with close, and late entries** (`late`).
@@ -415,8 +415,8 @@ libomp is shown twice:
 - **default**: on this hybrid CPU, libomp's default blocktime is 0. Idle workers go to sleep at
   once, so every region pays an OS wake-up for each worker.
 - **`KMP_BLOCKTIME=200`**: workers spin for 200 ms before sleeping, which is libomp's default
-  on non-hybrid CPUs such as z. This is the fair comparison with pomp, which spins
-  `POMP_SPIN` iterations before sleeping.
+  on non-hybrid CPUs such as z. These timings were taken when pomp spun 200000 iterations
+  before sleeping (now `POMP_SPIN` µs, default 5).
 
 | Threads | libomp default<br>fork/join · barrier · loop | libomp `KMP_BLOCKTIME=200`<br>fork/join · barrier · loop | pomp<br>fork/join · barrier · loop |
 |---|---|---|---|
@@ -643,7 +643,7 @@ root leads a level-1 team, so one group per slot is enough. Inner teams therefor
 valid from one region to the next. For example, with 16 threads, a 4×4 split gives the same
 4 + 4×3 assignment every time.
 
-**Wake-up without losing a signal.** An idle worker spins for `POMP_SPIN` iterations on two
+**Wake-up without losing a signal.** An idle worker spins for `POMP_SPIN` microseconds on two
 things: its own `go` epoch (work) and its bit in the global `released` word (release). The
 `released` word is written only by release and by leaving workers, so it stays shared in every
 cache and costs the spin nothing. To sleep, the worker sets its bit in the global `sleeping`
@@ -736,8 +736,8 @@ the leader's new wait set, so the post is consumed by that wait.
 
 **Waits in a team sleep.** The join and both barriers wait with the same protocol as an idle
 worker:
-1. Spin, yielding after 4096 iterations.
-2. After `POMP_SPIN` iterations, set the waiter's bit (its slot) in the team's `sleepers` word.
+1. Spin, without yielding.
+2. After `POMP_SPIN` microseconds, set the waiter's bit (its slot) in the team's `sleepers` word.
 3. Fence, re-check the condition, and sleep on the waiter's own post.
 
 A thread is in at most one wait at a time, so its slot's single post serves every kind of
@@ -835,8 +835,9 @@ On macOS with Apple clang, use `-Xclang -fopenmp -I$(brew --prefix libomp)/inclu
 ## Tried and not kept: yielding while spinning, as libomp does
 
 libomp's spin waits call `sched_yield` once every 512 spins by default on Linux
-(`KMP_USE_YIELD=1`, `KMP_INIT_WAIT`/`KMP_NEXT_WAIT` in `kmp.h`); pomp's idle workers never yield,
-and its team waits yield on every spin only after 4096. As pomp loses about 2.8× from pinned to
+(`KMP_USE_YIELD=1`, `KMP_INIT_WAIT`/`KMP_NEXT_WAIT` in `kmp.h`); pomp's idle workers never yielded,
+and its team waits then yielded on every spin after 4096 (since removed: waits now spin for
+`POMP_SPIN` µs without yielding). As pomp loses about 2.8× from pinned to
 free threads where libomp loses nothing, a `POMP_YIELD=N` setting made every wait yield once
 every N spins. Measured on z17 with `test/run_z.sh` (µs, median of 5 runs):
 

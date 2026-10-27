@@ -306,7 +306,7 @@ public:
         Order::Relaxed);
   }
   int maxActive() const { return maxActive_; }
-  long spin() const { return spin_; }
+  long spinUs() const { return spinUs_; } // POMP_SPIN.
   int treeMin() const { return treeMin_; }
 
 private:
@@ -326,7 +326,7 @@ private:
   bool limitFromEnv_ = false;        // Under limitMutex_.
   Atomic<int> limitMismatchSeen_;
   Atomic<int> noLimitSeen_;
-  long spin_ = 0;
+  long spinUs_ = 0;
   int treeMin_ = 0; // Team size from which the tree barrier is used.
 };
 

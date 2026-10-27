@@ -160,7 +160,7 @@ run() {
 }
 T="$B/tls"
 for L in 2 3 4 8 16 17; do
-  for S in 0 30 200000; do
+  for S in 0 5 200000; do
     for TB in 2 65; do
       E="env OMP_THREAD_LIMIT=$L POMP_SPIN=$S POMP_TREE_BARRIER=$TB"
       run $E "$T/pomp_test" stress $N
@@ -185,8 +185,8 @@ for L in 2 3 4 8 16 17; do
 done
 echo "$runs runs, $fail failures"
 
-# Timings: median of 5 runs. libomp spins 200 ms before sleeping, as pomp
-# spins POMP_SPIN iterations. Every timing starts after 1000 untimed regions
+# Timings: median of 5 runs. libomp spins 200 ms before sleeping, pomp
+# POMP_SPIN microseconds (default 5). Every timing starts after 1000 untimed regions
 # of the same shape, so that libomp's threads exist and are hot: no timing
 # includes the creation of a thread.
 #
@@ -215,7 +215,7 @@ RUNTIMES="$POMPS $([ $HAVE_LIBOMP = 1 ] && echo libomp)"
 exe() { case $1 in pomp*) echo "$B/tls/pomp_test" ;; *) echo "$B/pomp_test_libomp" ;; esac; }
 LIBENV="KMP_BLOCKTIME=200"
 R="$B/results"
-mkdir -p "$R"
+rm -rf "$R"; mkdir -p "$R"  # stale rows would enter the best-of
 
 note "one level, us per region (median of 5 runs of 100000)"
 echo "overhead = region - work; work = one thread's share of the loop alone."
@@ -457,8 +457,8 @@ if [ -r /sys/devices/system/cpu/cpu0/topology/core_id ]; then
   echo "  own core: every thread on a core of its own, same chip."
   echo "  alone: the LONG work with one thread. excess = phase - alone: the runtime's"
   echo "  overhead plus the slowdown of the long work by its waiting sibling."
-  echo "Wait policies: pomp POMP_SPIN = spins before sleeping (default 200000; 0"
-  echo "sleeps at once); libomp KMP_BLOCKTIME = time spinning before sleeping."
+  echo "Wait policies: pomp POMP_SPIN = microseconds spinning before sleeping"
+  echo "(default 5; 0 sleeps at once); libomp KMP_BLOCKTIME = the same, in ms or us."
   # CPUs for T threads: pairs of SMT siblings, or one per core, on C0's chip.
   PAIRS=$(for c in $(echo "$CHIP1" | tr ',' ' '); do
     echo "$c,$(expand "$(topo $c thread_siblings_list)" | grep -vx $c | head -1)"
@@ -487,7 +487,7 @@ if [ -r /sys/devices/system/cpu/cpu0/topology/core_id ]; then
           esac
           for rt in $RUNTIMES; do
             if [ $rt = pomp ]; then
-              POLS="POMP_SPIN=200000 POMP_SPIN=20000 POMP_SPIN=2000 POMP_SPIN=0"
+              POLS="POMP_SPIN=200000 POMP_SPIN=20 POMP_SPIN=10 POMP_SPIN=5 POMP_SPIN=2 POMP_SPIN=0"
             else
               POLS="KMP_BLOCKTIME=200 KMP_BLOCKTIME=20us KMP_BLOCKTIME=0"
             fi

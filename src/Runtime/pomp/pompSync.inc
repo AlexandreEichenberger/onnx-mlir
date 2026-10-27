@@ -52,18 +52,16 @@ private:
 // -----------------------------------------------------------------------------
 // TeamWait
 
-// Spin, then yield (for an oversubscribed waitee), then sleep after POMP_SPIN
-// iterations.
+// Spin for POMP_SPIN microseconds, then sleep. No yield: a waiting thread
+// that yields still slows an SMT sibling that computes, and an oversubscribed
+// waitee gets its CPU back once the waiter sleeps.
 template <class Cond>
 void TeamWait::until(Thread &self, Cond cond) {
-  long i = 0;
+  SpinBudget spin(settings.spinUs());
   SlotMask meMask = SlotMask::of(self.slot());
   while (!cond()) {
-    if (i++ < settings.spin()) {
-      if (i < kYieldSpin)
-        relax(); // Initially just relax to avoid yielding too early.
-      else
-        sched_yield(); // Then yield to let a waitee run, before sleeping.
+    if (spin.more()) {
+      relax();
       continue;
     }
     // Sleep: set our bit, fence (pairs with the waker's, in claimSleepers:
