@@ -8,9 +8,8 @@
 //
 // =============================================================================
 //
-// Part of pomp.cpp, included in its anonymous namespace: the settings, read
-// from the environment once, and the thread limit with the allocation of the
-// descriptors.
+// Part of pomp.cpp: the settings, read from the environment once, and the
+// thread limit with the allocation of the descriptors.
 //
 //===----------------------------------------------------------------------===//
 
@@ -18,8 +17,7 @@
 // Initialization
 // -----------------------------------------------------------------------------
 
-// `n` zeroed objects of `size` bytes, starting on a cache line, or nullptr.
-// calloc's alignment may be less than a line: over-allocate and round up.
+// `n` zeroed objects of `size` bytes, line-aligned, or nullptr.
 void *allocLines(size_t n, size_t size) {
   char *p = static_cast<char *>(calloc(1, n * size + kCacheLine));
   if (!p)
@@ -28,65 +26,25 @@ void *allocLines(size_t n, size_t size) {
   return reinterpret_cast<void *>(a);
 }
 
-// Set the thread limit, once per process, as OpenMP's thread-limit-var: from
-// OMP_THREAD_LIMIT at initialization, or else from the first open that gives
-// one. Once set it never changes: a later request for another value (0 means
-// none) is clamped to it, with one warning per process, and succeeds. Fails
-// only while no limit is set and `limit` is not a valid one.
-int Settings::setLimit(long limit) {
-  ScopedLock<Mutex> lock(limitMutex_);
-  int cur = this->limit();
-  if (cur) {
-    if (limit != 0 && limit != cur && !limitMismatchSeen_.exchange(1))
-      fprintf(stderr,
-          "pomp: warning: thread limit %ld requested, but the limit is "
-          "already %d for this process; using %d\n",
-          limit, cur, cur);
-    return POMP_OK;
+// Called on each entry as this slot, before it is recruitable, and at
+// allocation for slot 0. Entries as a slot are serialized by `present_`.
+inline void Thread::init() {
+  if (!initialized_) {
+    post_.init();
+    initialized_ = true;
   }
-  if (limit < 1 || limit > kMaxThreads)
-    return POMP_ERR_LIMIT;
-  // One block for both arrays: `limit` threads, then `limit` + 1 teams from
-  // the next line. A failure allocates nothing, and leaves no limit set for a
-  // later call to retry. The block is never freed: the limit never changes.
-  size_t tBytes = (size_t(limit) * sizeof(Thread) + kCacheLine - 1) &
-                  ~size_t(kCacheLine - 1);
-  char *p = static_cast<char *>(
-      allocLines(1, tBytes + (size_t(limit) + 1) * sizeof(Team)));
-  if (!p)
-    return POMP_ERR_NOMEM;
-  Thread *t = reinterpret_cast<Thread *>(p);
-  Team *m = reinterpret_cast<Team *>(p + tBytes);
-  // The root sleeps in joins and barriers before any worker enters: its
-  // sleep is ready now. Workers ready theirs on entry.
-  t[0].initPost();
-  // Team i, below kTeams, seeds its unique ids with i, its index.
-  for (int i = 0; i <= limit; ++i)
-    m[i].seedUniqueIds(i);
-  threads = t;
-  teams = m;
-  for (int i = 0; i < kMaxActive; ++i) {
-    int n = envNthreads_[i];
-    nthreads_[i].store(n && n < limit ? n : int(limit));
-  }
-  limitSlots_.store(SlotMask::below(int(limit)));
-  // Publishes the descriptors: read them only after an acquire of the limit
-  // (limitAcquire), or after a step that follows one.
-  limit_.store(int(limit), Order::Release);
-  return POMP_OK;
 }
 
-// pomp creates no threads: its workers are the host's threads lent through
-// pomp_enter_pool, and the limit says how many there can be. Without one, a
-// program that asks how many threads it may use gets 1, and is told why.
-void Settings::warnNoLimit() {
-  if (!noLimitSeen_.exchange(1))
-    fprintf(stderr,
-        "pomp: warning: omp_get_max_threads/omp_get_thread_limit return 1: "
-        "no thread limit is set yet (OMP_THREAD_LIMIT is unset or invalid, "
-        "and no pomp_open_pool(limit) with limit in [1, %d] has been called); "
-        "until one is, parallel regions run on one thread\n",
-        kMaxThreads);
+// Concurrent first calls wait for the one that does it.
+void Settings::initOnce() {
+  int expected = 0;
+  if (initialized_.compareExchange(expected, 1)) {
+    init();
+    initialized_.store(2, Order::Release);
+  } else {
+    while (initialized_.load(Order::Acquire) != 2)
+      sched_yield();
+  }
 }
 
 void Settings::init() {
@@ -112,8 +70,8 @@ void Settings::init() {
   for (int i = n > 0 ? n : kMaxActive; i < kMaxActive; ++i)
     envNthreads_[i] = envNthreads_[i - 1];
 
-  // Max active levels: as in libomp, 1 unless asked for, or unless
-  // OMP_NUM_THREADS lists more than one level.
+  // Max active levels: as libomp, 1 unless asked for or OMP_NUM_THREADS lists
+  // more than one level.
   maxActive_ = n > 1 ? kMaxActive : 1;
   s = getenv("OMP_MAX_ACTIVE_LEVELS");
   if (s && (v = parseInt(s, nullptr)) >= 0)
@@ -129,33 +87,75 @@ void Settings::init() {
   if (s && (v = parseInt(s, nullptr)) >= 0)
     spin_ = v;
 
-  // OMP_THREAD_LIMIT, if set, must be valid. If it is not set, or not valid,
-  // the pool starts closed, and the first open that gives a limit opens it.
   s = getenv("OMP_THREAD_LIMIT");
   if (s) {
     v = parseInt(s, &end);
-    int rc = v < 1 || *end ? POMP_ERR_LIMIT : setLimit(v);
+    int rc = *end ? POMP_ERR_LIMIT : setLimit(v, true);
     if (rc != POMP_OK)
       fprintf(stderr,
           "pomp: warning: OMP_THREAD_LIMIT=\"%s\" is not in [1, %d] or "
           "cannot be allocated, and is ignored; the pool stays closed "
-          "until pomp_open_pool gives a limit\n",
+          "until pomp_set_thread_limit gives a limit\n",
           s, kMaxThreads);
   }
-  if (!limit())
-    pool.closeGate();
 }
 
-// Concurrent first calls wait for the one that does it. Without a valid
-// thread limit, the pool stays closed and regions run on one thread: nothing
-// here is fatal.
-void Settings::initOnce() {
-  int expected = 0;
-  if (initialized_.compareExchange(expected, 1)) {
-    init();
-    initialized_.store(2, Order::Release);
-  } else {
-    while (initialized_.load(Order::Acquire) != 2)
-      sched_yield();
+// Set the thread limit, once per process (see pomp_set_thread_limit). Once it
+// is set, the same value succeeds; another one is refused if a call set the
+// limit, and ignored with one warning if OMP_THREAD_LIMIT did.
+int Settings::setLimit(long limit, bool fromEnv) {
+  ScopedLock<Mutex> lock(limitMutex_);
+  int cur = this->limit();
+  if (cur) {
+    if (limit == cur)
+      return POMP_OK;
+    if (!limitFromEnv_)
+      return POMP_ERR_LIMIT;
+    if (!limitMismatchSeen_.exchange(1))
+      fprintf(stderr,
+          "pomp: warning: thread limit %ld requested, but OMP_THREAD_LIMIT "
+          "already set it to %d for this process; using %d\n",
+          limit, cur, cur);
+    return POMP_OK;
   }
+  if (limit < 1 || limit > kMaxThreads)
+    return POMP_ERR_LIMIT;
+  // One block, never freed: `limit` threads, then `limit` + 1 teams from the
+  // next line. On failure no limit is set, so a later call may retry.
+  size_t tBytes = (size_t(limit) * sizeof(Thread) + kCacheLine - 1) &
+                  ~size_t(kCacheLine - 1);
+  char *p = static_cast<char *>(
+      allocLines(1, tBytes + (size_t(limit) + 1) * sizeof(Team)));
+  if (!p)
+    return POMP_ERR_NOMEM;
+  Thread *t = reinterpret_cast<Thread *>(p);
+  Team *m = reinterpret_cast<Team *>(p + tBytes);
+  // Slot 0 may sleep before any pool thread enters; those init on entry.
+  t[0].init();
+  // Set before Team::init, which reads index(). Not yet visible to other
+  // threads: the limit_ store below publishes the descriptors.
+  threads = t;
+  teams = m;
+  for (int32_t i = 0; i <= limit; ++i)
+    m[i].init();
+  for (int i = 0; i < kMaxActive; ++i) {
+    int n = envNthreads_[i];
+    nthreads_[i].store(n && n < limit ? n : int(limit));
+  }
+  limitSlots_.store(SlotMask::below(int(limit)));
+  limitFromEnv_ = fromEnv;
+  // Publishes the descriptors (see limitAcquire).
+  limit_.store(int(limit), Order::Release);
+  return POMP_OK;
+}
+
+void Settings::warnNoLimit() {
+  if (!noLimitSeen_.exchange(1))
+    fprintf(stderr,
+        "pomp: warning: omp_get_max_threads/omp_get_thread_limit return 1: "
+        "no thread limit is set yet (OMP_THREAD_LIMIT is unset or invalid, "
+        "and no pomp_set_thread_limit(limit) with limit in [1, %d] has been "
+        "called); "
+        "until one is, parallel regions run on one thread\n",
+        kMaxThreads);
 }

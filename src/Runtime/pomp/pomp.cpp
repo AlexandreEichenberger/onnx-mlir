@@ -18,29 +18,17 @@
 //   __kmpc_for_static_init_{4,4u,8,8u}                   __kmpc_for_static_fini
 // plus a few omp_* queries.
 //
-// Model: one root (the initial thread, slot 0) and up to 63 worker threads
-// lent by the host through the pool (slots 1..limit-1). One 64-bit word,
-// `busy`, holds one bit per slot; a bit is clear iff that slot is an idle
-// worker in the pool. A leader recruits a team with a single CAS on `busy`,
-// hands each worker the work through its descriptor, wakes it by bumping its
-// private epoch, and clears the team's bits again after the join. At most two
-// levels are active; deeper or empty forks run inline as a team of one.
+// Model: the initial thread (slot 0) and up to 63 pool threads lent by the
+// host (slots 1..limit-1). The 64-bit `busy` word has one bit per slot, clear
+// iff that slot is an idle pool thread. A leader recruits its workers with one
+// CAS on `busy`, and wakes each by bumping its epoch. At most two levels are
+// active; deeper or empty forks run inline as a team of one. Every wait spins,
+// then sleeps.
 //
-// The join polls one done flag per member, and barriers of more than four
-// threads use a 4-ary tree; see POMP.md for the measurements behind both.
-// Every wait, idle or in a team, spins and then sleeps.
-//
-// Release does not block the leader: it closes the pool, claims the idle
-// workers and marks them in `released`. Spinning workers see their bit and
-// leave by themselves; each leaving worker wakes up to two sleeping ones, so
-// the wake-ups spread as a tree. See POMP.md for the scenarios supported.
-//
-// Language: C++ for its classes and templates only. No virtual functions,
-// exceptions, RTTI, nor any C++ header; every global is constant-initialized
-// and trivially destructible. The thread and team descriptors are allocated
-// once, with calloc, when the thread limit is set, and never freed. The object
-// file thus needs only the C library and pthreads, as a C one does, and links
-// into C programs with the C driver. See "Language" in POMP.md.
+// Language: C++ for classes and templates only: no virtual functions,
+// exceptions, RTTI, nor C++ headers, and constant-initialized globals. The
+// object file needs only libc and pthreads, and links into C programs. See
+// "Language" in POMP.md.
 //
 //===----------------------------------------------------------------------===//
 
@@ -60,21 +48,18 @@ namespace {
 // Configuration
 // -----------------------------------------------------------------------------
 
-// Max thread defined in pomp.h, currently limited by the code scheme to 64.
+// From pomp.h; at most 64, as slots are bits of one word.
 constexpr int kMaxThreads = POMP_MAX_THREADS;
 static_assert(kMaxThreads <= 64, "slots are bits of one 64-bit word");
 // Teams: one led by each slot at level 2, and the root's at level 1.
 constexpr int kTeams = kMaxThreads + 1;
 
-// Max shared args passed to an outlined fn: one more than the 15 of libomp's
-// portable kmp_invoke_microtask.cpp.
+// Max shared args of an outlined fn (libomp's portable invoke allows 15).
 constexpr int kMaxArgs = 16;
 
 // Max nesting levels recorded; deeper ones are serialized and only counted.
 constexpr int kMaxDepth = 8;
-// Max nesting levels of any kind, on a region stack or in a foreign one;
-// deeper aborts. Far beyond any real use, and small enough to fit the
-// foreign depth of SelfWord.
+// Max nesting levels of any kind; deeper aborts. Fits SelfWord's foreign depth.
 constexpr int kMaxNesting = 256;
 constexpr int kMaxActive = 2; // Max active (more than 1 thread) levels.
 // Spin iterations of any wait (idle, join, barrier) before it sleeps.
@@ -82,11 +67,9 @@ constexpr long kDefaultSpin = 200000;
 constexpr long kYieldSpin = 4096; // Team-wait spin iterations before yield.
 
 // Teams of at least this many threads use the tree barrier, smaller ones the
-// central one (POMP_TREE_BARRIER overrides it). Measured: on z17 the tree is
-// 41-70% faster from 16 threads on and on par at 8; z/OS, on the same
-// hardware, takes the same default. On Apple M-series the tree is slower at
-// every size measured (up to 16 threads, about the core count). Other targets
-// are unmeasured and keep the central barrier. See POMP.md.
+// central one (POMP_TREE_BARRIER overrides). On z17 the tree is 41-70% faster
+// from 16 threads, on par at 8; on Apple M-series it is slower at every size.
+// Unmeasured targets keep the central barrier. See POMP.md.
 #if defined(__s390x__) || defined(__MVS__)
 constexpr int kDefaultTreeBarrier = 5;
 #else
@@ -115,8 +98,8 @@ constexpr int32_t kSchModifierMask = (1 << 29) | (1 << 30);
 
 namespace {
 
-// pomp itself, in parts that follow each other: types first, then the code
-// on them. See the comment at the top of each file.
+// pomp itself, in dependency order: not to be sorted.
+// clang-format off
 #include "pompIdentity.inc"
 #include "pompSyncTypes.inc"
 #include "pompTypes.inc"
@@ -125,6 +108,7 @@ namespace {
 #include "pompSync.inc"
 #include "pompRegion.inc"
 #include "pompLoop.inc"
+// clang-format on
 
 } // namespace
 
@@ -132,14 +116,19 @@ namespace {
 // Host interface: the pool (pomp.h)
 // -----------------------------------------------------------------------------
 
+int pomp_set_thread_limit(int thread_limit) {
+  settings.ensureInit();
+  return settings.setLimit(thread_limit, false);
+}
+
 int pomp_get_thread_limit(void) {
   settings.ensureInit();
   return settings.limit();
 }
 
-int pomp_open_pool(int thread_limit) {
+int pomp_open_pool(void) {
   settings.ensureInit();
-  return pool.open(thread_limit);
+  return pool.open();
 }
 
 int pomp_enter_pool(int slot) {
@@ -159,7 +148,7 @@ int pomp_wait_pool_empty(void) {
 
 int pomp_is_pool_open(void) {
   settings.ensureInit();
-  return !pool.isClosed();
+  return pool.isOpen();
 }
 
 int pomp_pool_size(void) {
@@ -173,12 +162,20 @@ int pomp_pool_size(void) {
 
 extern "C" {
 
-// May be the first call into pomp: compilers emit it in the host function,
-// before push_num_threads, serialized_parallel or fork_call. No init needed:
-// a thread without a slot is slot 0, and before init no thread has one (only
-// pomp_enter_pool makes workers, and it inits first). Unlike libomp, which
-// registers the calling thread here, this is just a load of the thread's word.
+// Often the first call into pomp. Needs no init: before init, no thread has a
+// slot, so every thread reads slot 0.
 int32_t __kmpc_global_thread_num(void *) { return SelfWord::current().slot(); }
+
+void __kmpc_push_num_threads(void *, int32_t, int32_t nth) {
+  settings.ensureInit();
+  if (nth < 0)
+    nth = 0;
+  else if (nth > kMaxThreads)
+    nth = kMaxThreads;
+  SelfWord::set(SelfWord::current().withPending(nth));
+}
+
+void __kmpc_push_proc_bind(void *, int32_t, int32_t) {}
 
 void __kmpc_fork_call(void *, int32_t argc, Microtask fn, ...) {
   void *argv[kMaxArgs];
@@ -194,17 +191,6 @@ void __kmpc_fork_call(void *, int32_t argc, Microtask fn, ...) {
   va_end(ap);
   forkCall(fn, argc, argv);
 }
-
-void __kmpc_push_num_threads(void *, int32_t, int32_t nth) {
-  settings.ensureInit();
-  if (nth < 0)
-    nth = 0;
-  else if (nth > kMaxThreads)
-    nth = kMaxThreads;
-  SelfWord::set(SelfWord::current().withPending(nth));
-}
-
-void __kmpc_push_proc_bind(void *, int32_t, int32_t) {}
 
 void __kmpc_serialized_parallel(void *, int32_t) {
   settings.ensureInit();
@@ -235,9 +221,9 @@ void __kmpc_end_serialized_parallel(void *, int32_t) {
 
 void __kmpc_barrier(void *, int32_t) {
   Thread *self = Thread::current();
-  Level *top = self ? self->regions().activeTop() : nullptr;
-  if (top)
-    top->team->barrier(*self, *top);
+  Level *innermost = self ? self->regions().activeInnermost() : nullptr;
+  if (innermost)
+    innermost->team->barrier(*self, *innermost);
 }
 
 void __kmpc_for_static_init_4(void *, int32_t, int32_t sched, int32_t *plast,
@@ -274,20 +260,20 @@ void __kmpc_for_static_fini(void *, int32_t) {}
 // omp_* queries
 // -----------------------------------------------------------------------------
 
-// The queries of the calling thread's regions need no init: before it, no
-// thread is in a region nor has a descriptor (forks and serialized regions
-// init first), so they answer as outside of any region.
+// Region queries need no init: before it, every thread is outside regions.
 int omp_get_thread_num(void) {
   RegionStack *regions = Thread::currentRegions();
-  return regions && !SelfWord::current().inForeign() ? regions->topTid() : 0;
+  return regions && !SelfWord::current().inForeign() ? regions->innermostTid()
+                                                     : 0;
 }
 
 int omp_get_num_threads(void) {
   RegionStack *regions = Thread::currentRegions();
-  return regions && !SelfWord::current().inForeign() ? regions->topNth() : 1;
+  return regions && !SelfWord::current().inForeign() ? regions->innermostNth()
+                                                     : 1;
 }
 
-// A foreign region is nested only in other foreign regions, all inactive.
+// Foreign regions nest only in foreign regions.
 int omp_get_level(void) {
   SelfWord w = SelfWord::current();
   if (w.inForeign())
@@ -304,11 +290,7 @@ int omp_get_active_level(void) {
 
 int omp_in_parallel(void) { return omp_get_active_level() > 0; }
 
-// The thread limit is set once per process: by OMP_THREAD_LIMIT at init, or
-// else by the first pomp_open_pool(limit) with a limit in [1, 64]. With a valid
-// OMP_THREAD_LIMIT these two report it from the first call, before any open.
-// Until a limit is set they return 1, with one warning: every region runs on
-// one thread then, as pomp only uses threads the host lends it.
+// Until a thread limit is set (pomp.h), these return 1 and warn once.
 int omp_get_max_threads(void) {
   int active = omp_get_active_level();
   settings.ensureInit();

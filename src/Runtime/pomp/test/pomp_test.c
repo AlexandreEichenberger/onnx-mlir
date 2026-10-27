@@ -129,7 +129,7 @@ static void *member(void *arg) {
 
 static void enter_all(void) {
   int i, n = pomp_get_thread_limit();
-  pomp_open_pool(0);
+  pomp_open_pool();
   for (i = 1; i < n; ++i)
     pthread_create(&members[i], NULL, member, (void *)(intptr_t)i);
   while (pomp_pool_size() != n - 1)

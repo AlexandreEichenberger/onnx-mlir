@@ -8,110 +8,82 @@
 //
 // =============================================================================
 //
-// Part of pomp.cpp, included in its anonymous namespace: the types of the
-// synchronization inside a team, which Team and Thread hold by value, so
-// they come first. Their code, which uses Team and Thread, is in pompSync.inc.
+// Part of pomp.cpp: the types of the synchronization inside a team. Team and
+// Thread hold them by value, so they come first; their code is in pompSync.inc.
 //
 //===----------------------------------------------------------------------===//
-
-// -----------------------------------------------------------------------------
-// Synchronization inside a team: types
-// -----------------------------------------------------------------------------
 
 // Defined in pompTypes.inc, after these types.
 class Team;
 class Thread;
 struct Level;
 
-// This file covers the synchronization of the threads of a team while they
-// run a region: the join at its end, and the barriers inside it.
-//
-// A worker also waits outside of any team: in the pool, for a team to
-// recruit it (Pool::waitWork, in pompPool.inc). After its done report at
-// the join of one region, it waits there for the next region it takes part
-// in, which may be of another team. It uses the same spin-then-sleep
-// protocol, but on pool words (`go`, `sleeping`), woken by the recruiter.
-// That wait is not covered here, and uses none of the types below: it has
-// its own code and its own mask of sleepers. It shares with them only the
-// thread's post, on which both sleep, and the thread's wake-up line, which
-// holds both its `go` and its MemberSync, used in turn.
-//
-// The rest of this file is about the team's synchronization, in two layers.
-//
-// What members wait for: two protocols, which differ in who waits.
-//   TeamJoin     the end of a region ("Join"). One way: each member other
-//                than the leader reports done, and only the leader waits. A
-//                member does not wait after its report; it goes back to the
-//                pool, whose idle wait (pompPool.inc) is the "release" of
-//                the join. Hence a done flag per member, which the leader
-//                polls, and no release step.
-//   Barriers     a barrier inside the region (__kmpc_barrier, "Barriers").
-//                All to all: every member waits until all have arrived, and
-//                then all go on in the same region. TeamCentralBarrier, a
-//                counter, for small teams; TeamTreeBarrier for large ones.
-//
-// How they wait: TeamWait ("Waits inside a team"), the one wait that all
-// use. Spin, yield, then sleep on the waiter's own post, with its bit set in
-// the team's `sleepers`. A protocol stores its flag first, then calls wake()
-// for the threads that read that flag, so no wake-up is lost. This is the
-// same protocol as the pool's idle wait, but on a word of the team: a team's
-// wake-ups look only at the team's members, and a thread is in at most one
-// wait at a time, idle or in a team.
-//
-// Where the state lives. A member is one of the team's nth threads: tid 0,
-// the leader, and the workers it recruited, tids 1 .. nth-1. A protocol has
-// a team part, and may have a member part:
-//   Team part    one copy per team, in Team, shared by the members: what all
-//                of them must agree on.
-//   Member part  one copy per member, written only by that member, so that
-//                the writes are spread over lines of their own. Either
-//                private, or read by exactly one other thread:
-//     MemberBarrier  in the member's region-stack entry, private: the id
-//                    of its current barrier, and its links in the barrier
-//                    tree.
-//     MemberSync     on the thread's wake-up line, the flags that one other
-//                    thread polls: `done`, for the leader at the join, and
-//                    TreeFlags, for the parent or children in the tree
-//                    barrier. The leader uses none. Per thread rather than
-//                    per team, as a thread is a non-leader member of at
-//                    most one team at a time.
-//
-// The parts of each protocol:
-//
-//                    team part                    member part
-//   join             TeamJoin: the unique id of   MemberSync::done: one flag
-//                    the current region, which    per member, which the
-//                    members store into `done`    leader polls
-//   central barrier  TeamCentralBarrier: the      none
-//                    counter and epoch, the
-//                    barrier itself, written by
-//                    every member
-//   tree barrier     TeamTreeBarrier: the unique  MemberBarrier (barrier id,
-//                    id of the team's last        tree links) and TreeFlags:
-//                    barrier, from which the      the barrier itself, one
-//                    members' ids continue        writer and one reader per
-//                                                 flag
-//
-// Unique ids. The values that the join and the tree barrier store into flags,
-// and wait for, are unique ids: never stored twice, by any team. A team's ids,
-// one sequence for its joins and one for its tree barriers, each in flags of
-// its own, are seeded with the team's index (below kTeams), and each new id is
-// the last one plus kTeams. So every id of a team is its index modulo kTeams,
-// and two teams never meet; and a team's ids only grow, so a team never meets
-// its own earlier ids either. Flags are never reset, and every wait tests for
-// equality: a value left in a flag by an earlier region, barrier or team never
-// matches. An id is advanced before use, so the first one is index + kTeams: no
-// id is 0, which every flag holds at first.
-//
-// The central barrier accepts contention on its shared lines, which is cheap
-// on a few cores. The tree and the join avoid it: per-member flags on
-// distinct lines are read in parallel, where one shared line is written in
-// turn.
+// Two protocols run inside a region, both waiting through TeamWait:
+//   TeamJoin   end of the region: workers report done, only the leader waits.
+//   Barriers   __kmpc_barrier: all wait for all. TeamCentralBarrier (one
+//              counter) for small teams, TeamTreeBarrier for large ones.
+// Each keeps a team part, in Team, and may keep a member part: MemberBarrier
+// (private, in the region-stack entry) and WorkerSync (flags polled by one
+// other thread, on the thread's wake-up line). Roles: see pompIdentity.inc.
+// The idle wait of the pool
+// (Pool::waitWork) is separate and uses none of these types.
 
-// The wait primitive of the team's protocols (join, barriers): wait
-// until a condition on a flag holds, then sleep if it takes too long. It
-// defines no flags of its own; `sleepers_` only records who sleeps, so that
-// a waker posts only to those threads. See "Waits inside a team".
+// -----------------------------------------------------------------------------
+// UniqueId and UniqueId Flag
+// -----------------------------------------------------------------------------
+
+// Unique ids. The join and the tree barrier store and wait for ids that are
+// never stored twice, by any team: a team's ids start at its index (below
+// kTeams) and grow by kTeams, so they are its index modulo kTeams and only
+// grow. Flags are never reset and waits test for equality, so a value left
+// by an earlier region, barrier or team never matches. Ids advance before
+// use, so none is 0, the initial value of every flag.
+//
+// UniqueId and UniqueIdFlag enforce this: an id is made only by seed, changes
+// only by advance, and is only compared for equality; a flag holds only ids,
+// stored with release and tested with acquire. Zero bits are the unseeded id,
+// so both are valid in the zero-allocated descriptors.
+class UniqueId {
+public:
+  constexpr UniqueId() = default;
+  // The first id of team `index`, in [0, kTeams).
+  static UniqueId seed(int32_t index) {
+    if (uint32_t(index) >= uint32_t(kTeams))
+      fatal("unique id seed out of range");
+    UniqueId id;
+    id.v_ = uint64_t(index);
+    return id;
+  }
+  // Move to the next id of the same team; return it.
+  UniqueId advance() {
+    v_ += kTeams;
+    return *this;
+  }
+  bool operator==(UniqueId other) const { return v_ == other.v_; }
+
+private:
+  friend class UniqueIdFlag;
+  uint64_t v_ = 0;
+};
+
+// A flag that one thread stores ids into and another waits on. Never reset.
+class UniqueIdFlag {
+public:
+  void store(UniqueId id) { flag_.store(id.v_, Order::Release); }
+  bool is(UniqueId id) const { return flag_.load(Order::Acquire) == id.v_; }
+
+private:
+  Atomic<uint64_t> flag_;
+};
+static_assert(sizeof(UniqueId) == 8 && __is_trivially_copyable(UniqueId),
+    "passed and copied as a plain 64-bit value");
+
+// -----------------------------------------------------------------------------
+// Team Wait and Join
+// -----------------------------------------------------------------------------
+
+// The wait of the join and barriers: spin until a condition holds, then
+// sleep. `sleepers_` records who sleeps, so wakers post only to them.
 class TeamWait {
 public:
   // Wait, as `self`, until `cond` holds.
@@ -123,129 +95,97 @@ public:
   void wakeOne(int32_t slot);
 
 private:
+  // Clear the bits of the sleepers among `slots`; return those it cleared.
   SlotMask claimSleepers(SlotMask slots);
 
-  // A member's slot is in while it sleeps in a wait, or is about to. Written
-  // only by sleepers and their wakers, so it stays shared.
+  // Slots of members sleeping in a wait, or about to.
   alignas(kCacheLine) AtomicMask sleepers_;
 };
 
-// The end of a region: members report, the leader waits. Unlike a barrier,
-// the members do not wait for one another, or for the leader. Each member
-// other than the leader stores its done flag (MemberSync::done) and leaves
-// the team. The leader polls the flags one by one: loads of distinct lines
-// overlap, where increments of one counter would serialize. The value is
-// the unique id of the region's join (see "Unique ids"), so a flag left by
-// an earlier region, or by another team, never matches.
+// The end of a region: each worker stores the join's unique id into its
+// WorkerSync::done and leaves, without waiting; the leader polls the flags.
 class TeamJoin {
 public:
   // At allocation: seed the ids with the team's index.
-  void seed(int32_t index) { currUniqueJoinId_ = uint64_t(index); }
-  // Leader, before waking the members: the next unique id, for this
-  // region's join.
-  void startRegion();
-  // Member, on entry: the value its done flag takes at the end of the region.
-  // Read on entry, with the other fields a member reads then, on the same
-  // line, so that the end of the region reads nothing of the team.
-  static uint64_t doneValue(const Team &team);
-  // Member, at the end of the region: store `done`, from doneValue, into its
-  // done flag, and wake the leader. The member's last access to the team.
-  static void finish(Team &team, Thread &self, uint64_t done);
-  // Leader: wait until every member reported done.
-  static void wait(Team &team, Thread &leader);
+  void seed(int32_t index) { currUniqueJoinId_ = UniqueId::seed(index); }
+  // Before the wake-up: advance to this region's join id.
+  void leaderStart();
+  // On entry: the value of the worker's done flag at the end. Read with the
+  // other entry fields, so the end of the region reads nothing of the team.
+  static UniqueId workerDoneValue(const Team &team);
+  // At the end: store `done` and wake the leader. The worker's last access to
+  // the team.
+  static void workerFinish(Team &team, Thread &self, UniqueId done);
+  // Wait until every worker reported done.
+  static void leaderWait(Team &team, Thread &leader);
 
 private:
-  // The unique id of the current region's join, which members store into
-  // their done flags.
-  uint64_t currUniqueJoinId_ = 0;
+  // The current region's join id.
+  UniqueId currUniqueJoinId_;
 };
 
-// A barrier inside a region. Unlike the join, every member waits, and all of
-// them continue in the region. Two algorithms, each with its own state; a
-// team uses one of them, by its size (Team::usesTreeBarriers), and
-// Team::barrier picks it. The design of both, and their code, are in
-// "Barriers" in pompSync.inc.
+// -----------------------------------------------------------------------------
+// Barriers
+// -----------------------------------------------------------------------------
 
-// Central barrier, for small teams: the team's part only, in the team.
-// Members keep no state of their own for it.
+// Barriers: one of two algorithms per team, by size (Team::usesTreeBarriers).
+// See "Barriers" in pompSync.inc.
+
+// Central barrier, for small teams. No member state.
 class TeamCentralBarrier {
 public:
-  // A barrier, for the member at `top`, running on `self`.
-  void wait(Team &team, Thread &self, const Level &top);
+  // A barrier, for the member at `innermost`, running on `self`.
+  void wait(Team &team, Thread &self, const Level &innermost);
 
 private:
-  // On lines of their own, as every member writes them. `count_` is the
-  // number of members that arrived at the current barrier, 0 between
-  // barriers (reset by the last to arrive before bumping the epoch), and so
-  // at the start of every region, with no reset there. `epoch_`
-  // is bumped once per barrier, by the last to arrive, and the others wait for
-  // it to move.
+  // Each on its own line, as every member writes them. `count_`: members
+  // arrived, 0 between barriers. `epoch_`: bumped once per barrier.
   alignas(kCacheLine) Atomic<int> count_;
   alignas(kCacheLine) Atomic<uint64_t> epoch_;
 };
 
-// A member's barrier state for a region, in its region-stack entry, set on
-// entry (Team::initMemberBarrier). Written only by the member, which keeps it
-// private. Only the tree barrier uses it; a member of a team that uses the
-// central barrier keeps the default.
+// A member's private barrier state, in its region-stack entry, set on entry.
+// Used by the tree barrier only.
 struct MemberBarrier {
-  // The unique id of this member's current barrier, or of its last one:
-  // the team's last on entry, advanced by kTeams at each barrier. The same
-  // for every member, as all pass the same barriers.
-  uint64_t currUniqueBarrierId = 0;
-  // The slots of this member's children (none for a leaf), and of its
-  // parent (unused for tid 0). Slots, not tids, so that a barrier reaches
-  // their flags directly.
+  // Id of the current (or last) barrier; the same for every member.
+  UniqueId currUniqueBarrierId;
+  // Slots, not tids, of the tree children and parent (unused for tid 0).
   SlotMask children;
   int32_t parent = 0;
 };
 
-// Tree barrier: a member's flags, on its wake-up line (see MemberSync):
-// `arrive` is written by the member and polled by its parent, `release` the
-// other way. Each holds the value of the last barrier it took part in;
-// never reset.
+// Tree barrier flags of a member: `arrive` is written by the member and
+// polled by its parent, `release` the other way.
 struct TreeFlags {
-  Atomic<uint64_t> arrive;
-  Atomic<uint64_t> release;
+  UniqueIdFlag arrive;
+  UniqueIdFlag release;
 };
 
-// Tree barrier: the team's part, in the team. Only the unique id of the
-// team's last barrier, from which the members' ids continue, read once by
-// each member on entry; so not aligned, unlike the central barrier: it stays
-// on the line of the other fields members read on entry (see Team).
+// Tree barrier, team part: the id of the team's last barrier, read by each
+// member on entry. Not aligned: it shares the line of the other entry fields.
 class TeamTreeBarrier {
 public:
   // At allocation: seed the ids with the team's index.
-  void seed(int32_t index) { lastUniqueBarrierId_ = uint64_t(index); }
+  void seed(int32_t index) { lastUniqueBarrierId_ = UniqueId::seed(index); }
   // Member `tid` of `team`, on entry: its part of the barrier.
   MemberBarrier enter(const Team &team, int32_t tid) const;
-  // A barrier, for the member at `top`, running on `self`.
-  static void wait(Team &team, Thread &self, Level &top);
-  // Leader, after the join: `currUniqueBarrierId` is the id of the leader's
-  // last barrier, and so every member's, from which the next region of the
-  // team continues.
-  void endRegion(uint64_t currUniqueBarrierId);
+  // A barrier, for the member at `innermost`, running on `self`.
+  static void wait(Team &team, Thread &self, Level &innermost);
+  // After the join: the next region continues from `currUniqueBarrierId`,
+  // the last barrier id of the region.
+  void leaderEndRegion(UniqueId currUniqueBarrierId);
 
 private:
-  // The unique id of the team's last tree barrier, in any region.
-  uint64_t lastUniqueBarrierId_ = 0;
+  UniqueId lastUniqueBarrierId_;
 };
-static_assert(sizeof(TeamTreeBarrier) == sizeof(uint64_t),
+static_assert(sizeof(TeamTreeBarrier) == sizeof(UniqueId),
     "takes the place of a plain counter in Team");
 
-// Synchronization words of a thread as a member of a team, on the thread's
-// wake-up line (see Thread). `done` is written by the member and polled by the
-// leader at the join, and `tree` is shared with the member's parent or
-// children in the barrier tree, so a line is shared by two threads at a time.
-// Only members other than the leader use their line: the leader of a team
-// stores no `done`, has no parent in the tree, and only reads and writes the
-// lines of other members. A thread is such a member of at most one team at
-// a time, as it leads any team it forks, and a level-1 member cannot be
-// recruited at level 2. So each thread has one line, which it takes from team
-// to team. The values stored are unique ids (see "Unique ids"), and waits
-// test for equality, so that a value left by a previous team never matches;
-// nothing needs to be reset.
-struct MemberSync {
-  Atomic<uint64_t> done;
+// A thread's flags as a worker in a team, on its wake-up line: `done`, polled
+// by the leader, and `tree`, shared with its tree parent or children. Per
+// thread, not per team: a thread is a worker of at most one team at a time
+// (it leads any team it forks). Never reset; see "Unique ids".
+struct WorkerSync {
+  UniqueIdFlag done;
   TreeFlags tree;
 };

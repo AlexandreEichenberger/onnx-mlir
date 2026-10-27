@@ -8,31 +8,21 @@
 //
 // =============================================================================
 //
-// Part of pomp.cpp, included in its anonymous namespace: the pool of workers.
-// The idle wait and its wake-ups, the recruitment of a team's workers, and the
-// host protocol: entry, close, release and reopen.
+// Part of pomp.cpp: the pool of threads. The idle wait and its wake-ups,
+// recruitment, and the host protocol: entry, close, release and reopen.
 //
 //===----------------------------------------------------------------------===//
 
 // -----------------------------------------------------------------------------
 // Wake-up and sleep
 //
-// An idle worker spins on its `go` epoch and on its bit in `released`, then
-// sleeps. To sleep, it sets its bit in `sleeping`, re-reads both, and waits for
-// a post. A waker first publishes (bumps `go`, or sets the `released` bit),
-// then reads `sleeping`, and posts only to workers whose bit it clears itself.
-// All these accesses are sequentially consistent, so either the worker sees
-// the new value or the waker sees the bit: no wake-up is lost. Exactly one of
-// them clears the bit, so every post is consumed in the sleep it was meant for.
-// Spinning workers never touch a mutex, and a waker of spinning workers makes
-// one load of `sleeping` and no system call.
-//
-// A post only means "re-check": a waker may clear the bit of a later sleep
-// than the one it meant to end. The worker then re-checks, finds nothing new,
-// and sleeps again.
+// An idle pool thread spins on its `go` epoch and its `released` bit, then
+// sleeps with its bit set in `sleeping`. A waker publishes, then posts only to
+// the sleepers whose bit it clears. Waking spinning threads costs one load of
+// `sleeping`, and no system call.
 // -----------------------------------------------------------------------------
 
-// The assignment, then the bump of `go` that publishes it (seq_cst).
+// The bump of `go` publishes the assignment (seq_cst).
 inline void Thread::assign(Team *team, int32_t tid) {
   wake_.team = team;
   wake_.tid = tid;
@@ -49,13 +39,13 @@ int Pool::wakeSleepers(SlotMask workers) {
   if (!workers)
     return 0;
   SlotMask m = sleeping_.clearAndReport(workers);
-  for (int slot : m)
+  for (int32_t slot : m)
     threads[slot].post();
   return m.count();
 }
 
-// Wake up to n sleeping workers that a release claimed. Used by each leaving
-// worker, so that sleepers are woken as a tree, and not by the leader.
+// Wake up to n sleeping released threads. Each leaving thread calls it, so
+// the wake-ups spread as a tree, not from the leader.
 void Pool::wakeReleased(int n) {
   while (n > 0) {
     SlotMask s = sleeping_.load();
@@ -67,7 +57,7 @@ void Pool::wakeReleased(int n) {
 }
 
 // Wait for work or for release. Return true for work, with `last` updated to
-// the new epoch, and false when a release has claimed this worker.
+// the new epoch, and false when a release has claimed this thread.
 bool Pool::waitWork(Thread &t, SlotMask self, uint64_t &last) {
   for (long i = 0; i < settings.spin(); ++i) {
     uint64_t g = t.epoch(Order::Acquire);
@@ -79,6 +69,9 @@ bool Pool::waitWork(Thread &t, SlotMask self, uint64_t &last) {
       return false;
     relax();
   }
+  // Sleep: set our bit, then re-check. A waker publishes, then reads
+  // `sleeping`; all seq_cst, so either we see its publish or it sees our
+  // bit: no wake-up is lost.
   uint64_t g;
   for (;;) {
     sleeping_.fetchSet(self);
@@ -92,6 +85,7 @@ bool Pool::waitWork(Thread &t, SlotMask self, uint64_t &last) {
         t.waitPost();
       break;
     }
+    // A post only means "re-check": it may be meant for an earlier sleep.
     t.waitPost();
     g = t.epoch();
     rel = bool(released_.load() & self);
@@ -131,7 +125,7 @@ SlotMask Pool::recruit(Team &team, int want, SlotMask prefer) {
     // Same request, same workers all idle: O(1).
     SlotMask pick = team.cachedPick(want, idle);
     if (!pick) {
-      // Take what is idle now, preferred workers first; fewer is fine.
+      // Take what is idle now, preferred threads first; fewer is fine.
       pick = (idle & prefer).lowest(want);
       pick |= (idle - pick).lowest(want - pick.count());
     }
@@ -146,12 +140,11 @@ SlotMask Pool::recruit(Team &team, int want, SlotMask prefer) {
   }
 }
 
-// Return the workers of a team. A release that ran meanwhile, from another
-// host thread, did not see them idle; they are released here instead. Both
-// sides are seq_cst, so one of them sees the other.
+// Return a team's workers. A release that ran meanwhile did not see them
+// idle, so release them here; both sides are seq_cst, so one sees the other.
 void Pool::returnWorkers(SlotMask workers) {
   busy_.fetchClear(workers);
-  if (isClosed())
+  if (!isOpen())
     releaseIdle();
 }
 
@@ -171,7 +164,7 @@ private:
   const Thread &thread_;
 };
 
-// Spin on a condition outside of any team (reclaim), yielding when long.
+// Spin on a condition outside of any team, yielding when long.
 template <class Cond>
 void spinUntil(Cond cond) {
   for (long n = 0; !cond();) {
@@ -186,21 +179,38 @@ void spinUntil(Cond cond) {
 // The pool
 // -----------------------------------------------------------------------------
 
-int Pool::enter(int slot) {
+// The pool starts closed: a host that sets the limit but never opens the pool
+// runs every region on one thread, and is told why. Not after a close, where
+// one thread is the documented behaviour.
+void Pool::warnIfNeverOpened() {
+  if (state_.load(Order::Relaxed) == kNeverOpened &&
+      !neverOpenedSeen_.exchange(1))
+    fprintf(stderr, "pomp: warning: a parallel region runs on one thread, as "
+                    "the pool was never opened; call pomp_open_pool() before "
+                    "the pool threads enter (see pomp.h)\n");
+}
+
+int Pool::open() {
+  if (SelfWord::current().inPomp())
+    return POMP_ERR_STATE;
+  if (!settings.limit())
+    return POMP_ERR_LIMIT;
+  state_.store(kOpen);
+  return POMP_OK;
+}
+
+int Pool::enter(int32_t slot) {
   int limit = settings.limitAcquire();
   if (!limit)
-    return POMP_ERR_CLOSED; // Closed until an open gives the limit.
+    return POMP_ERR_CLOSED; // Closed until a limit is set and the pool opened.
   if (slot < 1 || slot >= limit)
     return POMP_ERR_SLOT;
-  // A thread in the pool cannot enter it again, and the leader cannot enter
-  // it from inside its regions.
+  // Not from a pool thread, nor from inside a region.
   if (SelfWord::current().inPomp())
     return POMP_ERR_STATE;
   Thread &self = threads[slot];
   SlotMask me = SlotMask::of(slot);
-  // Take the slot. If its previous thread was released but has not left yet,
-  // wait for it: this costs this thread, not the leader. A slot whose thread
-  // has not been released is in use.
+  // Take the slot; wait if its previous thread was released but has not left.
   for (;;) {
     int observed;
     if (self.claimSlot(observed))
@@ -210,32 +220,30 @@ int Pool::enter(int slot) {
     sched_yield();
   }
 
-  // Ready this slot's sleep before the slot can be recruited, posted to or
-  // claimed by a release: all of these follow the clear of `busy` below.
-  self.initPost();
+  // Init before the slot becomes recruitable, below.
+  self.init();
   SelfWord::set(SelfWord(slot));
   self.regions().startAt(0, 0);
   self.clearPost();
   uint64_t epoch = self.epoch();
 
-  // Become idle, hence recruitable, then check the gate. Release closes the
-  // gate before it claims idle workers, so either this thread sees it closed
-  // or the release claims it.
+  // Become idle, then check that the pool is open. A close marks it closed
+  // before claiming the idle threads, so either we see it closed or the
+  // close claims us.
   busy_.fetchClear(me);
-  if (isClosed()) {
+  if (!isOpen()) {
     if (!(busy_.fetchSet(me) & me)) {
       // Nobody claimed this slot: back out.
       SelfWord::set(SelfWord());
       self.setPresence(Thread::kFree, Order::Release);
       return POMP_ERR_CLOSED;
     }
-    // Claimed between the two steps, by a release or by a fork after an
-    // open: serve as any worker.
+    // Claimed meanwhile, by a release or a fork: serve as any pool thread.
   }
-  numWorkers_.fetchAdd(1);
+  numPoolThreads_.fetchAdd(1);
 
   while (waitWork(self, me, epoch))
-    self.assignedTeam().runMember(self, slot, self.assignedTid());
+    self.assignedTeam().runWorker(self, slot, self.assignedTid());
 
   // Released. The busy bit stays set until a thread enters as this slot.
   self.regions().startAt(0, 0);
@@ -243,14 +251,13 @@ int Pool::enter(int slot) {
   released_.fetchClear(me);
   wakeReleased(2);
   SelfWord::set(SelfWord());
-  numWorkers_.fetchSub(1);
+  numPoolThreads_.fetchSub(1);
   self.setPresence(Thread::kFree, Order::Release);
   return POMP_OK;
 }
 
-// Claim every idle worker for a release, as a fork would, and start their
-// wake-up. Called by a release after it closed the gate, and by a leader that
-// returns its team's workers while the gate is closed.
+// Claim every idle pool thread, as a fork would, mark it released, and start
+// the wake-ups. Called once the pool is marked closed.
 void Pool::releaseIdle() {
   SlotMask old = busy_.load(), idle;
   do {
@@ -259,20 +266,18 @@ void Pool::releaseIdle() {
   if (!idle)
     return;
   released_.fetchSet(idle);
-  // Spinning workers see their bit and leave; each leaving worker wakes
-  // sleeping ones. Only if every claimed worker sleeps is there nobody to start
-  // that chain: then post to one.
+  // Spinning threads see their bit and leave, waking sleepers as they go. If
+  // all claimed threads sleep, post to one to start that chain.
   if ((sleeping_.load() & idle) == idle)
     wakeSleepers(SlotMask::of(idle.lowest()));
 }
 
 int Pool::close() {
-  // Not from a worker, nor from inside the regions of the calling thread.
+  // Not from a pool thread, nor from inside the regions of the calling thread.
   if (SelfWord::current().inPomp())
     return POMP_ERR_STATE;
-  // Close the gate first, so an entry from now on either backs out or is
-  // claimed just below.
-  closeGate();
+  // Mark closed first: a concurrent entry then backs out or is claimed below.
+  state_.store(kClosed);
   releaseIdle();
   return POMP_OK;
 }
@@ -281,24 +286,12 @@ int Pool::waitEmpty() {
   if (SelfWord::current().inPomp())
     return POMP_ERR_STATE;
   int limit = settings.limitAcquire();
-  // Wake any claimed worker still asleep, until all have left.
+  // Wake any claimed thread still asleep, until all have left.
   while (released_.load() & settings.limitSlots()) {
     wakeReleased(kMaxThreads);
     sched_yield();
   }
-  for (int i = 1; i < limit; ++i)
-    spinUntil(NotLeaving(threads[i]));
-  return POMP_OK;
-}
-
-int Pool::open(int threadLimit) {
-  if (SelfWord::current().inPomp())
-    return POMP_ERR_STATE;
-  // Whether the pool is open or closed, the outcome is the same: open with
-  // the process's limit, or POMP_ERR_LIMIT with the pool unchanged.
-  int rc = settings.setLimit(threadLimit);
-  if (rc != POMP_OK)
-    return rc;
-  closed_.store(0);
+  for (int32_t slot = 1; slot < limit; ++slot)
+    spinUntil(NotLeaving(threads[slot]));
   return POMP_OK;
 }

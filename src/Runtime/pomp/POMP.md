@@ -51,7 +51,7 @@ other than the two above aborts at run time.
 
 | Variable | Meaning |
 |---|---|
-| `OMP_THREAD_LIMIT` | In `[1, 64]`, initial thread included. Fixes the thread limit for the whole process, and takes precedence over any limit passed to `pomp_open_pool` (see "The thread limit"). If unset, the first `pomp_open_pool(limit)` gives it; until then the pool is closed, regions run on one thread, and `omp_get_max_threads` and `omp_get_thread_limit` return 1, with one warning on stderr. If set but invalid, it is ignored with a warning on stderr, as if unset. Nothing aborts |
+| `OMP_THREAD_LIMIT` | In `[1, 64]`, initial thread included. Fixes the thread limit for the whole process, and takes precedence over `pomp_set_thread_limit` (see "The thread limit"). If unset, the first valid `pomp_set_thread_limit(limit)` gives it; until then the pool is closed, regions run on one thread, and `omp_get_max_threads` and `omp_get_thread_limit` return 1, with one warning on stderr. If set but invalid, it is ignored with a warning on stderr, as if unset. Nothing aborts |
 | `OMP_NUM_THREADS` | `n` or `n1,n2`: default team size at levels 1 and 2, clamped to the limit once it is known. Default is the limit |
 | `OMP_MAX_ACTIVE_LEVELS` | 1 (default) or 2; 0 means 1 and larger values mean 2. As in libomp, a list in `OMP_NUM_THREADS` implies 2 |
 | `POMP_SPIN` | Spin iterations of any wait before it sleeps: an idle worker, the leader at the join, a thread in a barrier (default 200000; 0 sleeps immediately). Team waits yield after 4096 iterations of the spin |
@@ -60,8 +60,9 @@ other than the two above aborts at run time.
 ## Host interface (`pomp.h`)
 
 ```c
+int pomp_set_thread_limit(int limit); // once per process; OMP_THREAD_LIMIT, if valid, wins
 int pomp_get_thread_limit(void);    // initial thread included; 0 while no limit is set
-int pomp_open_pool(int limit);      // open the pool (once per cycle); sets the limit once; 0 keeps it
+int pomp_open_pool(void);           // open the pool (once per cycle); needs a limit
 int pomp_enter_pool(int slot);      // calling thread works in the pool; returns once the pool closes
 int pomp_close_pool(void);          // close the pool and release its threads; does NOT wait
 int pomp_wait_pool_empty(void);     // optional: wait until released threads have returned
@@ -72,7 +73,7 @@ int pomp_pool_size(void);           // threads currently in the pool
 ### Initialization, and `pomp_open_pool`
 
 There is no init call. pomp initializes itself on the first call of **any** entry point:
-`pomp_enter_pool`, `pomp_open_pool`, `pomp_get_thread_limit`, the other pool calls, and the
+`pomp_enter_pool`, `pomp_set_thread_limit`, `pomp_get_thread_limit`, the other pool calls, and the
 `__kmpc_*` calls of compiled code. Initialization reads the environment (`OMP_THREAD_LIMIT`,
 `OMP_NUM_THREADS`, ...) once per process. Concurrent first calls are safe: one thread does it
 and the others wait a few microseconds.
@@ -80,14 +81,16 @@ and the others wait a few microseconds.
 `pomp_open_pool` is a different thing: it runs once per *cycle*, as the counterpart of
 `pomp_close_pool`. It lets threads enter, and lets parallel regions use them.
 
-- If `OMP_THREAD_LIMIT` is set, the pool starts open, so the first cycle does not need
-  `pomp_open_pool`.
-- If it is not set, the first `pomp_open_pool(limit)` provides the limit and opens the pool.
-  Before that, the pool is closed: `pomp_enter_pool` returns `POMP_ERR_CLOSED` and regions run
-  on one thread.
+- The pool starts closed, whether or not `OMP_THREAD_LIMIT` is set: every cycle, the first
+  one included, starts with `pomp_open_pool()`. Until the first open, regions run on one
+  thread, and the first one to find the pool never opened warns on stderr.
+- If `OMP_THREAD_LIMIT` is not set, the host calls `pomp_set_thread_limit(limit)` before
+  `pomp_open_pool()`.
+  Before the limit is set, the pool is closed: `pomp_open_pool` returns `POMP_ERR_LIMIT`,
+  `pomp_enter_pool` returns `POMP_ERR_CLOSED` and regions run on one thread.
 - If it is set but invalid, it is ignored with a warning on stderr, and pomp behaves as if it
   were not set. A host that wants to fail loudly, for example with a Java exception, checks
-  `pomp_get_thread_limit() == 0` before its first `pomp_open_pool(0)`.
+  `pomp_get_thread_limit() == 0` before its call to `pomp_set_thread_limit`.
 
 So a thread may call `pomp_enter_pool` before anything else in the process: it initializes pomp
 and enters the pool, or gets `POMP_ERR_CLOSED` if no limit is known yet.
@@ -95,7 +98,7 @@ and enters the pool, or gets `POMP_ERR_CLOSED` if no limit is known yet.
 | Code | Meaning |
 |---|---|
 | `POMP_OK` | Success. For `pomp_enter_pool`: the thread worked in the pool, was released by a close, and is back with the host |
-| `POMP_ERR_LIMIT` | `pomp_open_pool` while no limit is set yet, with a `limit` that is 0 or not in `[1, 64]`. Never returned once a limit is set |
+| `POMP_ERR_LIMIT` | `pomp_set_thread_limit` with a `limit` not in `[1, 64]` while no limit is set, or different from the limit a previous call set; `pomp_open_pool` while no limit is set |
 | `POMP_ERR_SLOT` | Slot out of range (`[1, limit-1]`), or another thread is in the pool as that slot and not released |
 | `POMP_ERR_STATE` | Wrong caller or state: enter, close, open or wait from a pool thread or from inside a parallel region |
 | `POMP_ERR_CLOSED` | Entry refused at once because the pool is closed (after a close, before the next open, or before any thread limit is known) |
@@ -140,24 +143,23 @@ Where it comes from, in order:
 
 1. **`OMP_THREAD_LIMIT`**, read at initialization, if it is set and in `[1, 64]`. It takes
    precedence: no call can override it.
-2. Otherwise, **the first `pomp_open_pool(limit)` with a `limit` in `[1, 64]`**. This stands
-   in for the environment variable when the host cannot set one, and it is pomp's only addition
-   to the standard here.
+2. Otherwise, **the first `pomp_set_thread_limit(limit)` with a `limit` in `[1, 64]`**. This
+   stands in for the environment variable when the host cannot set one, and it is pomp's only
+   addition to the standard here.
 
-What `pomp_open_pool(limit)` then does:
+What `pomp_set_thread_limit(limit)` does (it never opens or closes the pool):
 
-| Limit already set? | `limit` | Result |
+| Limit already set by | `limit` | Result |
 |---|---|---|
-| No | 0, or not in `[1, 64]` | `POMP_ERR_LIMIT`; the pool is unchanged (closed) |
-| No | in `[1, 64]` | The limit becomes `limit`; the pool opens |
-| Yes | 0 | The pool opens with the limit |
-| Yes | equal to the limit | The pool opens with the limit |
-| Yes | anything else | **Clamped to the limit**, with one warning on stderr per process; the pool opens |
+| nothing | not in `[1, 64]` | `POMP_ERR_LIMIT`; no limit is set |
+| nothing | in `[1, 64]` | The limit becomes `limit` |
+| either | equal to the limit | `POMP_OK` |
+| `OMP_THREAD_LIMIT` | anything else | `POMP_OK`, the limit unchanged, with one warning on stderr per process |
+| `pomp_set_thread_limit` | anything else | `POMP_ERR_LIMIT`, the limit unchanged |
 
-Once a limit is set, an open never fails over its argument, and the result is the same whether
-the pool was open or closed. A host that ignores the return code can therefore never leave an
-inference running on one thread by passing the wrong limit. It gets the process's limit and one
-warning.
+A host can therefore always call `pomp_set_thread_limit` with its own value: the environment
+variable, if set, wins quietly. A second call with another value is a host bug, and is refused.
+`pomp_open_pool()` takes no limit; it returns `POMP_ERR_LIMIT` while none is set.
 
 **Relation to the OpenMP standard.** In OpenMP, `thread-limit-var` is initialized from
 `OMP_THREAD_LIMIT` and there is no `omp_set_thread_limit`, so a program cannot change it. The
@@ -176,7 +178,7 @@ That is a side effect of an unfinished path in libomp (see
 ### Pool states
 
 ```
-            pomp_open_pool(limit)
+            pomp_open_pool()
    +----------------------------------+
    v                                  |
  OPEN ------ pomp_close_pool() --> CLOSED
@@ -185,10 +187,9 @@ That is a side effect of an unfinished path in libomp (see
                                         released threads return to the host
 ```
 
-The pool starts OPEN at initialization if `OMP_THREAD_LIMIT` gave a valid limit, and CLOSED
-otherwise. Then the first `pomp_open_pool` must give the limit (S12). A close while CLOSED
-releases any pool thread claimed since the last close (normally none). An open while OPEN does
-nothing besides checking its argument, as in the table above.
+The pool starts CLOSED at initialization. Without a valid `OMP_THREAD_LIMIT`,
+`pomp_set_thread_limit` must give the limit before the first `pomp_open_pool` (S12). A close while CLOSED releases any pool thread claimed since the last close (normally
+none). An open while OPEN does nothing.
 
 No thread stays in the pool across a close. `pomp_close_pool` releases every idle thread at
 once, and a thread busy in a team is released by its leader at that team's join. A thread still
@@ -276,8 +277,8 @@ returns. The leader pays one post.
 - A slot held by a pool thread that has not been released: `POMP_ERR_SLOT`.
 - Enter, close, open or wait from inside a parallel region: `POMP_ERR_STATE`. The same
   holds from a pool thread, which is always inside pomp.
-- `pomp_open_pool` with a limit out of range, or different from the one already set:
-  `POMP_ERR_LIMIT`.
+- `pomp_set_thread_limit` with a limit out of range, or different from the one a previous call
+  set: `POMP_ERR_LIMIT`.
 
 **S9. Two host threads running regions at once** (`tworoots`).
 
@@ -304,9 +305,10 @@ kinds; every one is woken by the thread it waits for.
 
 **S12. No `OMP_THREAD_LIMIT`** (`nolimit`, run without it).
 
-The pool starts closed, entries return `POMP_ERR_CLOSED` and regions run on one thread, until
-`pomp_open_pool(limit)` sets the limit. The limit is then fixed: a later open with another value
-is clamped to it, with one warning, and opens the pool.
+The pool starts closed, opens return `POMP_ERR_LIMIT`, entries return `POMP_ERR_CLOSED` and
+regions run on one thread, until `pomp_set_thread_limit(limit)` sets the limit. The limit is then
+fixed: the same value succeeds, another one returns `POMP_ERR_LIMIT`. Setting it does not open
+the pool; `pomp_open_pool()` does.
 
 **S13. Inner teams taking each other's workers** (`steal`, with `OMP_MAX_ACTIVE_LEVELS=2`).
 
@@ -541,7 +543,7 @@ namespace:
 |---|---|
 | `pompSupport.inc` | Code not specific to pomp: `POMP_CONSTINIT`, `fatal`, `relax`, `Atomic<T>`, `Mutex`, `Condition`, `ScopedLock<T>`, `Post`, and `invoke`, the call of an outlined function through its exact type |
 | `pompIdentity.inc` | Slot sets, and the per-thread word |
-| `pompSyncTypes.inc` | The types of the synchronization inside a team, which `Team` and `Thread` hold by value: `TeamWait`, `TeamJoin`, `TeamCentralBarrier`, `TeamTreeBarrier`, `MemberBarrier`, `TreeFlags`, `MemberSync` |
+| `pompSyncTypes.inc` | The types of the synchronization inside a team, which `Team` and `Thread` hold by value: `TeamWait`, `TeamJoin`, `TeamCentralBarrier`, `TeamTreeBarrier`, `MemberBarrier`, `TreeFlags`, `WorkerSync` |
 | `pompTypes.inc` | The descriptors and the globals: the region stack, `Team`, `Thread`, `Pool`, `Settings`, `Root` |
 | `pompInit.inc` | Settings from the environment, the thread limit and the allocation of the descriptors |
 | `pompPool.inc` | The idle wait, recruitment, and the host protocol of the pool |
@@ -763,8 +765,8 @@ state, never by an argument taken as is:
 - **`gtid` arguments are ignored**, so a wrong `gtid` (negative, 64 or more, or another
   thread's) cannot index `threads`, read another thread's region stack, or join another
   team's barrier.
-- **Thread limit.** `pomp_open_pool` accepts only `[1, 64]` while no limit is set, and clamps
-  any later value to the limit set. `OMP_THREAD_LIMIT` out of range is ignored.
+- **Thread limit.** `pomp_set_thread_limit` accepts only `[1, 64]` while no limit is set, and
+  refuses any later value other than the limit set. `OMP_THREAD_LIMIT` out of range is ignored.
 - **Team sizes.** `num_threads` is clamped to `[0, 64]` when pushed and to the limit at the
   fork; `OMP_NUM_THREADS` to `[1, 64]`. A team is at most the number of idle workers + 1.
 - **Arguments.** `__kmpc_fork_call` aborts on `argc` outside `[0, 16]` before reading any.
@@ -782,7 +784,7 @@ UBSan (bad slots, limits, `gtid`s, `num_threads` and loop bounds), and against l
 ends of every IV type.
 
 **Failures and resources.** pomp allocates memory once: the descriptors, when the thread
-limit is set. If that fails, `pomp_open_pool` returns `POMP_ERR_NOMEM` and no limit is set (an
+limit is set. If that fails, `pomp_set_thread_limit` returns `POMP_ERR_NOMEM` and no limit is set (an
 `OMP_THREAD_LIMIT` that cannot be allocated is ignored, with a warning). Every pthread call is
 checked, and a failure aborts with the name of the call. Nothing else aborts at run
 time, except:

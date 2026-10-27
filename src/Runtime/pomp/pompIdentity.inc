@@ -8,53 +8,42 @@
 //
 // =============================================================================
 //
-// Part of pomp.cpp, included in its anonymous namespace: the per-thread word
-// that names the calling thread's slot, and slot sets.
+// Part of pomp.cpp: the per-thread word (SelfWord) and slot sets (SlotMask).
 //
 //===----------------------------------------------------------------------===//
 
 // -----------------------------------------------------------------------------
-// Thread identity: one per-thread word, SelfWord, which every entry point
-// reads first to know who is calling. The terms it uses:
+// Thread identity: SelfWord, the per-thread word every entry point reads
+// first.
 //
-// - Worker: a thread that entered the pool with pomp_enter_pool(slot). It is
-//   given its slot, 1..limit-1, on entry, and reads 0 again once it leaves.
+// Threads, by their place in the pool:
+// - Pool thread: a thread lent to the pool (pomp_enter_pool), as slot
+//   1..limit-1. Between teams it waits idle in the pool.
+// - Non-pool thread: any other thread. All of them read slot 0, which one of
+//   them at a time may own (see "Root ownership" in pompRegion.inc).
+// - Foreign region: a region that a non-pool thread runs inline, as a team
+//   of one, touching no descriptor, with its nesting counted in this word:
+//   while another thread owns slot 0, before the thread limit is set, and
+//   inside another foreign region.
 //
-// - Non-worker (host thread): any other thread, such as the application's
-//   main thread or a thread of its own that runs a model. Its slot is always
-//   0, so all non-workers share slot 0's descriptor, `threads[0]`.
+// Threads, by their place in a team (an active region):
+// - Leader: the thread that forks the region, tid 0. It sets up the team,
+//   wakes the workers, runs its share, and joins.
+// - Worker: a pool thread recruited into the team, tid 1..nth-1. It leaves
+//   after its done report, without waiting.
+// - Member: any of the team's nth threads, leader included.
+// A pool thread is idle, or a worker of one team; as a worker it may also
+// lead a level-2 team.
 //
-// - Root: the one non-worker that currently owns slot 0, and so may use
-//   `threads[0]`: its region stack, and the teams it leads at level 1. There
-//   is at most one root at a time. No thread is the root between regions.
-//   Ownership is taken when a non-worker starts a region (fork or serialized)
-//   at depth 0: the first to swap Root::active_ from 0 to 1 becomes the root,
-//   in whatever order the threads arrive. It is given up when that outermost
-//   region ends. Any non-worker can then be the root of its next region, so
-//   the root may change from region to region, but two are never root at once.
+// Functions take a `leader` or `worker` prefix when only that role calls
+// them; unprefixed team functions are for any member.
 //
-// - Foreign region: a region that a non-worker runs inline as a team of one,
-//   without touching any descriptor. Its nesting is counted in this word
-//   instead of in a region stack, and inside it every query and barrier sees
-//   a team of one. A thread starts a foreign region:
-//     * when another thread is the root: a second host thread running a model
-//       at the same time (POMP.md, S9). pomp warns once;
-//     * when the thread limit is not set yet, as there are no descriptors yet;
-//     * for any region nested in a foreign region, even if the root has left
-//       or the limit has been set meanwhile.
-//   Like a region stack, the depth is at most kMaxNesting; deeper aborts.
-//   Each foreign region ends by decrementing the depth. At depth 0 the thread
-//   is no longer foreign, and its next region tries again to take the root.
-//   Workers and the root never start foreign regions: they run on their slot.
+// The pending team size (__kmpc_push_num_threads, consumed by the next fork
+// or serialized region) and the foreign depth are per thread, not per slot,
+// as non-pool threads share slot 0.
 //
-// - Pending team size: the size __kmpc_push_num_threads gives the thread's
-//   next fork, 0 if none. The next fork or serialized region consumes it.
-//
-// The pending size and foreign depth belong to the thread, not to its slot:
-// non-workers share slot 0, so they cannot be kept in `threads[0]`.
-//
-// Layout of the word (bits): 0-7 slot, 8 root owner, 9-15 pending team size,
-// 16-30 foreign depth. Zero is a non-worker that is in no region.
+// Layout (bits): 0-7 slot, 8 root owner, 9-15 pending size, 16-30 foreign
+// depth. Zero is a non-pool thread in no region.
 // -----------------------------------------------------------------------------
 
 class SelfWord {
@@ -67,15 +56,13 @@ public:
   // Create the per-thread storage, once, before any thread has a slot.
   static void createStorage();
 
-  // The thread's slot: 1..limit-1 for a worker, 0 for any non-worker.
+  // The thread's slot: 1..limit-1 for a pool thread, 0 for any other.
   int32_t slot() const { return word_ & kSlotBits; }
-  // A non-worker that is the root, inside its regions.
+  // A non-pool thread that owns slot 0, inside its regions.
   bool ownsRoot() const { return (word_ & kRootOwner) != 0; }
-  // A worker, or the root: the thread may use `threads[slot()]`. Any other
-  // thread is a non-worker outside regions or in foreign ones.
+  // A pool thread, or the owner of slot 0: may use `threads[slot()]`.
   bool hasDescriptor() const { return (word_ & (kSlotBits | kRootOwner)) != 0; }
-  // A worker, the root, or a thread in a foreign region: the pool calls of
-  // pomp.h are refused from such a thread.
+  // A pool thread, or inside a region: pool calls are refused.
   bool inPomp() const { return (word_ & kInPompBits) != 0; }
   // The pending team size, 0 if none.
   int32_t pending() const { return (word_ & kPendingBits) >> kPendingShift; }
@@ -83,15 +70,15 @@ public:
   bool inForeign() const { return (word_ & kForeignBits) != 0; }
   int32_t foreignDepth() const { return (word_ & kForeignBits) / kForeignOne; }
 
+  // Set or clear the pending team size.
   SelfWord withPending(int32_t nth) const {
     return SelfWord((word_ & ~kPendingBits) | (nth << kPendingShift));
   }
   SelfWord withoutPending() const { return SelfWord(word_ & ~kPendingBits); }
-  // Set by Root::tryEnter when the thread becomes the root, cleared by
-  // Root::leave.
+  // Set and cleared by Root::tryEnter and Root::leave.
   SelfWord withRootOwner() const { return SelfWord(word_ | kRootOwner); }
   SelfWord withoutRootOwner() const { return SelfWord(word_ & ~kRootOwner); }
-  // Start and end a foreign region: one level deeper, one level out.
+  // Enter or leave a foreign region: one level deeper, or one out.
   SelfWord enterForeign() const {
     if (foreignDepth() >= kMaxNesting)
       fatal("regions nested too deeply");
@@ -106,7 +93,6 @@ private:
   static constexpr int32_t kPendingBits = 0x7f << kPendingShift;
   static constexpr int32_t kForeignOne = 1 << 16;
   static constexpr int32_t kForeignBits = 0x7fff * kForeignOne;
-  // Set iff the thread is a worker, or inside a region.
   static constexpr int32_t kInPompBits = kSlotBits | kRootOwner | kForeignBits;
   static_assert(kMaxNesting <= kForeignBits / kForeignOne,
       "the foreign depth field must hold kMaxNesting");
@@ -115,8 +101,7 @@ private:
 };
 
 #ifdef POMP_USE_PTHREAD_KEY
-// Created at init. Until then no thread has a slot, and the key must not be
-// read: its value would name a key of another library.
+// Created at init, and not read before: its value could be another library's.
 POMP_CONSTINIT pthread_key_t selfKey{};
 POMP_CONSTINIT Atomic<int> selfKeyReady;
 
@@ -145,15 +130,17 @@ void SelfWord::createStorage() {}
 // Slot sets
 // -----------------------------------------------------------------------------
 
-// A set of slots, one bit per slot of a 64-bit word. Slots are pool-wide
-// ids: 0 for the root and 1..limit-1 for the workers (`threads[slot]`). Tids,
-// the ids of members in their team, are not sets: the leader is tid 0, and the
-// other members follow in increasing order of slots. Iterating visits the
-// slots in increasing order, one step per slot in the set.
+// A set of slots, one bit each in a 64-bit word. Slots are pool-wide ids (0
+// for the owner of slot 0, 1..limit-1 for pool threads); tids are ids within
+// a team (leader 0, then the workers by increasing slot). Iteration visits
+// slots in increasing order.
 class SlotMask {
 public:
   constexpr SlotMask() = default;
-  static constexpr SlotMask of(int id) { return SlotMask(uint64_t(1) << id); }
+  // The set {id}.
+  static constexpr SlotMask of(int32_t id) {
+    return SlotMask(uint64_t(1) << id);
+  }
   // Ids 0..n-1.
   static constexpr SlotMask below(int n) {
     return SlotMask(n >= 64 ? UINT64_MAX : (uint64_t(1) << n) - 1);
@@ -164,9 +151,8 @@ public:
   constexpr explicit operator bool() const { return bits_ != 0; }
   int count() const { return __builtin_popcountll(bits_); }
   // The lowest id of a nonempty set.
-  int lowest() const { return __builtin_ctzll(bits_); }
-  // The subset made of the n smallest ids of this set, or the whole set if it
-  // has fewer than n. E.g. {2, 5, 9, 12}.lowest(2) is {2, 5}.
+  int32_t lowest() const { return __builtin_ctzll(bits_); }
+  // The n smallest ids, or all if fewer: {2, 5, 9, 12}.lowest(2) is {2, 5}.
   SlotMask lowest(int n) const {
     uint64_t x = bits_, r = 0;
     for (; n > 0 && x; --n) {
@@ -183,7 +169,7 @@ public:
   constexpr SlotMask operator&(SlotMask o) const {
     return SlotMask(bits_ & o.bits_);
   }
-  // Set difference: the ids of this set that are not in `o`.
+  // Set difference.
   constexpr SlotMask operator-(SlotMask o) const {
     return SlotMask(bits_ & ~o.bits_);
   }
@@ -195,7 +181,7 @@ public:
   class Iterator {
   public:
     explicit Iterator(uint64_t rest) : rest_(rest) {}
-    int operator*() const { return __builtin_ctzll(rest_); }
+    int32_t operator*() const { return __builtin_ctzll(rest_); }
     Iterator &operator++() {
       rest_ &= rest_ - 1;
       return *this;
@@ -213,9 +199,7 @@ private:
   uint64_t bits_ = 0;
 };
 
-// An atomic SlotMask. Operations take and return masks, as Atomic's do
-// values; fetchSet and fetchClear add and remove slots and return the previous
-// set.
+// An atomic SlotMask; fetchSet and fetchClear return the previous set.
 class AtomicMask {
 public:
   constexpr AtomicMask() = default;
@@ -228,18 +212,15 @@ public:
   SlotMask fetchSet(SlotMask m, Order o = Order::SeqCst) {
     return SlotMask::fromBits(bits_.fetchOr(m.bits(), o));
   }
-  // Remove the slots of `m`; return the whole set before.
   SlotMask fetchClear(SlotMask m, Order o = Order::SeqCst) {
     return SlotMask::fromBits(bits_.fetchAnd(~m.bits(), o));
   }
-  // Clear the slots of `m`; return those of them that this call cleared,
-  // that is, those that were set until now. Of threads that race to clear a
-  // slot, exactly one gets it back.
+  // Clear `m`; return the slots this call cleared. Of racing clearers of a
+  // slot, exactly one gets it.
   SlotMask clearAndReport(SlotMask m, Order o = Order::SeqCst) {
     return fetchClear(m, o) & m;
   }
-  // If the set is `expected`, replace it with `desired` and return true;
-  // else, or on a spurious failure, load the set into `expected`.
+  // As Atomic's: on failure, `expected` gets the current set.
   bool compareExchangeWeak(SlotMask &expected, SlotMask desired,
       Order success = Order::SeqCst, Order failure = Order::SeqCst) {
     uint64_t e = expected.bits();

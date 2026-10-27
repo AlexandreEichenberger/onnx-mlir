@@ -8,14 +8,10 @@
 //
 // =============================================================================
 //
-// Support code of pomp.cpp that is not specific to pomp: constant
-// initialization, errors, spinning, atomics, pthread locks and conditions,
-// and the call of an outlined function. Included by pomp.cpp only, in its
-// single translation unit, so that every function here stays visible to the
-// inliner; it is not a separate source. The same rules as pomp.cpp apply: no
-// C++ header, no C++ runtime, constant initialization only (see "Language" in
-// POMP.md). pomp.cpp defines kMaxArgs, the most arguments invoke() passes,
-// before including it.
+// Generic support code of pomp.cpp: errors, spinning, atomics, pthread locks,
+// and the call of an outlined function. Included in pomp.cpp's single
+// translation unit, so all of it stays visible to the inliner; same language
+// rules as pomp.cpp. Uses kMaxArgs, defined before the include.
 //
 //===----------------------------------------------------------------------===//
 
@@ -25,9 +21,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-// Every global must be initialized at compile time: a constructor run at load
-// would need the C++ runtime's static-init machinery. C++20 checks it with
-// constinit, and clang in C++17 with its own attribute.
+// Globals must be constant-initialized: a load-time constructor would need the
+// C++ runtime. Checked by C++20 constinit, or clang's attribute in C++17.
 #if defined(__cpp_constinit)
 #define POMP_CONSTINIT constinit
 #elif defined(__has_cpp_attribute)
@@ -51,7 +46,7 @@ namespace {
   abort();
 }
 
-// Abort if a pthread call fails: pomp has no way to continue without it.
+// Abort if a pthread call fails.
 inline void checkPthread(int rc, const char *call) {
   if (rc != 0)
     fatal("pthread call failed: ", call);
@@ -85,10 +80,8 @@ long parseInt(const char *s, const char **end) {
 // -----------------------------------------------------------------------------
 // Atomics and locks
 //
-// Atomics use the compiler's __atomic builtins, on which both <stdatomic.h>
-// and <atomic> are built: the same instructions and the same memory model as
-// C11, without a header. As in C11, an operation is sequentially consistent
-// unless told otherwise. Locks are pthread's, behind small classes.
+// Atomics wrap the __atomic builtins (C11 memory model, no header); seq_cst
+// unless told otherwise. Locks wrap pthread's.
 // -----------------------------------------------------------------------------
 
 enum class Order : int {
@@ -146,8 +139,7 @@ private:
   T value_;
 };
 
-// A pthread mutex. Its storage starts zeroed, so that static arrays of them
-// stay in .bss; init() must run before any other use.
+// A pthread mutex, zeroed until init(), which must come before any use.
 class Mutex {
 public:
   constexpr Mutex() : mutex_() {}
@@ -169,7 +161,7 @@ private:
   pthread_mutex_t mutex_;
 };
 
-// A pthread condition, zeroed until init() as a Mutex.
+// A pthread condition, zeroed until init().
 class Condition {
 public:
   constexpr Condition() : cond_() {}
@@ -203,25 +195,27 @@ private:
   Lockable &lockable_;
 };
 
-// A binary "posted" flag with its mutex and condition, to sleep on. A post
-// only means "re-check": the waiter tests its own condition again.
+// A binary flag to sleep on. A post only means "re-check your condition".
 class Post {
 public:
   void init() {
     mutex_.init();
     cond_.init();
   }
+  // Set the flag and wake the waiter.
   void post() {
     ScopedLock<Mutex> lock(mutex_);
     posted_ = true;
     cond_.signal();
   }
+  // Wait until the flag is set, then consume it.
   void wait() {
     ScopedLock<Mutex> lock(mutex_);
     while (!posted_)
       cond_.wait(mutex_);
     posted_ = false;
   }
+  // Drop a pending post.
   void clear() {
     ScopedLock<Mutex> lock(mutex_);
     posted_ = false;
@@ -236,17 +230,15 @@ private:
 // -----------------------------------------------------------------------------
 // Calling an outlined function
 //
-// The compiler declares an outlined function variadic, but defines it with
-// fixed parameters: the two int32_t pointers, then one void * per shared
-// argument. Call each through its exact type, as libomp's portable
-// kmp_invoke_microtask.cpp does, so that the call is valid on ABIs where
-// variadic and fixed calls differ. A table, built at compile time, holds one
-// caller per argument count.
+// An outlined function is declared variadic but defined with fixed
+// parameters (two int32_t *, then one void * per argument). Call it through
+// its exact type, as libomp's portable invoke does, since variadic and fixed
+// calls differ on some ABIs: a compile-time table holds one caller per count.
 // -----------------------------------------------------------------------------
 
 using Microtask = void (*)(int32_t *gtid, int32_t *btid, ...);
 
-// The argument indices I...: call() passes argv[I]... to an outlined function.
+// call() passes argv[I]... to an outlined function.
 template <unsigned... I>
 struct Args {
   template <unsigned>
@@ -276,7 +268,8 @@ struct CallTable<Args<N...>> {
 };
 
 // Call `fn` with the gtid and tid pointers it takes, and argv[0..argc-1].
-void invoke(Microtask fn, int32_t gtid, int32_t tid, int argc, void **argv) {
+void invoke(
+    Microtask fn, int32_t gtid, int32_t tid, int32_t argc, void **argv) {
   using Table = CallTable<FirstArgs<kMaxArgs + 1>::Type>;
   if (argc < 0)
     fatal("negative argument count for an outlined function");

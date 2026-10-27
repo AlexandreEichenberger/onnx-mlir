@@ -177,7 +177,7 @@ for L in 2 3 4 8 16 17; do
         run $E "$T/pomp_host_test" rejoin 50
     done
   done
-  # No OMP_THREAD_LIMIT: the limit, and the descriptors, come from an open.
+  # No OMP_THREAD_LIMIT: the limit, and the descriptors, come from a call.
   run env POMP_SPIN=0 "$T/pomp_host_test" nolimit 50 $L
   run env POMP_SPIN=0 "$T/pomp_host_test" lateopen $L
 done

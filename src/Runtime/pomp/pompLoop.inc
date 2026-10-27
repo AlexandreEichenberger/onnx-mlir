@@ -8,33 +8,25 @@
 //
 // =============================================================================
 //
-// Part of pomp.cpp, included in its anonymous namespace: static loop
-// partitioning, as libomp's.
+// Part of pomp.cpp: static loop partitioning, as libomp's.
 //
 //===----------------------------------------------------------------------===//
 
 // -----------------------------------------------------------------------------
 // Static loops
 //
-// Static loop partitioning, matching libomp's (kmp_sched.cpp) results for
-// kmp_sch_static and kmp_sch_static_chunked. For kmp_sch_static, libomp's
-// effective flavor is "balanced": __kmp_do_serial_initialize overrides the
-// "greedy" initializer of __kmp_static.
+// Matches libomp's (kmp_sched.cpp) results for kmp_sch_static, in its
+// effective "balanced" flavor, and kmp_sch_static_chunked.
 //
-// T is the IV type, ST its signed type, and UT its unsigned type. All
-// arithmetic is in UT, where it wraps, so the results are libomp's bit for bit
-// without signed overflow. Two cases differ, both at the ends of the IV type,
-// which compiled code does not reach as it normalizes its loops to
-// [0, trip count - 1]:
-// - A loop over all values of the type has a trip count that wraps to 0.
-//   libomp then divides by zero (chunked) or splits nothing; pomp runs the
-//   whole loop on tid 0.
-// - The empty share of a thread is libomp's upper bound plus one step, unless
-//   that wraps around the end of the type, which would make it the whole
-//   range; then the upper bound moves one step back instead.
+// T is the IV type, ST and UT its signed and unsigned types. Arithmetic is in
+// UT, so results match libomp's bit for bit, without signed overflow. They
+// differ only at the ends of the IV type, which normalized loops never reach;
+// see the trip == 0 case and emptyShare.
 // -----------------------------------------------------------------------------
 
-// Give the calling thread an empty share of the loop that ends at `hi`.
+// Give the calling thread an empty share of the loop that ends at `hi`: as
+// libomp, start one step past `hi`, unless that wraps around the type, which
+// would make the share the whole range; then end one step before instead.
 template <class T, class ST, class UT>
 void emptyShare(T *plower, T *pupper, UT hi, ST incr) {
   T past = T(incr > 0 ? hi + 1 : hi - 1);
@@ -60,8 +52,8 @@ void staticInit(int32_t sched, int32_t *plast, T *plower, T *pupper,
     *pstride = incr;
     return;
   }
-  UT nth = regions ? UT(regions->topNth()) : 1;
-  UT tid = regions ? UT(regions->topTid()) : 0;
+  UT nth = regions ? UT(regions->innermostNth()) : 1;
+  UT tid = regions ? UT(regions->innermostTid()) : 0;
   if (nth == 1) {
     if (plast)
       *plast = 1;
@@ -79,7 +71,9 @@ void staticInit(int32_t sched, int32_t *plast, T *plower, T *pupper,
     trip = (lo - hi) / (UT(0) - inc) + 1;
   if (sched != kSchStatic && sched != kSchStaticChunked)
     fatal("unsupported loop schedule (only static is implemented)");
-  if (trip == 0) { // All values of the type: the whole loop on tid 0.
+  // A loop over all values of the type: the trip count wraps to 0. libomp
+  // then fails; pomp runs the whole loop on tid 0.
+  if (trip == 0) {
     if (tid != 0)
       emptyShare(plower, pupper, hi, incr);
     if (plast)

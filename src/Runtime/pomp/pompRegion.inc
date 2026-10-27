@@ -8,9 +8,8 @@
 //
 // =============================================================================
 //
-// Part of pomp.cpp, included in its anonymous namespace: parallel regions.
-// The region stack, the ownership of slot 0 by a host thread, and fork/join:
-// launch, run and join of a team.
+// Part of pomp.cpp: parallel regions. The region stack, the ownership of
+// slot 0, and fork/join.
 //
 //===----------------------------------------------------------------------===//
 
@@ -41,30 +40,31 @@ inline void RegionStack::pop() {
     fatal("__kmpc_end_serialized_parallel without a matching "
           "__kmpc_serialized_parallel");
   depth_--;
+  // A serialized entry is recorded with nth 1.
   if (depth_ < kMaxDepth && levels_[depth_].nth > 1)
     active_--;
 }
 
-// In queries below, the top is nullptr if there is none or it is past
-// kMaxDepth, we have by definition a serialized region.
+// Without a recorded innermost entry (none, or past kMaxDepth), the region is
+// serialized.
 
-inline int32_t RegionStack::topTid() const {
-  const Level *l = recordedTop();
+inline int32_t RegionStack::innermostTid() const {
+  const Level *l = recordedInnermost();
   return l ? l->tid : 0;
 }
 
-inline int32_t RegionStack::topNth() const {
-  const Level *l = recordedTop();
+inline int32_t RegionStack::innermostNth() const {
+  const Level *l = recordedInnermost();
   return l ? l->nth : 1;
 }
 
-inline bool RegionStack::topIsActive() const {
-  const Level *l = recordedTop();
+inline bool RegionStack::innermostIsActive() const {
+  const Level *l = recordedInnermost();
   return l && l->nth > 1;
 }
 
-inline Level *RegionStack::activeTop() {
-  return topIsActive() ? &levels_[depth_ - 1] : nullptr;
+inline Level *RegionStack::activeInnermost() {
+  return innermostIsActive() ? &levels_[depth_ - 1] : nullptr;
 }
 
 inline Thread *Thread::current() {
@@ -80,25 +80,14 @@ inline RegionStack *Thread::currentRegions() {
 // -----------------------------------------------------------------------------
 // Root ownership
 //
-// Every thread that is not a worker in the pool reads slot 0, so two host
-// threads running models at once would share slot 0's region stack and teams.
-// The first of them to start a region (fork or serialized) at depth 0 owns slot
-// 0 until that region ends, and marks itself in its per-thread word. Another
-// non-worker that starts a region meanwhile is detected, whatever the timing:
-// its region runs inline as a team of one, without touching slot 0, and a
-// warning is printed once. Entry points that take a `gtid` ignore it and use
-// the calling thread's own word, so a non-owner sees no enclosing region,
-// which is exactly what a team of one needs.
+// All non-pool threads read slot 0, so two host threads running models at once
+// would share its region stack and teams. The first to start an outermost
+// region becomes the root, owning slot 0 until that region ends; another
+// non-pool thread that starts one meanwhile runs it as a foreign region, and
+// pomp warns once.
 // -----------------------------------------------------------------------------
 
-void Root::warnSecondRoot() {
-  if (!secondRootSeen_.exchange(1))
-    fprintf(stderr, "pomp: warning: two host threads ran OpenMP regions at "
-                    "once; the later ones run on one thread (see POMP.md)\n");
-}
-
-// Take root ownership for the calling non-worker of word `w`. Return false if
-// another thread owns it.
+// Take root ownership for the caller, of word `w`; false if already owned.
 inline bool Root::tryEnter(SelfWord w) {
   int expected = 0;
   // Acquire: see slot 0 as the previous owner left it.
@@ -108,28 +97,30 @@ inline bool Root::tryEnter(SelfWord w) {
   return true;
 }
 
-inline void Root::leave() {
-  SelfWord::set(SelfWord::current().withoutRootOwner());
-  active_.store(0, Order::Release);
+void Root::warnSecondRoot() {
+  if (!secondRootSeen_.exchange(1))
+    fprintf(stderr, "pomp: warning: two host threads ran OpenMP regions at "
+                    "once; the later ones run on one thread (see POMP.md)\n");
 }
 
-// For a region about to start on the calling thread, whose word is `w`
-// (pending bits clear): say whether it runs on its slot as usual, after taking
-// root ownership, or as a foreign region, as another thread owns slot 0.
-//
-// Before the thread limit is set there are no descriptors: a region of a
-// non-worker then runs as a foreign one, which keeps its nesting in the
-// thread's word, as a serialized region would (workers exist only after).
-// The acquire of the limit orders the descriptors' allocation before their use.
+// How a region about to start on the caller, of word `w` (no pending size),
+// runs: on its own slot, on slot 0 as the new root, or as a foreign region.
 inline Root::Entry Root::enter(SelfWord w) {
   if (w.slot() || w.ownsRoot())
     return Entry::Own;
+  // No descriptors before the limit is set; the acquire orders their
+  // allocation before their use.
   if (!settings.limitAcquire())
     return Entry::Foreign;
   if (tryEnter(w))
     return Entry::Taken;
   warnSecondRoot();
   return Entry::Foreign;
+}
+
+inline void Root::leave() {
+  SelfWord::set(SelfWord::current().withoutRootOwner());
+  active_.store(0, Order::Release);
 }
 
 // Run `fn` inline as a foreign region of one thread.
@@ -148,21 +139,19 @@ Level Team::levelFor(int32_t tid) const {
   l.team = const_cast<Team *>(this);
   l.tid = tid;
   l.nth = nth_;
-  l.bar = initMemberBarrier(tid);
+  l.bar = initBarrier(tid);
   return l;
 }
 
-// For a level-1 team, split the remaining idle workers into one contiguous
-// group per member, which that member then prefers for its level-2 team, so
-// that concurrent inner forks do not compete and their caches stay valid.
-// Each member's group is kept in its thread descriptor, written before the
-// wake-up: called once the workers are known.
-void Team::partition() {
+// For a level-1 team: split the remaining idle pool threads into one contiguous
+// group per member, preferred for its level-2 team, so concurrent inner forks
+// do not compete and their caches stay warm.
+void Team::leaderPartition() {
   SlotMask spare = pool.idle();
   int n = spare.count();
   int32_t slot = leaderSlot();
   SlotMask rest = workers_;
-  for (int t = 0; t < nth_; ++t) {
+  for (int32_t t = 0; t < nth_; ++t) {
     int k = n / nth_ + (t < n % nth_ ? 1 : 0);
     SlotMask group = spare.lowest(k);
     threads[slot].setPreferred(group);
@@ -174,69 +163,73 @@ void Team::partition() {
   }
 }
 
-void Team::launch(SlotMask workers, int32_t level, int32_t depth, Microtask fn,
-    int32_t argc, void **argv) {
+void Team::leaderLaunch(SlotMask workers, int32_t level, int32_t depth,
+    Microtask fn, int32_t argc, void **argv) {
   fn_ = fn;
   argc_ = argc;
   memcpy(argv_, argv, sizeof(void *) * size_t(argc));
   nth_ = 1 + workers.count();
   level_ = level;
   depth_ = depth;
-  join_.startRegion();
+  join_.leaderStart();
   workers_ = workers;
   if (level_ == 1 && settings.maxActive() > 1)
-    partition();
+    leaderPartition();
 
-  // Assign and wake the members; post only to those that sleep. The team's
-  // workers are written first: members use them to wake each other.
+  // Assign and wake the workers, posting only to sleepers. workers_ is set
+  // first: members use it to wake each other.
   int32_t tid = 1;
-  for (int slot : workers)
+  for (int32_t slot : workers)
     threads[slot].assign(this, tid++);
   pool.wakeSleeping(workers);
 }
 
-void Team::join(Thread &leader, uint64_t uniqueBarrierId) {
-  TeamJoin::wait(*this, leader);
-  endLeaderBarrier(uniqueBarrierId);
-}
-
-void Team::runMember(Thread &self, int32_t slot, int32_t tid) {
-  uint64_t done = TeamJoin::doneValue(*this);
+void Team::runWorker(Thread &self, int32_t slot, int32_t tid) {
+  UniqueId doneUniqueId = TeamJoin::workerDoneValue(*this);
   // Continue the leader's nesting: same depth, same active levels.
   RegionStack &regions = self.regions();
   regions.startAt(depth_, level_ - 1);
   regions.pushActive(levelFor(tid));
   invoke(fn_, slot, tid, argc_, argv_);
   regions.pop();
-  TeamJoin::finish(*this, self, done);
+  TeamJoin::workerFinish(*this, self, doneUniqueId);
+}
+
+void Team::leaderJoin(Thread &leader, UniqueId uniqueBarrierId) {
+  TeamJoin::leaderWait(*this, leader);
+  leaderEndBarrier(uniqueBarrierId);
 }
 
 void Thread::fork(
     int32_t gtid, int32_t want, Microtask fn, int32_t argc, void **argv) {
-  int32_t limit = settings.limit();
+  int limit = settings.limit();
   if (want <= 0)
     want = settings.numThreads(regions_.active());
   if (want > limit)
     want = limit;
 
-  // Serialized: one thread asked for, no active level left, nested too
-  // deeply, or pool closed.
+  // Recruit, unless serialized: one thread, no active level left, too deep,
+  // or pool not open.
   Team *team = nullptr;
   SlotMask workers;
-  if (want > 1 && regions_.active() < settings.maxActive() &&
-      regions_.canNest() && !pool.isClosed(Order::Acquire)) {
+  bool parallel = want > 1 && regions_.active() < settings.maxActive() &&
+                  regions_.canNest();
+  if (parallel && !pool.isOpen(Order::Acquire)) {
+    pool.warnIfNeverOpened();
+  } else if (parallel) {
     SlotMask prefer;
     if (regions_.active() == 0) {
       if (gtid != 0)
-        fatal("a worker started a parallel region outside of a team");
+        fatal("a pool thread started a parallel region outside of a team");
       team = &rootTeam();
       prefer = settings.limitSlots();
     } else {
       team = &slotTeam(gtid);
-      prefer = regions_.topIsActive() ? preferred() : SlotMask();
+      prefer = regions_.innermostIsActive() ? preferred() : SlotMask();
     }
     workers = pool.recruit(*team, want - 1, prefer);
   }
+  // When we have no workers (reasons listed above), run serialized.
   if (!workers) {
     regions_.pushSerialized();
     invoke(fn, gtid, 0, argc, argv);
@@ -244,14 +237,15 @@ void Thread::fork(
     return;
   }
 
-  // Members start at the leader's depth and level. Run as tid 0, then join.
-  team->launch(
+  // Now launch parallel work, run as tid 0, then join.
+  team->leaderLaunch(
       workers, regions_.active() + 1, regions_.depth(), fn, argc, argv);
   regions_.pushActive(team->levelFor(0));
   invoke(fn, gtid, 0, argc, argv);
-  uint64_t uniqueBarrierId = regions_.activeTop()->bar.currUniqueBarrierId;
+  UniqueId uniqueBarrierId =
+      regions_.activeInnermost()->bar.currUniqueBarrierId;
   regions_.pop();
-  team->join(*this, uniqueBarrierId);
+  team->leaderJoin(*this, uniqueBarrierId);
   pool.returnWorkers(workers);
 }
 
@@ -259,6 +253,8 @@ void Thread::fork(
 void forkCall(Microtask fn, int32_t argc, void **argv) {
   SelfWord w = SelfWord::current();
   int32_t want = w.pending();
+  // Check for cases where we cannot run in parallel, in which case we run the
+  // work as foreign.
   if (want)
     SelfWord::set(w = w.withoutPending());
   if (w.inForeign()) {
@@ -270,6 +266,7 @@ void forkCall(Microtask fn, int32_t argc, void **argv) {
     runForeign(fn, argc, argv);
     return;
   }
+  // We are now forking the work with w.slot() as the leader.
   threads[w.slot()].fork(w.slot(), want, fn, argc, argv);
   if (entry == Root::Entry::Taken)
     root.leave();
