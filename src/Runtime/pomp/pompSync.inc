@@ -129,9 +129,11 @@ inline UniqueId TeamJoin::workerDoneValue(const Team &team) {
   return team.join_.currUniqueJoinId_;
 }
 
-// After the store the leader may reuse the team, and its thread may end: the
-// wake-up that follows reads only fields set at allocation (see "Root
-// blocks" in pompRegion.inc).
+// After the store the leader may reuse the team, and its thread may end and
+// its root block go to another root: read `leader_` first, and nothing of
+// the team after the store but the wake-up, which uses only fields set at
+// allocation. See the rules of "Root blocks" in pompRegion.inc before adding
+// anything here.
 inline void TeamJoin::workerFinish(Team &team, Thread &self, UniqueId done) {
   Thread &leader = *team.leader_;
   self.sync().done.store(done);
@@ -173,7 +175,9 @@ inline void Team::leaderEndBarrier(UniqueId currUniqueBarrierId) {
     tree_.leaderEndRegion(currUniqueBarrierId);
 }
 
-// Join and tree ids share a seed: they go to different flags.
+// Join and tree ids share a seed: they go to different flags. Once per team,
+// at allocation: never again, even when a root block is reused ("Root
+// blocks", rule 3).
 inline void Team::init(int32_t index, Thread &leader) {
   leader_ = &leader;
   leaderSlot_ = leader.slot();

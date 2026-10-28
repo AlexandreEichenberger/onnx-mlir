@@ -124,7 +124,8 @@ private:
   // New cache line (a Team is line-aligned). The fields up to central_ take
   // one line on s390x, two where a line is 128 bytes.
 
-  // Set at allocation, never changed.
+  // Set at allocation, never changed: a worker's late wake-up reads them
+  // after its region (see "Root blocks" in pompRegion.inc).
   Thread *leader_ = nullptr;
   int32_t leaderSlot_ = 0;
   // Work, written before the wake-up of the members.
@@ -320,14 +321,15 @@ private:
   Atomic<int> neverOpenedSeen_;
 };
 
-// Settings: defaults, then pomp_set_option calls, then the environment.
-// Each is read from the environment at init (the first call of any entry
-// point); a set environment variable takes precedence over calls, unless
-// POMP_IGNORE_ENV=1. See "Environment" in POMP.md.
+// Settings: defaults, then the environment, then pomp_set_option calls. The
+// environment is read at init (the first call of any entry point) and gives
+// initial values; as in OpenMP, a call overrides them. The exception is the
+// thread limit: OMP_THREAD_LIMIT wins over calls. See "Environment" in
+// POMP.md.
 class Settings {
 public:
-  // Where a setting's value comes from, by increasing precedence.
-  enum Source : int8_t { kDefault, kCall, kEnv };
+  // Where a setting's value comes from, in the order they apply.
+  enum Source : int8_t { kDefault, kEnv, kCall };
   // pomp_set_option: set setting `name` (its environment variable's name)
   // from `value`. POMP_ERR_LIMIT: unknown name or invalid value;
   // POMP_ERR_STATE: the setting cannot change now.
@@ -368,12 +370,12 @@ private:
   void initOnce();
   // Read the environment, and set the limit from OMP_THREAD_LIMIT.
   void init();
-  // Parsers: return false if `s` is invalid; otherwise set the setting,
-  // unless `apply` is false (validation only). Under optionMutex_.
-  bool setNumThreads(const char *s, bool apply);
-  bool setMaxActive(const char *s, bool apply);
-  bool setTreeMin(const char *s, bool apply);
-  bool setSpin(const char *s, bool apply);
+  // Parsers: return false if `s` is invalid (the setting is unchanged);
+  // otherwise set the setting. Under optionMutex_.
+  bool setNumThreads(const char *s);
+  bool setMaxActive(const char *s);
+  bool setTreeMin(const char *s);
+  bool setSpin(const char *s);
   // Settings with a source, indexed as kOptions in pompInit.inc.
   static constexpr int kNumOptions = 4;
 
@@ -381,10 +383,9 @@ private:
   // Serializes setOption (calls, and init's reads of the environment).
   Mutex optionMutex_;
   Source sources_[kNumOptions] = {};
-  bool ignoreEnv_ = false;           // POMP_IGNORE_ENV=1.
   int displayEnv_ = 0;               // OMP_DISPLAY_ENV: 0, 1 (true), 2 (verbose).
   Atomic<int> displayed_;
-  int envNthreads_[kMaxActive] = {}; // OMP_NUM_THREADS, 0: unset.
+  int envNthreads_[kMaxActive] = {}; // OMP_NUM_THREADS as set, 0: unset.
   // Whether OMP_NUM_THREADS listed more than one level, for the default of
   // OMP_MAX_ACTIVE_LEVELS.
   bool nthreadsNested_ = false;
@@ -404,7 +405,8 @@ private:
 };
 
 // A root's descriptor and the teams it leads, allocated together, recycled
-// together and never freed; see "Root blocks" in pompRegion.inc.
+// together and never freed; see "Root blocks" in pompRegion.inc for the
+// rules that keep a late wake-up of a recycled block harmless.
 struct RootBlock {
   Thread thread;
   Team levelOne;

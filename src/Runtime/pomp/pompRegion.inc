@@ -94,12 +94,39 @@ inline bool Thread::callerInPomp() {
 // touches nothing global but the pool.
 //
 // When the thread ends, the destructor of `exitKey_` returns the block to the
-// free list; blocks are never freed. A worker that has stored its done flag
-// may still wake the leader of its team, and the leader's thread may have
-// ended meanwhile: that wake-up reads only fields set at allocation, and at
-// worst posts to the block's next owner, which only makes it re-check. So a
-// block is recycled whole, with its teams, and a new owner does not clear
-// its post.
+// free list, and a later root may take it. Blocks are never freed.
+//
+// Why: a late wake-up. At the end of a region each worker stores its done
+// flag, then wakes the leader (TeamJoin::workerFinish). Once the last flag is
+// stored the leader may join, return, and its thread end; a worker may be
+// delayed for any time between its store and its wake-up, so that wake-up
+// may come while the block is on the free list or owned by another root. It
+// touches, in the block:
+//   - `sleepers_` of the team: one load, and an atomic clear of bit 0 if it
+//     is set;
+//   - the leader Thread's `post_` (mutex, condition, flag), only if it
+//     cleared that bit.
+// It is harmless to a new owner: bit 0 is set only while the owner waits in
+// that team (TeamWait::until always leaves with its bit clear), and a waker
+// that clears a sleeper's bit owes it one post, which this one makes; a post
+// only means "re-check". A late done flag holds an old join id, which no
+// later join waits for.
+//
+// So, for any change here or in the team waits:
+//   1. Never free a block, nor its Thread or teams: the late wake-up would
+//      use freed memory, a pthread mutex among it.
+//   2. Never initialize a block's post again (Thread::init does it once): a
+//      late waker may still be inside its post().
+//   3. Never reset a team's unique ids on reuse: they must keep growing, or a
+//      late or stale flag could match a new region's id. A block keeps its
+//      team indices too. Roots::acquire resets only the pending team size.
+//   4. Recycle a block whole: its teams' `leader_` must stay its Thread, as
+//      a late wake-up of team T posts to T's leader_.
+//   5. After its done store, a worker reads nothing of the team but fields
+//      set at allocation and never changed (`leader_`, read before the
+//      store, and the leader's slot): any other would belong to the region
+//      of the block's next owner.
+// test/pomp_host_test.c latepost (S18) stresses this case.
 // -----------------------------------------------------------------------------
 
 // The destructor of Roots::exitKey_, with the block of the ending thread.
@@ -130,6 +157,8 @@ RootBlock *Roots::allocate() {
   return b;
 }
 
+// A reused block keeps all of its state but the pending team size: see rules
+// 2 and 3 of "Root blocks".
 Thread &Roots::acquire() {
   RootBlock *b;
   {
@@ -147,8 +176,8 @@ Thread &Roots::acquire() {
 }
 
 // The value of exitKey_ is already null here: use `block`, not Self. A thread
-// that ends inside a region (pthread_exit) keeps its block: its team may
-// still use it.
+// that ends inside a region (pthread_exit) keeps its block, never reused: its
+// team may still use it.
 void Roots::recycle(RootBlock &block) {
   Self::set(nullptr);
   if (block.thread.regions().depth() != 0)

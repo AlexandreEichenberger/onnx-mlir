@@ -31,8 +31,8 @@
 //   rejoin   : S15, workers leave and enter again as the same slots, many
 //              times, while they sleep and are posted to (POMP_SPIN=0)
 //   options  : S16, pomp_set_option: values, errors, when it is allowed, and
-//              the environment's precedence (run with and without
-//              OMP_NUM_THREADS=3 POMP_SPIN=7, and with POMP_IGNORE_ENV=1)
+//              that calls override the environment (run with and without
+//              OMP_NUM_THREADS=3 POMP_SPIN=7)
 //   rootchurn: S17, host threads come and go; their root blocks are reused
 //   latepost : S18, root blocks reused while workers may still wake their
 //              last owner (POMP_SPIN=0)
@@ -1043,18 +1043,14 @@ static void test_rejoin(long cycles) {
 
 // -----------------------------------------------------------------------------
 // S16: pomp_set_option, before the pool is first opened and after. The limit
-// comes from a call (no OMP_THREAD_LIMIT), so that this test also runs with
-// POMP_IGNORE_ENV. With OMP_NUM_THREADS set and POMP_IGNORE_ENV unset, the
-// environment wins: calls succeed but change nothing.
+// comes from a call (no OMP_THREAD_LIMIT). With OMP_NUM_THREADS set, calls
+// still override it, as in OpenMP.
 // -----------------------------------------------------------------------------
 
 int omp_get_max_threads(void);
 int omp_get_max_active_levels(void);
 
 static void test_options(int lim) {
-  const char *env_nt = getenv("OMP_NUM_THREADS");
-  const char *ign = getenv("POMP_IGNORE_ENV");
-  int env_wins = env_nt && !(ign && *ign && strcmp(ign, "0"));
   limit = lim;
   // Unknown names and invalid values: refused, nothing changes.
   CHECK(pomp_set_option("NO_SUCH_OPTION", "1") == POMP_ERR_LIMIT);
@@ -1084,9 +1080,8 @@ static void test_options(int lim) {
   CHECK(pomp_set_option("POMP_TREE_BARRIER", "2") == POMP_OK);
   CHECK(pomp_set_option("POMP_SPIN", "auto:20") == POMP_OK);
   CHECK(pomp_set_option("OMP_NUM_THREADS", "2") == POMP_OK);
-  int want = env_wins ? omp_get_max_threads() : (lim < 2 ? lim : 2);
+  int want = lim < 2 ? lim : 2;
   CHECK(omp_get_max_threads() == want);
-  CHECK(env_wins || omp_get_max_threads() == (lim < 2 ? lim : 2));
   // Regions use the team size set.
   CHECK(pomp_open_pool() == POMP_OK);
   host_start();
@@ -1113,8 +1108,7 @@ static void test_options(int lim) {
   CHECK(pomp_wait_pool_empty() == POMP_OK);
   // Still refused once closed: the pool has been opened.
   CHECK(pomp_set_option("OMP_NUM_THREADS", "2") == POMP_ERR_STATE);
-  printf("options: limit %d, env %s, errors %ld\n", lim,
-      env_wins ? "wins" : "does not win", errors);
+  printf("options: limit %d, errors %ld\n", lim, errors);
 }
 
 int main(int argc, char **argv) {

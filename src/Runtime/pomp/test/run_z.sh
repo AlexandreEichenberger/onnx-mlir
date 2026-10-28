@@ -190,7 +190,6 @@ for L in 2 3 4 8 16 17; do
   run env POMP_SPIN=0 "$T/pomp_host_test" lateopen $L
   run "$T/pomp_host_test" options $L
   run env OMP_NUM_THREADS=3 POMP_SPIN=7 "$T/pomp_host_test" options $L
-  run env OMP_NUM_THREADS=3 POMP_SPIN=7 POMP_IGNORE_ENV=1 "$T/pomp_host_test" options $L
 done
 echo "$runs runs, $fail failures"
 

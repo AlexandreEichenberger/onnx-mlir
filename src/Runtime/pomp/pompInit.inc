@@ -28,6 +28,9 @@ void *allocLines(size_t n, size_t size) {
 
 // Called on each entry as this slot, before it is recruitable, and at the
 // allocation of a root block. Entries as a slot are serialized by `present_`.
+// The post is initialized once per descriptor, never again: a waker of a
+// previous occupant (or owner, for a root block) may still be inside its
+// post() ("Root blocks", rule 2, in pompRegion.inc).
 inline void Thread::init() {
   if (!initialized_) {
     post_.init();
@@ -58,10 +61,8 @@ void Settings::init() {
   treeMin_.store(kDefaultTreeBarrier, Order::Relaxed);
   spinUs_.store(-1, Order::Relaxed);
   spinMaxUs_.store(kDefaultSpinMaxUs, Order::Relaxed);
-  const char *s = getenv("POMP_IGNORE_ENV");
-  ignoreEnv_ = s && *s && strcmp(s, "0") != 0;
   // OMP_DISPLAY_ENV: TRUE or VERBOSE (any case), as in OpenMP.
-  s = getenv("OMP_DISPLAY_ENV");
+  const char *s = getenv("OMP_DISPLAY_ENV");
   if (s && (!strcasecmp(s, "true") || !strcmp(s, "1")))
     displayEnv_ = 1;
   else if (s && !strcasecmp(s, "verbose"))
@@ -74,12 +75,11 @@ void Settings::init() {
       fprintf(stderr, "pomp: warning: %s=\"%s\" is invalid and ignored\n",
           name, s);
 
-  // Under POMP_IGNORE_ENV the host sets the limit itself: the limit cannot
-  // change once set, so OMP_THREAD_LIMIT is not used at all.
+  // The limit never changes once set, so OMP_THREAD_LIMIT, read first, wins
+  // over pomp_set_thread_limit (see setLimit).
   const char *end;
   long v;
-  s = ignoreEnv_ ? nullptr : getenv("OMP_THREAD_LIMIT");
-  if (s) {
+  if ((s = getenv("OMP_THREAD_LIMIT"))) {
     v = parseInt(s, &end);
     int rc = *end ? POMP_ERR_LIMIT : setLimit(v, true);
     if (rc != POMP_OK)
@@ -98,7 +98,7 @@ namespace {
 struct OptionDesc {
   const char *name;
   bool anytime;
-  bool (Settings::*set)(const char *, bool);
+  bool (Settings::*set)(const char *);
 };
 } // namespace
 
@@ -123,16 +123,11 @@ int Settings::setOption(const char *name, const char *value, Source from) {
     return POMP_ERR_LIMIT;
   if (from == kCall && !kOptions[k].anytime && pool.wasOpened())
     return POMP_ERR_STATE;
+  // As in OpenMP, the environment gives the initial value (init reads it
+  // before any call is served) and a call overrides it.
   ScopedLock<Mutex> lock(optionMutex_);
-  // A set environment variable wins over calls, unless POMP_IGNORE_ENV. An
-  // overridden call still validates its value, and succeeds if it is valid:
-  // it did not fail, it was overridden.
-  bool overridden = (from == kCall && sources_[k] == kEnv && !ignoreEnv_) ||
-                    (from == kEnv && ignoreEnv_ && sources_[k] == kCall);
-  if (!(this->*kOptions[k].set)(value, !overridden))
+  if (!(this->*kOptions[k].set)(value))
     return POMP_ERR_LIMIT;
-  if (overridden)
-    return POMP_OK;
   sources_[k] = from;
   return POMP_OK;
 }
@@ -177,8 +172,6 @@ void Settings::displayOnce() {
     snprintf(v, sizeof(v), "'%ld'", spinUs());
   fprintf(stderr, "  %-22s = %-12s [%s]\n", "POMP_SPIN", v,
       sourceName(sources_[3]));
-  fprintf(stderr, "  %-22s = '%s'\n", "POMP_IGNORE_ENV",
-      ignoreEnv_ ? "TRUE" : "FALSE");
   if (displayEnv_ == 2) {
     fprintf(stderr, "  %-22s = '%d'\n", "[pomp] max threads", kMaxThreads);
     fprintf(stderr, "  %-22s = '%d'\n", "[pomp] cache line", kCacheLine);
@@ -198,7 +191,7 @@ void Settings::displayOnce() {
 
 // "n" or "n1,n2"; missing entries repeat the last one. Clamped to the limit
 // once it is known (setLimit), or now if it is.
-bool Settings::setNumThreads(const char *s, bool apply) {
+bool Settings::setNumThreads(const char *s) {
   int vals[kMaxActive] = {};
   int n = 0;
   const char *end;
@@ -215,8 +208,6 @@ bool Settings::setNumThreads(const char *s, bool apply) {
     return false;
   for (int i = n; i < kMaxActive; ++i)
     vals[i] = vals[i - 1];
-  if (!apply)
-    return true;
   // Under limitMutex_ too: setLimit reads envNthreads_.
   ScopedLock<Mutex> lock(limitMutex_);
   for (int i = 0; i < kMaxActive; ++i)
@@ -234,29 +225,27 @@ bool Settings::setNumThreads(const char *s, bool apply) {
 }
 
 // 1 or 2; 0 means 1 and larger values mean 2.
-bool Settings::setMaxActive(const char *s, bool apply) {
+bool Settings::setMaxActive(const char *s) {
   const char *end;
   long v = parseInt(s, &end);
   if (v < 0 || *end)
     return false;
-  if (apply)
-    maxActive_.store(v < 1 ? 1 : (v > kMaxActive ? kMaxActive : int(v)),
-      Order::Relaxed);
+  maxActive_.store(
+      v < 1 ? 1 : (v > kMaxActive ? kMaxActive : int(v)), Order::Relaxed);
   return true;
 }
 
-bool Settings::setTreeMin(const char *s, bool apply) {
+bool Settings::setTreeMin(const char *s) {
   const char *end;
   long v = parseInt(s, &end);
   if (v < 0 || *end)
     return false;
-  if (apply)
-    treeMin_.store(int(v), Order::Relaxed);
+  treeMin_.store(int(v), Order::Relaxed);
   return true;
 }
 
 // auto, auto:MAX, or a fixed number of us.
-bool Settings::setSpin(const char *s, bool apply) {
+bool Settings::setSpin(const char *s) {
   const char *end;
   long v;
   while (*s == ' ' || *s == '\t')
@@ -272,23 +261,21 @@ bool Settings::setSpin(const char *s, bool apply) {
     } else if (*s) {
       return false;
     }
-    if (apply) {
-      spinMaxUs_.store(maxUs, Order::Relaxed);
-      spinUs_.store(-1, Order::Relaxed);
-    }
+    spinMaxUs_.store(maxUs, Order::Relaxed);
+    spinUs_.store(-1, Order::Relaxed);
     return true;
   }
   v = parseInt(s, &end);
   if (v < 0 || *end)
     return false;
-  if (apply)
-    spinUs_.store(v, Order::Relaxed);
+  spinUs_.store(v, Order::Relaxed);
   return true;
 }
 
 // Set the thread limit, once per process (see pomp_set_thread_limit). Once it
 // is set, the same value succeeds; another one is refused if a call set the
-// limit, and ignored with one warning if OMP_THREAD_LIMIT did.
+// limit, and ignored with one warning if OMP_THREAD_LIMIT did. The one setting
+// where the environment wins over calls: OpenMP has no call to set it.
 int Settings::setLimit(long limit, bool fromEnv) {
   ScopedLock<Mutex> lock(limitMutex_);
   int cur = this->limit();

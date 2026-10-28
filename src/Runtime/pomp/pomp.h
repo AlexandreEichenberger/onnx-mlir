@@ -35,7 +35,8 @@ extern "C" {
 #define POMP_ERR_SLOT 2   /* Slot number out of range or already in use. */
 #define POMP_ERR_STATE 3  /* Call not valid in the current state. */
 #define POMP_ERR_CLOSED 4 /* Entry refused: the pool is closed. */
-#define POMP_ERR_NOMEM 5  /* The thread limit's descriptors cannot be allocated. */
+#define POMP_ERR_NOMEM                                                         \
+  5 /* The thread limit's descriptors cannot be allocated. */
 
 //===----------------------------------------------------------------------===//
 // General interface description
@@ -71,6 +72,9 @@ extern "C" {
 // OpenMP's thread-limit-var, it never changes afterwards. A valid
 // OMP_THREAD_LIMIT sets it first and takes precedence: the call then returns
 // POMP_OK whatever `thread_limit` is, warning once on stderr if it differs.
+// (The only setting where the environment wins over a call: OpenMP has no
+// call to set thread-limit-var, so this call is a pomp addition and the
+// variable keeps the role it has in OpenMP.)
 // Otherwise the first call with `thread_limit` in [1, POMP_MAX_THREADS] sets
 // it; later calls return POMP_OK with the same value and POMP_ERR_LIMIT with
 // any other. Setting the limit does not open the pool. It allocates pomp's
@@ -99,12 +103,11 @@ int pomp_open_pool(void);
 
 // The calling thread enters the pool as pool thread `slot`, in
 // [1, thread_limit - 1]; slot 0 is any thread that is not in the pool. While
-// the pool is open,
-// the call returns only once pomp_close_pool releases the thread, with
-// POMP_OK. It returns at once with POMP_ERR_CLOSED if the pool is closed
-// (including while no thread limit is set), with POMP_ERR_SLOT if another
-// thread is in the pool as `slot`, and with POMP_ERR_STATE from inside a
-// parallel region. If the previous thread of `slot` was released but has not
+// the pool is open, the call returns only once pomp_close_pool releases the
+// thread, with POMP_OK. It returns at once with POMP_ERR_CLOSED if the pool is
+// closed (including while no thread limit is set), with POMP_ERR_SLOT if
+// another thread is in the pool as `slot`, and with POMP_ERR_STATE from inside
+// a parallel region. If the previous thread of `slot` was released but has not
 // left yet, the call waits for it to leave. A thread may enter again after it
 // returns, as the same slot or another one, and may also run parallel regions
 // itself, before and after.
@@ -141,12 +144,11 @@ int pomp_pool_size(void);
 //   POMP_TREE_BARRIER     the smallest team that uses the tree barrier
 //   POMP_SPIN             "auto", "auto:MAX" or a number of microseconds
 // POMP_SPIN may be set at any time and applies to the next waits; the others
-// only before the first pomp_open_pool (POMP_ERR_STATE after). If the
-// environment variable is set, it takes precedence: the call returns POMP_OK
-// (or POMP_ERR_LIMIT for an invalid value, as always) and changes nothing, unless POMP_IGNORE_ENV=1 is set, which makes calls take
-// precedence over the environment (OMP_THREAD_LIMIT is then not read at all:
-// the host must set the limit). POMP_ERR_LIMIT: unknown name, or invalid
-// value (the setting is unchanged).
+// only before the first pomp_open_pool (POMP_ERR_STATE after). As in OpenMP,
+// the environment variable, if set, only gives the initial value, and a call
+// overrides it. The exception is OMP_THREAD_LIMIT, which OpenMP gives no call
+// to change: if set, it wins, as described at pomp_set_thread_limit.
+// POMP_ERR_LIMIT: unknown name, or invalid value (the setting is unchanged).
 int pomp_set_option(const char *name, const char *value);
 
 // Diagnosis: copy up to `n` of pomp's sleep and wake-up counters into

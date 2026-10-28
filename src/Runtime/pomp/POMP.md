@@ -49,12 +49,20 @@ other than the two above aborts at run time.
 
 Each setting below can also be set from code with `pomp_set_option(name, value)`, which takes the
 variable's name and the same strings; for hosts that cannot set environment variables, such as a
-JVM. A set environment variable takes precedence over calls (the call returns `POMP_OK` and
-changes nothing), so an operator can still override at launch; `POMP_IGNORE_ENV=1` reverses that,
-for hosts that must not be affected by variables meant for another OpenMP library in the process.
-`POMP_SPIN` may change at any time and applies to the next waits; the others only before the
-first `pomp_open_pool` (`POMP_ERR_STATE` after). The environment is read once, at pomp's first
-call.
+JVM. The environment is read once, at pomp's first call, and gives each setting its initial
+value; a later `pomp_set_option` overrides it. This is OpenMP's rule: `OMP_NUM_THREADS`
+initializes `nthreads-var` and `omp_set_num_threads` changes it. It also keeps the host in
+control when another OpenMP library shares the process: an `OMP_NUM_THREADS` meant for that
+library gives pomp only its initial value. `POMP_SPIN` may change at any time and applies to the
+next waits; the others only before the first `pomp_open_pool` (`POMP_ERR_STATE` after).
+
+**The exception is `OMP_THREAD_LIMIT`.** If set, it wins over `pomp_set_thread_limit` and
+`pomp_set_option("OMP_THREAD_LIMIT", ...)`: such a call returns `POMP_OK` and changes nothing,
+with one warning on stderr if its value differs (see "The thread limit"). This is not a change
+to OpenMP's behavior: OpenMP has no call that sets `thread-limit-var` (no
+`omp_set_thread_limit`), so the variable is its only source there. `pomp_set_thread_limit` is a
+pomp addition, for hosts that cannot set the variable, and an operator who sets it still has
+the last word, as with any OpenMP program.
 
 | Variable | Meaning |
 |---|---|
@@ -64,7 +72,6 @@ call.
 | `OMP_DISPLAY_ENV` | `TRUE` (or `1`) prints every setting on stderr once, at the first `pomp_open_pool`, in OpenMP's format, each followed by its source: default, environment, or the call that set it. `VERBOSE` adds pomp's build constants. Read from the environment only |
 | `POMP_SPIN` | How long any wait spins before it sleeps: an idle worker, the leader at the join, a thread in a barrier. `auto` (default): each thread adapts, separately for waiting for work and for team waits, between 2 µs and 100 µs: after a wait of *d* µs, the next spin covers 2·*d* if *d* ≤ 100, and halves (down to 2) if *d* > 100. `auto:M` sets the ceiling to M µs (`auto:0` sleeps at once). A number N spins exactly N µs, without adapting (0 sleeps at once). Waits never yield. Why: on z a spinning thread slows an SMT sibling that computes by about 30%, so long waits should sleep; but a wake-up costs 2–10 µs, so short waits that sleep make the next ones longer, and the team keeps falling asleep (see `POMP_Z_Tuning.md`) |
 | `POMP_TREE_BARRIER` | Smallest team that uses the tree barrier instead of the central one. Default 5 on s390x, never elsewhere; 0 or 2 forces the tree, 65 (`POMP_MAX_THREADS` + 1) forces central |
-| `POMP_IGNORE_ENV` | `1`: `pomp_set_option` and `pomp_set_thread_limit` take precedence over the environment, and `OMP_THREAD_LIMIT` is not read at all (the host must set the limit). Read from the environment only |
 
 ## Host interface (`pomp.h`)
 
@@ -169,7 +176,10 @@ is set once per process and never changes**.
 Where it comes from, in order:
 
 1. **`OMP_THREAD_LIMIT`**, read at initialization, if it is set and in `[1, 64]`. It takes
-   precedence: no call can override it.
+   precedence: no call can override it. This is the only setting where the environment wins
+   over a call (for the others a call overrides the environment, see "Environment"). Since
+   OpenMP has no call that sets the limit, OpenMP behavior is unchanged: only pomp's own
+   `pomp_set_thread_limit` can lose to the variable.
 2. Otherwise, **the first `pomp_set_thread_limit(limit)` with a `limit` in `[1, 64]`**. This
    stands in for the environment variable when the host cannot set one, and it is pomp's only
    addition to the standard here.
@@ -360,12 +370,12 @@ first entry only: a later entry finds it ready, and a waker still posting to the
 occupant never finds it re-initialized.
 
 **S16. Settings from code** (`options`, run without `OMP_THREAD_LIMIT`; also with
-`OMP_NUM_THREADS` and `POMP_SPIN` set, and with `POMP_IGNORE_ENV=1`).
+`OMP_NUM_THREADS` and `POMP_SPIN` set).
 
 `pomp_set_option` refuses unknown names and invalid values, sets the limit as
 `pomp_set_thread_limit` does, and changes every setting before the first open. After it, only
 `POMP_SPIN` may change, while regions run; the others return `POMP_ERR_STATE`. With the
-environment variable set, calls succeed and change nothing, unless `POMP_IGNORE_ENV=1`.
+environment variable set, calls still override it.
 
 **S17. Host threads that come and go** (`rootchurn`).
 
@@ -681,8 +691,11 @@ ends; it is a pthread destructor, as a C++ `thread_local` destructor would need 
 Blocks are never freed. A worker that has stored its `done` may still wake its leader, whose
 thread may have ended and whose block may have a new owner: that wake-up reads only fields set
 at allocation, and at worst posts to the new owner, which only makes it re-check. So a block is
-reused whole, its teams with it, and its post is never cleared. A thread that ends inside a
-region (`pthread_exit`) keeps its block, as a team may still use it. On z/OS, the destructor
+reused whole, its teams with it, and its post is never cleared. The rules a change must keep
+for this (never free a block, never initialize its post or reset its ids again, recycle it
+whole, and read nothing of a team after a worker's `done` but fields set at allocation) are
+listed in the "Root blocks" comment of `pompRegion.inc`. A thread that ends inside a region
+(`pthread_exit`) keeps its block, as a team may still use it. On z/OS, the destructor
 was checked to run for threads that return, call `pthread_exit` or are detached.
 
 A team descriptor holds:
