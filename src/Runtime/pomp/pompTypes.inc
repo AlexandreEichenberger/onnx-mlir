@@ -9,7 +9,7 @@
 // =============================================================================
 //
 // Part of pomp.cpp: the declarations of the region stack, team, thread,
-// pool, settings and root, and the globals.
+// pool, settings and root blocks, and the globals.
 //
 //===----------------------------------------------------------------------===//
 
@@ -118,7 +118,7 @@ private:
   // fields the wake-up published.
   MemberBarrier initBarrier(int32_t tid) const;
   // After the join: keep the last barrier id for the next region, in
-  // the team, as the root team's leader may change between regions.
+  // the team, which each member reads on entry.
   void leaderEndBarrier(UniqueId currUniqueBarrierId);
 
   // New cache line (a Team is line-aligned). The fields up to central_ take
@@ -156,24 +156,42 @@ public:
   static constexpr int kInPool = 1;
   static constexpr int kLeaving = 2; // Returning to the host.
 
-  // The calling thread's descriptor, or nullptr for a non-pool thread that
-  // does not own slot 0. Entry points use this, not their `gtid` argument,
-  // which is only what the caller claims.
+  // The calling thread's descriptor, or nullptr for a thread that has none
+  // (see Self). Entry points use this, not their `gtid` argument, which is
+  // only what the caller claims.
   static Thread *current();
+  // The calling thread's descriptor; a new root's if it has none.
+  static Thread &currentOrNewRoot();
   // The calling thread's region stack, or nullptr.
   static RegionStack *currentRegions();
+  // Whether the caller is a pool thread or inside a region: pool calls are
+  // refused.
+  static bool callerInPomp();
 
   // Initialize the descriptor, once per slot; later calls do nothing.
   void init();
 
-  // Leader `gtid`: run `fn` on `want` threads (0: the default).
-  void fork(
-      int32_t gtid, int32_t want, Microtask fn, int32_t argc, void **argv);
+  // As leader: run `fn` on `want` threads (0: the default).
+  void fork(int32_t want, Microtask fn, int32_t argc, void **argv);
 
   // This thread's slot: 0 for a root.
   int32_t slot() const { return slot_; }
-  // At allocation: the slot of this descriptor.
-  void setSlot(int32_t slot) { slot_ = slot; }
+  // At allocation: the slot, and the teams this descriptor leads, at level 1
+  // (a root's only) and at level 2.
+  void initIdentity(int32_t slot, Team *levelOne, Team *levelTwo) {
+    slot_ = slot;
+    levelOne_ = levelOne;
+    levelTwo_ = levelTwo;
+  }
+
+  // The team size pushed for the next region (__kmpc_push_num_threads):
+  // set it, or take it, leaving none. 0: none.
+  void setPending(int32_t nth) { pending_ = nth; }
+  int32_t takePending() {
+    int32_t nth = pending_;
+    pending_ = 0;
+    return nth;
+  }
 
   // Recruiter: assign the next work, and wake the thread.
   void assign(Team *team, int32_t tid);
@@ -206,8 +224,8 @@ public:
   // Flags of this thread as a worker of a team.
   WorkerSync &sync() { return wake_.sync; }
 
-  // Workers preferred for this thread's level-2 team, set by the root's
-  // Team::leaderPartition.
+  // Workers preferred for this thread's level-2 team, set by the
+  // Team::leaderPartition of its level-1 team.
   void setPreferred(SlotMask slots) { wake_.preferred = slots; }
   SlotMask preferred() const { return wake_.preferred; }
 
@@ -232,7 +250,12 @@ private:
   // New line: private, and written at every barrier while the leader may
   // poll `sync`.
   alignas(kCacheLine) RegionStack regions_;
-  int32_t slot_ = 0; // Set at allocation.
+  // Set at allocation (initIdentity).
+  int32_t slot_ = 0;
+  Team *levelOne_ = nullptr;
+  Team *levelTwo_ = nullptr;
+  // Used by this thread only.
+  int32_t pending_ = 0;
   // kFree, kInPool or kLeaving; also serializes entries as this slot.
   Atomic<int> present_;
   bool initialized_ = false; // See init.
@@ -380,40 +403,43 @@ private:
   Atomic<int> treeMin_; // Team size from which the tree barrier is used.
 };
 
-// Ownership of slot 0; see "Root ownership".
-class Root {
+// A root's descriptor and the teams it leads, allocated together, recycled
+// together and never freed; see "Root blocks" in pompRegion.inc.
+struct RootBlock {
+  Thread thread;
+  Team levelOne;
+  Team levelTwo;
+  RootBlock *next; // In the free list.
+};
+
+// The root blocks: those in use, one per root, and the free list.
+class Roots {
 public:
-  enum class Entry {
-    Foreign, // Another thread owns slot 0: run as a foreign region.
-    Own,     // The thread runs on its own slot, as usual.
-    Taken,   // The thread just took ownership of slot 0.
-  };
-  // How a region about to start on the caller, of word `w`, runs.
-  Entry enter(SelfWord w);
-  // The root, at the end of its outermost region: give up slot 0.
-  void leave();
+  // At init: the lock, and the key whose destructor recycles a block.
+  void init();
+  // The calling thread, which has no descriptor, becomes a root.
+  Thread &acquire();
+  // The key's destructor: the thread of `block` has ended.
+  void recycle(RootBlock &block);
 
 private:
-  // Take ownership of slot 0 for the caller; false if already owned.
-  bool tryEnter(SelfWord w);
-  // Warn once that two host threads ran regions at once.
-  void warnSecondRoot();
+  // A new block, zeroed and initialized; under mutex_.
+  RootBlock *allocate();
 
-  // 1 while the root runs regions as slot 0.
-  alignas(kCacheLine) Atomic<int> active_;
-  Atomic<int> secondRootSeen_;
+  Mutex mutex_;
+  RootBlock *free_ = nullptr; // Under mutex_.
+  int32_t count_ = 0;         // Blocks allocated; under mutex_.
+  pthread_key_t exitKey_{};
 };
 
 POMP_CONSTINIT Settings settings;
 POMP_CONSTINIT Pool pool;
-POMP_CONSTINIT Root root;
-// The descriptors, zero-allocated by Settings::setLimit. teams[i] is the
-// level-2 team led by slot i, teams[limit] the root's level-1 team.
+POMP_CONSTINIT Roots roots;
+// The pool's descriptors, zero-allocated by Settings::setLimit: threads[i] is
+// pool thread i and teams[i] the level-2 team it leads. Index 0 is unused:
+// each root has its own (RootBlock).
 POMP_CONSTINIT Thread *threads = nullptr;
 POMP_CONSTINIT Team *teams = nullptr;
-
-inline Team &rootTeam() { return teams[settings.limit()]; }
-inline Team &slotTeam(int32_t slot) { return teams[slot]; }
 
 inline Thread &Team::member(int32_t slot) const {
   return slot ? threads[slot] : *leader_;

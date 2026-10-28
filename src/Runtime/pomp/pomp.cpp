@@ -18,7 +18,8 @@
 //   __kmpc_for_static_init_{4,4u,8,8u}                   __kmpc_for_static_fini
 // plus a few omp_* queries.
 //
-// Model: the initial thread (slot 0) and up to 63 pool threads lent by the
+// Model: any number of roots, host threads that run regions, each with its
+// own descriptor (slot 0 of its teams), and up to 63 pool threads lent by the
 // host (slots 1..limit-1). The 64-bit `busy` word has one bit per slot, clear
 // iff that slot is an idle pool thread. A leader recruits its workers with one
 // CAS on `busy`, and wakes each by bumping its epoch. At most two levels are
@@ -62,7 +63,7 @@ constexpr int kMaxArgs = 16;
 
 // Max nesting levels recorded; deeper ones are serialized and only counted.
 constexpr int kMaxDepth = 8;
-// Max nesting levels of any kind; deeper aborts. Fits SelfWord's foreign depth.
+// Max nesting levels of any kind; deeper aborts.
 constexpr int kMaxNesting = 256;
 constexpr int kMaxActive = 2; // Max active (more than 1 thread) levels.
 // How long a wait (idle, join, barrier) spins before it sleeps, in us. By
@@ -192,8 +193,11 @@ int pomp_get_stats(unsigned long long *counts, int n) {
 extern "C" {
 
 // Often the first call into pomp. Needs no init: before init, no thread has a
-// slot, so every thread reads slot 0.
-int32_t __kmpc_global_thread_num(void *) { return SelfWord::current().slot(); }
+// descriptor, and a thread without one is slot 0, as any root.
+int32_t __kmpc_global_thread_num(void *) {
+  Thread *self = Thread::current();
+  return self ? self->slot() : 0;
+}
 
 void __kmpc_push_num_threads(void *, int32_t, int32_t nth) {
   settings.ensureInit();
@@ -201,7 +205,7 @@ void __kmpc_push_num_threads(void *, int32_t, int32_t nth) {
     nth = 0;
   else if (nth > kMaxThreads)
     nth = kMaxThreads;
-  SelfWord::set(SelfWord::current().withPending(nth));
+  Thread::currentOrNewRoot().setPending(nth);
 }
 
 void __kmpc_push_proc_bind(void *, int32_t, int32_t) {}
@@ -223,29 +227,17 @@ void __kmpc_fork_call(void *, int32_t argc, Microtask fn, ...) {
 
 void __kmpc_serialized_parallel(void *, int32_t) {
   settings.ensureInit();
-  SelfWord w = SelfWord::current();
-  if (w.pending())
-    SelfWord::set(w = w.withoutPending());
-  if (w.inForeign() || root.enter(w) == Root::Entry::Foreign) {
-    SelfWord::set(SelfWord::current().enterForeign());
-    return;
-  }
-  Thread::current()->regions().pushSerialized();
+  Thread &self = Thread::currentOrNewRoot();
+  self.takePending();
+  self.regions().pushSerialized();
 }
 
 void __kmpc_end_serialized_parallel(void *, int32_t) {
-  SelfWord w = SelfWord::current();
-  if (w.inForeign()) {
-    SelfWord::set(w.leaveForeign());
-    return;
-  }
   Thread *self = Thread::current();
   if (!self)
     fatal("__kmpc_end_serialized_parallel without a matching "
           "__kmpc_serialized_parallel");
   self->regions().pop();
-  if (self->slot() == 0 && self->regions().depth() == 0)
-    root.leave();
 }
 
 void __kmpc_barrier(void *, int32_t) {
@@ -292,29 +284,22 @@ void __kmpc_for_static_fini(void *, int32_t) {}
 // Region queries need no init: before it, every thread is outside regions.
 int omp_get_thread_num(void) {
   RegionStack *regions = Thread::currentRegions();
-  return regions && !SelfWord::current().inForeign() ? regions->innermostTid()
-                                                     : 0;
+  return regions ? regions->innermostTid() : 0;
 }
 
 int omp_get_num_threads(void) {
   RegionStack *regions = Thread::currentRegions();
-  return regions && !SelfWord::current().inForeign() ? regions->innermostNth()
-                                                     : 1;
+  return regions ? regions->innermostNth() : 1;
 }
 
-// Foreign regions nest only in foreign regions.
 int omp_get_level(void) {
-  SelfWord w = SelfWord::current();
-  if (w.inForeign())
-    return w.foreignDepth();
-  Thread *self = Thread::current();
-  return self ? self->regions().depth() : 0;
+  RegionStack *regions = Thread::currentRegions();
+  return regions ? regions->depth() : 0;
 }
 
 int omp_get_active_level(void) {
-  Thread *self = Thread::current();
-  return self && !SelfWord::current().inForeign() ? self->regions().active()
-                                                  : 0;
+  RegionStack *regions = Thread::currentRegions();
+  return regions ? regions->active() : 0;
 }
 
 int omp_in_parallel(void) { return omp_get_active_level() > 0; }

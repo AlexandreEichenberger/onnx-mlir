@@ -26,8 +26,8 @@ void *allocLines(size_t n, size_t size) {
   return reinterpret_cast<void *>(a);
 }
 
-// Called on each entry as this slot, before it is recruitable, and at
-// allocation for slot 0. Entries as a slot are serialized by `present_`.
+// Called on each entry as this slot, before it is recruitable, and at the
+// allocation of a root block. Entries as a slot are serialized by `present_`.
 inline void Thread::init() {
   if (!initialized_) {
     post_.init();
@@ -50,7 +50,8 @@ void Settings::initOnce() {
 void Settings::init() {
   limitMutex_.init();
   optionMutex_.init();
-  SelfWord::createStorage();
+  Self::createStorage();
+  roots.init();
 
   // Defaults; then each setting the environment sets.
   maxActive_.store(1, Order::Relaxed);
@@ -305,27 +306,25 @@ int Settings::setLimit(long limit, bool fromEnv) {
   }
   if (limit < 1 || limit > kMaxThreads)
     return POMP_ERR_LIMIT;
-  // One block, never freed: `limit` threads, then `limit` + 1 teams from the
-  // next line. On failure no limit is set, so a later call may retry.
+  // One block, never freed: `limit` threads, then `limit` teams from the
+  // next line, for the pool threads; index 0 is unused (roots have their
+  // own). On failure no limit is set, so a later call may retry.
   size_t tBytes = (size_t(limit) * sizeof(Thread) + kCacheLine - 1) &
                   ~size_t(kCacheLine - 1);
-  char *p = static_cast<char *>(
-      allocLines(1, tBytes + (size_t(limit) + 1) * sizeof(Team)));
+  char *p =
+      static_cast<char *>(allocLines(1, tBytes + size_t(limit) * sizeof(Team)));
   if (!p)
     return POMP_ERR_NOMEM;
   Thread *t = reinterpret_cast<Thread *>(p);
   Team *m = reinterpret_cast<Team *>(p + tBytes);
-  // Slot 0 may sleep before any pool thread enters; those init on entry.
-  t[0].init();
   // Not yet visible to other threads: the limit_ store below publishes the
-  // descriptors.
+  // descriptors. Pool threads init their sleep on entry.
   threads = t;
   teams = m;
-  for (int32_t i = 0; i < limit; ++i)
-    t[i].setSlot(i);
-  for (int32_t i = 0; i < limit; ++i)
+  for (int32_t i = 1; i < limit; ++i) {
+    t[i].initIdentity(i, nullptr, &m[i]);
     m[i].init(i, t[i]);
-  m[limit].init(limit, t[0]);
+  }
   for (int i = 0; i < kMaxActive; ++i) {
     int n = envNthreads_[i];
     nthreads_[i].store(n && n < limit ? n : int(limit));

@@ -96,7 +96,7 @@ for v in tls key; do
         run $A2 "$T/pomp_host_test" nest
         run $A2 "$T/pomp_host_test" steal $((N / 4))
         # Host protocol. late and swap assume a slot 1 exists.
-        for sc in fresh reuse server overlap errors tworoots; do
+        for sc in fresh reuse server overlap errors tworoots rootchurn pushfirst; do
           run $E "$T/pomp_host_test" $sc
         done
         [ $L -ge 2 ] && run $E "$T/pomp_host_test" late
@@ -105,6 +105,7 @@ for v in tls key; do
           run $E "$T/pomp_host_test" sleepers
           run $E "$T/pomp_host_test" sleepjoin
           run $E "$T/pomp_host_test" rejoin 50
+          run $E "$T/pomp_host_test" latepost 200
         fi
       done
     done

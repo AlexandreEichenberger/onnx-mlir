@@ -23,7 +23,7 @@
 extern "C" {
 #endif
 
-// Maximum value of OMP_THREAD_LIMIT, including the initial thread. The pool is
+// Maximum value of OMP_THREAD_LIMIT, including the initial thread (slot 0). The pool is
 // described by one 64-bit word, one bit per thread slot.
 #define POMP_MAX_THREADS 64
 
@@ -55,6 +55,12 @@ extern "C" {
 // OMP_THREAD_LIMIT gave the limit. An OMP_THREAD_LIMIT that is set but invalid
 // is ignored with a warning on stderr; a host can detect it as
 // pomp_get_thread_limit() == 0.
+//
+// Any number of host threads that are not in the pool may run parallel
+// regions at once, each as the initial thread of its own regions: each
+// region gets the idle pool threads it can, up to the thread limit, so that
+// together they may run more threads than the limit. Each such thread has a
+// small descriptor, reused by another thread once it ends.
 
 //===----------------------------------------------------------------------===//
 // Interface calls
@@ -90,15 +96,16 @@ int pomp_get_thread_limit(void);
 int pomp_open_pool(void);
 
 // The calling thread enters the pool as pool thread `slot`, in
-// [1, thread_limit - 1]; slot 0 is the initial thread. While the pool is open,
+// [1, thread_limit - 1]; slot 0 is any thread that is not in the pool. While
+// the pool is open,
 // the call returns only once pomp_close_pool releases the thread, with
 // POMP_OK. It returns at once with POMP_ERR_CLOSED if the pool is closed
 // (including while no thread limit is set), with POMP_ERR_SLOT if another
 // thread is in the pool as `slot`, and with POMP_ERR_STATE from inside a
 // parallel region. If the previous thread of `slot` was released but has not
 // left yet, the call waits for it to leave. A thread may enter again after it
-// returns, as the same slot or another one, and may also act as the initial
-// thread.
+// returns, as the same slot or another one, and may also run parallel regions
+// itself, before and after.
 int pomp_enter_pool(int slot);
 
 // Close the pool and release every thread in it; return at once, without
@@ -106,7 +113,7 @@ int pomp_enter_pool(int slot);
 // that is not in the pool, outside of any parallel region (POMP_ERR_STATE).
 // Threads in a team when it is called are released when that team ends.
 // Until the next pomp_open_pool, pomp_enter_pool returns POMP_ERR_CLOSED and
-// parallel regions run on the initial thread alone. Each released thread
+// parallel regions run on their initial thread alone. Each released thread
 // returns from pomp_enter_pool as soon as it notices; sleeping ones are woken
 // by the threads that leave first.
 int pomp_close_pool(void);
@@ -143,7 +150,8 @@ int pomp_set_option(const char *name, const char *value);
 // Diagnosis: copy up to `n` of pomp's sleep and wake-up counters into
 // `counts` and return how many; 0 unless pomp is built with -DPOMP_STATS. In
 // order: regions forked with workers, idle sleeps, team-wait sleeps, posts,
-// posts at forks, ns spent posting, ns spent asleep.
+// posts at forks, ns spent posting, ns spent asleep, root blocks allocated
+// (one per host thread running regions at once; ended ones are reused).
 int pomp_get_stats(unsigned long long *counts, int n);
 
 #ifdef __cplusplus

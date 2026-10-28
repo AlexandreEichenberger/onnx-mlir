@@ -205,7 +205,7 @@ void Pool::warnIfNeverOpened() {
 }
 
 int Pool::open() {
-  if (SelfWord::current().inPomp())
+  if (Thread::callerInPomp())
     return POMP_ERR_STATE;
   if (!settings.limit())
     return POMP_ERR_LIMIT;
@@ -221,7 +221,7 @@ int Pool::enter(int32_t slot) {
   if (slot < 1 || slot >= limit)
     return POMP_ERR_SLOT;
   // Not from a pool thread, nor from inside a region.
-  if (SelfWord::current().inPomp())
+  if (Thread::callerInPomp())
     return POMP_ERR_STATE;
   Thread &self = threads[slot];
   SlotMask me = SlotMask::of(slot);
@@ -235,9 +235,11 @@ int Pool::enter(int32_t slot) {
     sched_yield();
   }
 
-  // Init before the slot becomes recruitable, below.
+  // Init before the slot becomes recruitable, below. A root that enters
+  // keeps its block for when it leaves.
   self.init();
-  SelfWord::set(SelfWord(slot));
+  Thread *root = Self::get();
+  Self::set(&self);
   self.regions().startAt(0, 0);
   self.clearPost();
   uint64_t epoch = self.epoch();
@@ -249,7 +251,7 @@ int Pool::enter(int32_t slot) {
   if (!isOpen()) {
     if (!(busy_.fetchSet(me) & me)) {
       // Nobody claimed this slot: back out.
-      SelfWord::set(SelfWord());
+      Self::set(root);
       self.setPresence(Thread::kFree, Order::Release);
       return POMP_ERR_CLOSED;
     }
@@ -265,7 +267,7 @@ int Pool::enter(int32_t slot) {
   self.setPresence(Thread::kLeaving);
   released_.fetchClear(me);
   wakeReleased(2);
-  SelfWord::set(SelfWord());
+  Self::set(root);
   numPoolThreads_.fetchSub(1);
   self.setPresence(Thread::kFree, Order::Release);
   return POMP_OK;
@@ -289,7 +291,7 @@ void Pool::releaseIdle() {
 
 int Pool::close() {
   // Not from a pool thread, nor from inside the regions of the calling thread.
-  if (SelfWord::current().inPomp())
+  if (Thread::callerInPomp())
     return POMP_ERR_STATE;
   // Mark closed first: a concurrent entry then backs out or is claimed below.
   state_.store(kClosed);
@@ -298,7 +300,7 @@ int Pool::close() {
 }
 
 int Pool::waitEmpty() {
-  if (SelfWord::current().inPomp())
+  if (Thread::callerInPomp())
     return POMP_ERR_STATE;
   int limit = settings.limitAcquire();
   // Wake any claimed thread still asleep, until all have left.

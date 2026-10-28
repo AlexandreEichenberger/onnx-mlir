@@ -21,7 +21,7 @@
 //   overlap  : S6, next cycle opened while the last one still leaves
 //   sleepers : S7, release while every worker sleeps (POMP_SPIN=0)
 //   errors   : S8, misuse returns errors
-//   tworoots : S9, two host threads run regions at once
+//   tworoots : S9, several host threads run regions at once
 //   nest     : S10, nesting levels seen by members of inner teams
 //   sleepjoin: S11, join and barriers that sleep (POMP_SPIN=0)
 //   steal    : S13, level-2 teams of varying sizes take each other's workers
@@ -33,6 +33,11 @@
 //   options  : S16, pomp_set_option: values, errors, when it is allowed, and
 //              the environment's precedence (run with and without
 //              OMP_NUM_THREADS=3 POMP_SPIN=7, and with POMP_IGNORE_ENV=1)
+//   rootchurn: S17, host threads come and go; their root blocks are reused
+//   latepost : S18, root blocks reused while workers may still wake their
+//              last owner (POMP_SPIN=0)
+//   pushfirst: S19, a pushed team size as a thread's first call; a root that
+//              enters the pool and is a root again
 //   latency  : leader time in release, and to the next region
 //
 //===----------------------------------------------------------------------===//
@@ -461,57 +466,57 @@ static void test_latency(long cycles) {
 }
 
 // -----------------------------------------------------------------------------
-// S9: two host threads run regions at once. The later one runs its regions on
-// one thread and never touches slot 0, so the owner's barriers still work.
+// S9: several host threads run regions at once. Each is a root of its own,
+// with its own teams: each region gets the idle pool threads it can, and its
+// members see their own team, whatever the other roots do meanwhile.
 // -----------------------------------------------------------------------------
 
-static atomic_int owner_in, other_in, other_go, other_bad;
+static atomic_int roots_bad, roots_go;
+static atomic_long roots_sum[8];
 
-static void other_inner(int32_t *gtid, int32_t *tid) {
-  int32_t g = __kmpc_global_thread_num(NULL);
-  if (*gtid != 0 || *tid != 0 || g != 0 || omp_get_num_threads() != 1)
-    atomic_fetch_add(&other_bad, 1);
-  __kmpc_barrier(NULL, g); // A team of one: returns at once.
-}
-
-static void other_body(int32_t *gtid, int32_t *tid) {
-  int32_t g = __kmpc_global_thread_num(NULL);
+static void root_inner(int32_t *gtid, int32_t *tid) {
   (void)gtid;
-  if (*tid != 0 || omp_get_num_threads() != 1 || omp_get_level() != 1 ||
-      omp_get_active_level() != 0)
-    atomic_fetch_add(&other_bad, 1);
-  atomic_store(&other_in, 1);
-  while (!atomic_load(&other_go))
-    sched_yield();
-  __kmpc_push_num_threads(NULL, g, 4);
-  __kmpc_fork_call(NULL, 0, (void *)other_inner);
-  __kmpc_serialized_parallel(NULL, g);
-  if (omp_get_level() != 2)
-    atomic_fetch_add(&other_bad, 1);
-  __kmpc_end_serialized_parallel(NULL, g);
-  __kmpc_barrier(NULL, g);
+  // Nested, with OMP_MAX_ACTIVE_LEVELS=1: serialized, unless the outer region
+  // got no worker and so is inactive (S10).
+  if (omp_get_level() != 2 || *tid != omp_get_thread_num() ||
+      *tid >= omp_get_num_threads() || omp_get_active_level() > 1)
+    atomic_fetch_add(&roots_bad, 1);
 }
 
-static void *other_host(void *arg) {
-  (void)arg;
-  while (!atomic_load(&owner_in))
-    sched_yield();
-  __kmpc_fork_call(NULL, 0, (void *)other_body);
-  return NULL;
-}
-
-static void owner_body(int32_t *gtid, int32_t *tid) {
-  if (*tid == 0) {
-    atomic_store(&owner_in, 1);
-    while (!atomic_load(&other_in))
-      sched_yield();
-  }
-  // Every member must pass, whatever the other host thread does meanwhile.
+static void root_body(int32_t *gtid, int32_t *tid, long *k) {
+  int n = omp_get_num_threads();
+  if (n < 1 || n > limit || *tid != omp_get_thread_num() || *tid >= n ||
+      omp_get_level() != 1 || omp_get_active_level() != (n > 1))
+    atomic_fetch_add(&roots_bad, 1);
+  if ((*tid == 0) != (__kmpc_global_thread_num(NULL) == 0))
+    atomic_fetch_add(&roots_bad, 1);
+  // Barriers of this team only: the sum is complete after the first.
+  atomic_fetch_add(&roots_sum[*k], *tid + 1);
+  __kmpc_barrier(NULL, *gtid);
+  if (atomic_load(&roots_sum[*k]) != (long)n * (n + 1) / 2)
+    atomic_fetch_add(&roots_bad, 1);
   __kmpc_barrier(NULL, *gtid);
   if (*tid == 0)
-    atomic_store(&other_go, 1);
-  __kmpc_barrier(NULL, *gtid);
-  atomic_fetch_add(&region_sum, *tid);
+    atomic_store(&roots_sum[*k], 0);
+  __kmpc_fork_call(NULL, 0, (void *)root_inner);
+}
+
+static void *root_host(void *arg) {
+  long k = (long)(intptr_t)arg;
+  while (!atomic_load(&roots_go))
+    sched_yield();
+  for (int r = 0; r < 20; ++r) {
+    if (r & 1)
+      __kmpc_push_num_threads(NULL, 0, 2);
+    __kmpc_fork_call(NULL, 1, (void *)root_body, &k);
+    __kmpc_serialized_parallel(NULL, 0);
+    if (omp_get_level() != 1 || omp_get_num_threads() != 1)
+      atomic_fetch_add(&roots_bad, 1);
+    __kmpc_end_serialized_parallel(NULL, 0);
+  }
+  if (omp_get_level() != 0)
+    atomic_fetch_add(&roots_bad, 1);
+  return NULL;
 }
 
 static void test_tworoots(long cycles) {
@@ -520,23 +525,193 @@ static void test_tworoots(long cycles) {
   host_enter_all();
   wait_pool_size(limit - 1);
   for (long c = 0; c < cycles; ++c) {
-    pthread_t b;
-    atomic_store(&owner_in, 0);
-    atomic_store(&other_in, 0);
-    atomic_store(&other_go, 0);
-    atomic_store(&region_sum, 0);
-    pthread_create(&b, NULL, other_host, NULL);
-    __kmpc_fork_call(NULL, 0, (void *)owner_body);
-    pthread_join(b, NULL);
-    CHECK(atomic_load(&region_sum) == (long)limit * (limit - 1) / 2);
-    CHECK(omp_get_level() == 0);
-    // Slot 0 is free again: a region from either thread may own it.
+    // 2, 3 or 4 roots, this thread among them.
+    int nroots = 2 + (int)(c % 3);
+    pthread_t b[8];
+    atomic_store(&roots_go, 0);
+    for (int k = 1; k < nroots; ++k)
+      pthread_create(&b[k], NULL, root_host, (void *)(intptr_t)k);
+    atomic_store(&roots_go, 1);
+    root_host((void *)(intptr_t)0);
+    for (int k = 1; k < nroots; ++k)
+      pthread_join(b[k], NULL);
+    // Alone again: every pool thread is idle, so the next region gets all.
+    wait_pool_size(limit - 1);
     CHECK(run_region() == limit);
   }
-  CHECK(atomic_load(&other_bad) == 0);
+  CHECK(atomic_load(&roots_bad) == 0);
   CHECK(pomp_close_pool() == POMP_OK);
   host_stop();
   printf("tworoots: %ld cycles, errors %ld\n", cycles, errors);
+}
+
+// -----------------------------------------------------------------------------
+// S17: host threads come and go, each a root for a few regions. Their root
+// blocks are recycled: no more are allocated than roots ran at once (only
+// counted with -DPOMP_STATS).
+// -----------------------------------------------------------------------------
+
+#define ROOTS_WIDTH 4
+
+// Members add their tid + 1 to the root's own sum.
+static void churn_body(int32_t *gtid, int32_t *tid, atomic_long *sum) {
+  (void)gtid;
+  atomic_fetch_add(sum, *tid + 1);
+}
+
+static void *churn_host(void *arg) {
+  (void)arg;
+  for (int r = 0; r < 3; ++r) {
+    atomic_long sum = 0;
+    atomic_long *p = &sum;
+    __kmpc_fork_call(NULL, 1, (void *)churn_body, p);
+    long s = atomic_load(&sum);
+    // 1 + 2 + .. + n for some team size n in [1, limit].
+    int ok = 0;
+    for (int n = 1; n <= limit; ++n)
+      ok |= s == (long)n * (n + 1) / 2;
+    CHECK(ok);
+  }
+  return NULL;
+}
+
+static long root_blocks(void) {
+  unsigned long long c[8];
+  return pomp_get_stats(c, 8) == 8 ? (long)c[7] : -1;
+}
+
+static void test_rootchurn(long cycles) {
+  host_start();
+  CHECK(pomp_open_pool() == POMP_OK);
+  host_enter_all();
+  wait_pool_size(limit - 1);
+  run_region(); // This thread's block.
+  for (long c = 0; c < cycles; ++c) {
+    pthread_t b[ROOTS_WIDTH];
+    for (int k = 0; k < ROOTS_WIDTH; ++k)
+      pthread_create(&b[k], NULL, churn_host, NULL);
+    for (int k = 0; k < ROOTS_WIDTH; ++k)
+      pthread_join(b[k], NULL);
+  }
+  long blocks = root_blocks();
+  CHECK(blocks < 0 || blocks <= 1 + ROOTS_WIDTH);
+  CHECK(pomp_close_pool() == POMP_OK);
+  host_stop();
+  printf("rootchurn: %ld cycles, %ld root blocks, errors %ld\n", cycles, blocks,
+      errors);
+}
+
+// -----------------------------------------------------------------------------
+// S18: a root's block is recycled while its workers may still wake it (run
+// with POMP_SPIN=0). Short-lived host threads each run one region with
+// workers, and end at once; the next takes the block and runs regions whose
+// joins and barriers sleep. A late wake-up of the old owner must only make
+// the new one re-check.
+// -----------------------------------------------------------------------------
+
+static void latepost_body(int32_t *gtid, int32_t *tid) {
+  // The leader finishes first, so that the workers' done stores come late.
+  if (*tid != 0) {
+    struct timespec ts = {0, 20000};
+    nanosleep(&ts, NULL);
+  }
+  __kmpc_barrier(NULL, *gtid);
+  atomic_fetch_add(&region_sum, *tid);
+}
+
+static void *latepost_host(void *arg) {
+  int regions = (int)(intptr_t)arg;
+  for (int r = 0; r < regions; ++r) {
+    atomic_store(&region_sum, 0);
+    __kmpc_fork_call(NULL, 0, (void *)latepost_body);
+    // Each region joins before the next: it gets every pool thread.
+    CHECK(atomic_load(&region_sum) == (long)limit * (limit - 1) / 2);
+  }
+  return NULL;
+}
+
+static void test_latepost(long cycles) {
+  host_start();
+  CHECK(pomp_open_pool() == POMP_OK);
+  host_enter_all();
+  wait_pool_size(limit - 1);
+  for (long c = 0; c < cycles; ++c) {
+    pthread_t a, b;
+    pthread_create(&a, NULL, latepost_host, (void *)(intptr_t)1);
+    pthread_join(a, NULL);
+    pthread_create(&b, NULL, latepost_host, (void *)(intptr_t)3);
+    pthread_join(b, NULL);
+  }
+  CHECK(pomp_close_pool() == POMP_OK);
+  host_stop();
+  printf("latepost: %ld cycles, errors %ld\n", cycles, errors);
+}
+
+// -----------------------------------------------------------------------------
+// S19: __kmpc_push_num_threads as the first call of a host thread; and a host
+// thread that is a root, then a pool thread, then a root again.
+// -----------------------------------------------------------------------------
+
+static void *pushfirst_host(void *arg) {
+  int want = (int)(intptr_t)arg;
+  __kmpc_push_num_threads(NULL, __kmpc_global_thread_num(NULL), want);
+  int n = run_region();
+  CHECK(n == want);
+  // Consumed: the next region has the default size.
+  CHECK(run_region() == limit);
+  return NULL;
+}
+
+static atomic_int rip_entered, rip_rc;
+
+static void *rootinpool_host(void *arg) {
+  (void)arg;
+  CHECK(run_region() == limit - 1); // Slot 1 is not in the pool yet.
+  atomic_store(&rip_entered, 1);
+  atomic_store(&rip_rc, pomp_enter_pool(1));
+  // A root again, with its block: regions, queries and gtid as before.
+  CHECK(__kmpc_global_thread_num(NULL) == 0 && omp_get_level() == 0);
+  CHECK(run_region() == 1); // Closed now.
+  return NULL;
+}
+
+static void test_pushfirst(void) {
+  host_start();
+  CHECK(pomp_open_pool() == POMP_OK);
+  host_enter_all();
+  wait_pool_size(limit - 1);
+  for (int want = 1; want <= limit; ++want) {
+    pthread_t t;
+    pthread_create(&t, NULL, pushfirst_host, (void *)(intptr_t)want);
+    pthread_join(t, NULL);
+  }
+  CHECK(pomp_close_pool() == POMP_OK);
+  host_stop();
+  CHECK(pomp_wait_pool_empty() == POMP_OK);
+  if (limit > 1) {
+    // Every host thread but slot 1's, then a root that enters as slot 1.
+    host_start();
+    atomic_store(&host[1].stop, 1);
+    pthread_join(host[1].th, NULL);
+    CHECK(pomp_open_pool() == POMP_OK);
+    for (int i = 2; i < limit; ++i)
+      atomic_fetch_add(&host[i].go, 1);
+    wait_pool_size(limit - 2);
+    pthread_t t;
+    pthread_create(&t, NULL, rootinpool_host, NULL);
+    while (!atomic_load(&rip_entered))
+      sched_yield();
+    wait_pool_size(limit - 1);
+    CHECK(run_region() == limit);
+    CHECK(pomp_close_pool() == POMP_OK);
+    pthread_join(t, NULL);
+    CHECK(atomic_load(&rip_rc) == POMP_OK);
+    for (int i = 2; i < limit; ++i) {
+      atomic_store(&host[i].stop, 1);
+      pthread_join(host[i].th, NULL);
+    }
+  }
+  printf("pushfirst: errors %ld\n", errors);
 }
 
 // -----------------------------------------------------------------------------
@@ -756,9 +931,9 @@ static void test_nolimit(long cycles, int lim) {
 // -----------------------------------------------------------------------------
 // S14: no OMP_THREAD_LIMIT. Host threads run nested serialized regions, and
 // regions, while another thread sets the limit and opens the pool. Until
-// then there are no descriptors: every region runs inline, at the right level,
-// on one thread. A thread inside a region when the limit is set stays inline
-// until it leaves it; its next region may use the pool.
+// then there are no pool descriptors: every region runs on one thread, at the
+// right level. Once the pool is open, any region may use it; here no pool
+// thread has entered yet, so the nested ones still run on one thread.
 // -----------------------------------------------------------------------------
 
 static atomic_int late_go, late_open, late_bad;
@@ -993,6 +1168,12 @@ int main(int argc, char **argv) {
     test_rejoin(n);
   else if (!strcmp(test, "latency"))
     test_latency(n);
+  else if (!strcmp(test, "rootchurn"))
+    test_rootchurn(n);
+  else if (!strcmp(test, "latepost"))
+    test_latepost(n);
+  else if (!strcmp(test, "pushfirst"))
+    test_pushfirst();
   else {
     fprintf(stderr, "unknown test %s\n", test);
     return 1;

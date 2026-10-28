@@ -8,8 +8,8 @@
 //
 // =============================================================================
 //
-// Part of pomp.cpp: parallel regions. The region stack, the ownership of
-// slot 0, and fork/join.
+// Part of pomp.cpp: parallel regions. The region stack, the root blocks,
+// and fork/join.
 //
 //===----------------------------------------------------------------------===//
 
@@ -67,9 +67,11 @@ inline Level *RegionStack::activeInnermost() {
   return innermostIsActive() ? &levels_[depth_ - 1] : nullptr;
 }
 
-inline Thread *Thread::current() {
-  SelfWord w = SelfWord::current();
-  return w.hasDescriptor() ? &threads[w.slot()] : nullptr;
+inline Thread *Thread::current() { return Self::get(); }
+
+inline Thread &Thread::currentOrNewRoot() {
+  Thread *self = Self::get();
+  return self ? *self : roots.acquire();
 }
 
 inline RegionStack *Thread::currentRegions() {
@@ -77,57 +79,83 @@ inline RegionStack *Thread::currentRegions() {
   return self ? &self->regions() : nullptr;
 }
 
+inline bool Thread::callerInPomp() {
+  Thread *self = current();
+  return self && (self->slot() != 0 || self->regions().depth() > 0);
+}
+
 // -----------------------------------------------------------------------------
-// Root ownership
+// Root blocks
 //
-// All non-pool threads read slot 0, so two host threads running models at once
-// would share its region stack and teams. The first to start an outermost
-// region becomes the root, owning slot 0 until that region ends; another
-// non-pool thread that starts one meanwhile runs it as a foreign region, and
-// pomp warns once.
+// A thread that is not in the pool becomes a root at its first region (or
+// pushed team size): it takes a root block, its descriptor and the two teams
+// it leads, its own until it ends. So roots never share a descriptor, any
+// number of them may run regions at once, and the next region of a root
+// touches nothing global but the pool.
+//
+// When the thread ends, the destructor of `exitKey_` returns the block to the
+// free list; blocks are never freed. A worker that has stored its done flag
+// may still wake the leader of its team, and the leader's thread may have
+// ended meanwhile: that wake-up reads only fields set at allocation, and at
+// worst posts to the block's next owner, which only makes it re-check. So a
+// block is recycled whole, with its teams, and a new owner does not clear
+// its post.
 // -----------------------------------------------------------------------------
 
-// Take root ownership for the caller, of word `w`; false if already owned.
-inline bool Root::tryEnter(SelfWord w) {
-  int expected = 0;
-  // Acquire: see slot 0 as the previous owner left it.
-  if (!active_.compareExchange(expected, 1))
-    return false;
-  SelfWord::set(w.withRootOwner());
-  return true;
+// The destructor of Roots::exitKey_, with the block of the ending thread.
+void recycleRootBlock(void *block) {
+  roots.recycle(*static_cast<RootBlock *>(block));
 }
 
-void Root::warnSecondRoot() {
-  if (!secondRootSeen_.exchange(1))
-    fprintf(stderr, "pomp: warning: two host threads ran OpenMP regions at "
-                    "once; the later ones run on one thread (see POMP.md)\n");
+void Roots::init() {
+  mutex_.init();
+  checkPthread(
+      pthread_key_create(&exitKey_, recycleRootBlock), "pthread_key_create");
 }
 
-// How a region about to start on the caller, of word `w` (no pending size),
-// runs: on its own slot, on slot 0 as the new root, or as a foreign region.
-inline Root::Entry Root::enter(SelfWord w) {
-  if (w.slot() || w.ownsRoot())
-    return Entry::Own;
-  // No descriptors before the limit is set; the acquire orders their
-  // allocation before their use.
-  if (!settings.limitAcquire())
-    return Entry::Foreign;
-  if (tryEnter(w))
-    return Entry::Taken;
-  warnSecondRoot();
-  return Entry::Foreign;
+RootBlock *Roots::allocate() {
+  // Team indices: below kMaxThreads for the pool's teams, then two per block.
+  int64_t index = int64_t(kMaxThreads) + 2 * int64_t(count_);
+  if (uint64_t(index + 1) >= kIdStride)
+    fatal("too many host threads running OpenMP regions at once");
+  RootBlock *b = static_cast<RootBlock *>(allocLines(1, sizeof(RootBlock)));
+  if (!b)
+    fatal("cannot allocate the descriptor of a host thread");
+  b->thread.init();
+  b->thread.initIdentity(0, &b->levelOne, &b->levelTwo);
+  b->levelOne.init(int32_t(index), b->thread);
+  b->levelTwo.init(int32_t(index + 1), b->thread);
+  ++count_;
+  POMP_STAT(kStatRootBlocks);
+  return b;
 }
 
-inline void Root::leave() {
-  SelfWord::set(SelfWord::current().withoutRootOwner());
-  active_.store(0, Order::Release);
+Thread &Roots::acquire() {
+  RootBlock *b;
+  {
+    ScopedLock<Mutex> lock(mutex_);
+    b = free_;
+    if (b)
+      free_ = b->next;
+    else
+      b = allocate();
+  }
+  b->thread.setPending(0);
+  checkPthread(pthread_setspecific(exitKey_, b), "pthread_setspecific");
+  Self::set(&b->thread);
+  return b->thread;
 }
 
-// Run `fn` inline as a foreign region of one thread.
-void runForeign(Microtask fn, int32_t argc, void **argv) {
-  SelfWord::set(SelfWord::current().enterForeign());
-  invoke(fn, 0, 0, argc, argv);
-  SelfWord::set(SelfWord::current().leaveForeign());
+// The value of exitKey_ is already null here: use `block`, not Self. A thread
+// that ends inside a region (pthread_exit) keeps its block: its team may
+// still use it.
+void Roots::recycle(RootBlock &block) {
+  Self::set(nullptr);
+  if (block.thread.regions().depth() != 0)
+    return;
+  ScopedLock<Mutex> lock(mutex_);
+  block.next = free_;
+  free_ = &block;
 }
 
 // -----------------------------------------------------------------------------
@@ -200,9 +228,11 @@ void Team::leaderJoin(Thread &leader, UniqueId uniqueBarrierId) {
   leaderEndBarrier(uniqueBarrierId);
 }
 
-void Thread::fork(
-    int32_t gtid, int32_t want, Microtask fn, int32_t argc, void **argv) {
-  int limit = settings.limit();
+void Thread::fork(int32_t want, Microtask fn, int32_t argc, void **argv) {
+  // Acquire: a root may predate the limit, and then reads the pool's
+  // descriptors for the first time (see Settings::limitAcquire). Until the
+  // limit is set, it is 0, and so is every team size: the fork serializes.
+  int limit = settings.limitAcquire();
   if (want <= 0)
     want = settings.numThreads(regions_.active());
   if (want > limit)
@@ -219,12 +249,12 @@ void Thread::fork(
   } else if (parallel) {
     SlotMask prefer;
     if (regions_.active() == 0) {
-      if (gtid != 0)
+      if (slot_ != 0)
         fatal("a pool thread started a parallel region outside of a team");
-      team = &rootTeam();
+      team = levelOne_;
       prefer = settings.limitSlots();
     } else {
-      team = &slotTeam(gtid);
+      team = levelTwo_;
       prefer = regions_.innermostIsActive() ? preferred() : SlotMask();
     }
     workers = pool.recruit(*team, want - 1, prefer);
@@ -232,7 +262,7 @@ void Thread::fork(
   // When we have no workers (reasons listed above), run serialized.
   if (!workers) {
     regions_.pushSerialized();
-    invoke(fn, gtid, 0, argc, argv);
+    invoke(fn, slot_, 0, argc, argv);
     regions_.pop();
     return;
   }
@@ -241,7 +271,7 @@ void Thread::fork(
   team->leaderLaunch(
       workers, regions_.active() + 1, regions_.depth(), fn, argc, argv);
   regions_.pushActive(team->levelFor(0));
-  invoke(fn, gtid, 0, argc, argv);
+  invoke(fn, slot_, 0, argc, argv);
   UniqueId uniqueBarrierId =
       regions_.activeInnermost()->bar.currUniqueBarrierId;
   regions_.pop();
@@ -251,25 +281,6 @@ void Thread::fork(
 
 // The fork of the calling thread, after its arguments are collected.
 void forkCall(Microtask fn, int32_t argc, void **argv) {
-  SelfWord w = SelfWord::current();
-  int32_t want = w.pending();
-  // Check for cases where we cannot run in parallel, in which case we run the
-  // work as foreign.
-  if (want)
-    SelfWord::set(w = w.withoutPending());
-  if (w.inForeign()) {
-    runForeign(fn, argc, argv);
-    return;
-  }
-  Root::Entry entry = root.enter(w);
-  if (entry == Root::Entry::Foreign) {
-    runForeign(fn, argc, argv);
-    return;
-  }
-  // We are now forking the work with w.slot() as the leader.
-  threads[w.slot()].fork(w.slot(), want, fn, argc, argv);
-  // If the leader took the root for itself, now that we have finished the fork,
-  // release the root for other level-1 region to take it again.
-  if (entry == Root::Entry::Taken)
-    root.leave();
+  Thread &self = Thread::currentOrNewRoot();
+  self.fork(self.takePending(), fn, argc, argv);
 }

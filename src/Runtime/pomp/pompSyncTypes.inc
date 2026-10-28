@@ -35,8 +35,8 @@ struct Level;
 // Unique ids. The join and the tree barrier store and wait for ids that are
 // never stored twice, by any team: a team's ids start at its index (below
 // kIdStride) and grow by kIdStride, so they are its index modulo kIdStride
-// and only grow. Flags are never reset and waits test for equality, so a value left
-// by an earlier region, barrier or team never matches. Ids advance before
+// and only grow. Flags are never reset and waits test for equality, so a value
+// left by an earlier region, barrier or team never matches. Ids advance before
 // use, so none is 0, the initial value of every flag.
 //
 // UniqueId and UniqueIdFlag enforce this: an id is made only by seed, changes

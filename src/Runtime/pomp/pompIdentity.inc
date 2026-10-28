@@ -8,23 +8,21 @@
 //
 // =============================================================================
 //
-// Part of pomp.cpp: the per-thread word (SelfWord) and slot sets (SlotMask).
+// Part of pomp.cpp: the calling thread's descriptor (Self) and slot sets
+// (SlotMask).
 //
 //===----------------------------------------------------------------------===//
 
 // -----------------------------------------------------------------------------
-// Thread identity: SelfWord, the per-thread word every entry point reads
-// first.
+// Thread identity: Self, the per-thread pointer every entry point reads first.
 //
 // Threads, by their place in the pool:
 // - Pool thread: a thread lent to the pool (pomp_enter_pool), as slot
 //   1..limit-1. Between teams it waits idle in the pool.
-// - Non-pool thread: any other thread. All of them read slot 0, which one of
-//   them at a time may own (see "Root ownership" in pompRegion.inc).
-// - Foreign region: a region that a non-pool thread runs inline, as a team
-//   of one, touching no descriptor, with its nesting counted in this word:
-//   while another thread owns slot 0, before the thread limit is set, and
-//   inside another foreign region.
+// - Root: any other thread, once it starts a region. Each root has a
+//   descriptor of its own, of slot 0, and the two teams it leads (see "Root
+//   blocks" in pompRegion.inc). Before its first region, a thread has no
+//   descriptor.
 //
 // Threads, by their place in a team (an active region):
 // - Leader: the thread that forks the region, tid 0. It sets up the team,
@@ -37,67 +35,18 @@
 //
 // Functions take a `leader` or `worker` prefix when only that role calls
 // them; unprefixed team functions are for any member.
-//
-// The pending team size (__kmpc_push_num_threads, consumed by the next fork
-// or serialized region) and the foreign depth are per thread, not per slot,
-// as non-pool threads share slot 0.
-//
-// Layout (bits): 0-7 slot, 8 root owner, 9-15 pending size, 16-30 foreign
-// depth. Zero is a non-pool thread in no region.
 // -----------------------------------------------------------------------------
 
-class SelfWord {
+class Thread;
+
+class Self {
 public:
-  constexpr explicit SelfWord(int32_t word = 0) : word_(word) {}
-
-  // The calling thread's word, and its update.
-  static SelfWord current();
-  static void set(SelfWord w);
-  // Create the per-thread storage, once, before any thread has a slot.
+  // The calling thread's descriptor: its pool slot's while in the pool, its
+  // root's otherwise, or nullptr if it has none.
+  static Thread *get();
+  static void set(Thread *t);
+  // Create the per-thread storage, once, before any thread has a descriptor.
   static void createStorage();
-
-  // The thread's slot: 1..limit-1 for a pool thread, 0 for any other.
-  int32_t slot() const { return word_ & kSlotBits; }
-  // A non-pool thread that owns slot 0, inside its regions.
-  bool ownsRoot() const { return (word_ & kRootOwner) != 0; }
-  // A pool thread, or the owner of slot 0: may use `threads[slot()]`.
-  bool hasDescriptor() const { return (word_ & (kSlotBits | kRootOwner)) != 0; }
-  // A pool thread, or inside a region: pool calls are refused.
-  bool inPomp() const { return (word_ & kInPompBits) != 0; }
-  // The pending team size, 0 if none.
-  int32_t pending() const { return (word_ & kPendingBits) >> kPendingShift; }
-  // Inside a foreign region, and how deeply nested in foreign regions.
-  bool inForeign() const { return (word_ & kForeignBits) != 0; }
-  int32_t foreignDepth() const { return (word_ & kForeignBits) / kForeignOne; }
-
-  // Set or clear the pending team size.
-  SelfWord withPending(int32_t nth) const {
-    return SelfWord((word_ & ~kPendingBits) | (nth << kPendingShift));
-  }
-  SelfWord withoutPending() const { return SelfWord(word_ & ~kPendingBits); }
-  // Set and cleared by Root::tryEnter and Root::leave.
-  SelfWord withRootOwner() const { return SelfWord(word_ | kRootOwner); }
-  SelfWord withoutRootOwner() const { return SelfWord(word_ & ~kRootOwner); }
-  // Enter or leave a foreign region: one level deeper, or one out.
-  SelfWord enterForeign() const {
-    if (foreignDepth() >= kMaxNesting)
-      fatal("regions nested too deeply");
-    return SelfWord(word_ + kForeignOne);
-  }
-  SelfWord leaveForeign() const { return SelfWord(word_ - kForeignOne); }
-
-private:
-  static constexpr int32_t kSlotBits = 0xff;
-  static constexpr int32_t kRootOwner = 0x100;
-  static constexpr int32_t kPendingShift = 9;
-  static constexpr int32_t kPendingBits = 0x7f << kPendingShift;
-  static constexpr int32_t kForeignOne = 1 << 16;
-  static constexpr int32_t kForeignBits = 0x7fff * kForeignOne;
-  static constexpr int32_t kInPompBits = kSlotBits | kRootOwner | kForeignBits;
-  static_assert(kMaxNesting <= kForeignBits / kForeignOne,
-      "the foreign depth field must hold kMaxNesting");
-
-  int32_t word_;
 };
 
 #ifdef POMP_USE_PTHREAD_KEY
@@ -105,25 +54,24 @@ private:
 POMP_CONSTINIT pthread_key_t selfKey{};
 POMP_CONSTINIT Atomic<int> selfKeyReady;
 
-inline SelfWord SelfWord::current() {
+inline Thread *Self::get() {
   if (!selfKeyReady.load(Order::Acquire))
-    return SelfWord();
-  return SelfWord(int32_t(intptr_t(pthread_getspecific(selfKey))));
+    return nullptr;
+  return static_cast<Thread *>(pthread_getspecific(selfKey));
 }
-inline void SelfWord::set(SelfWord w) {
-  checkPthread(pthread_setspecific(selfKey, (void *)intptr_t(w.word_)),
-      "pthread_setspecific");
+inline void Self::set(Thread *t) {
+  checkPthread(pthread_setspecific(selfKey, t), "pthread_setspecific");
 }
-void SelfWord::createStorage() {
+void Self::createStorage() {
   checkPthread(pthread_key_create(&selfKey, nullptr), "pthread_key_create");
   selfKeyReady.store(1, Order::Release);
 }
 #else
-POMP_CONSTINIT thread_local int32_t selfTls = 0;
+POMP_CONSTINIT thread_local Thread *selfTls = nullptr;
 
-inline SelfWord SelfWord::current() { return SelfWord(selfTls); }
-inline void SelfWord::set(SelfWord w) { selfTls = w.word_; }
-void SelfWord::createStorage() {}
+inline Thread *Self::get() { return selfTls; }
+inline void Self::set(Thread *t) { selfTls = t; }
+void Self::createStorage() {}
 #endif
 
 // -----------------------------------------------------------------------------
@@ -131,7 +79,7 @@ void SelfWord::createStorage() {}
 // -----------------------------------------------------------------------------
 
 // A set of slots, one bit each in a 64-bit word. Slots are pool-wide ids (0
-// for the owner of slot 0, 1..limit-1 for pool threads); tids are ids within
+// for a team's root leader, 1..limit-1 for pool threads); tids are ids within
 // a team (leader 0, then the workers by increasing slot). Iteration visits
 // slots in increasing order.
 class SlotMask {

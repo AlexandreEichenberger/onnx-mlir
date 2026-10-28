@@ -19,7 +19,7 @@ what a C library needs, the C library and pthreads; see "Language" below.
 | `__kmpc_global_thread_num` | Returns the thread's slot. Called by OpenMPIRBuilder code on every worker |
 | `__kmpc_push_num_threads` | Applies to the calling thread's next fork; clamped to the limit |
 | `__kmpc_push_proc_bind` | Accepted and ignored |
-| `__kmpc_serialized_parallel`, `__kmpc_end_serialized_parallel` | From `if(false)`; a team of 1. Like a fork, it can make its thread the owner of slot 0 (S9) |
+| `__kmpc_serialized_parallel`, `__kmpc_end_serialized_parallel` | From `if(false)`; a team of 1. Like a fork, it makes a host thread a root (S9) |
 | `__kmpc_barrier` | Central counter for small teams, 4-ary tree for large ones; long waits sleep |
 | `__kmpc_for_static_init_{4,4u,8,8u}`, `__kmpc_for_static_fini` | `schedule(static)` and `schedule(static, chunk)`. Results identical to libomp's "balanced" default |
 | `omp_get_thread_num`, `omp_get_num_threads`, `omp_get_level`, `omp_get_active_level`, `omp_in_parallel`, `omp_get_max_threads`, `omp_get_thread_limit`, `omp_get_max_active_levels` | Queries only. While no thread limit is set, `omp_get_max_threads` and `omp_get_thread_limit` return 1 |
@@ -36,9 +36,7 @@ near it:
 - clang passes one pointer per shared variable for zDNNx, and its largest region passes 5.
 
 **Nesting limit.** A thread can nest regions at most 256 levels deep, and aborts with a message
-beyond that. The limit applies equally to regions on its region stack and to foreign regions
-(S9), whose depth is kept in a field of the thread's per-thread word. Only the first 8 levels
-are recorded, and forks past them are serialized; the deeper ones are only counted. Real
+beyond that. Only the first 8 levels are recorded, and forks past them are serialized; the deeper ones are only counted. Real
 programs nest two or three levels; only unbounded recursion through parallel regions gets near
 the limit.
 
@@ -292,15 +290,15 @@ returns. The leader pays one post.
 - `pomp_set_thread_limit` with a limit out of range, or different from the one a previous call
   set: `POMP_ERR_LIMIT`.
 
-**S9. Two host threads running regions at once** (`tworoots`).
+**S9. Several host threads running regions at once** (`tworoots`).
 
-Every thread that is not a pool thread is slot 0, so two such threads would share slot 0's
-region stack and teams. The first thread to start a region at depth 0 owns slot 0 until that
-region ends, and records it in its per-thread word. A second non-worker that starts a region
-meanwhile (fork or serialized) is detected whatever the timing: its region, and everything
-nested in it, runs inline on that thread as a team of one, without touching slot 0. pomp prints a
-warning once. `__kmpc_barrier`, the loop init and the `omp_*` queries on that thread see a team
-of one. Results stay correct; that inference simply gets no workers.
+Every host thread that is not in the pool becomes a *root* at its first region (fork,
+serialized region or pushed team size), with a descriptor of its own: slot 0 of the teams it
+leads. So roots share nothing but the pool. Each region gets the idle pool threads it can, up to
+the limit, and its members see their own team in `__kmpc_barrier`, the loop init and the
+`omp_*` queries, whatever the other roots do meanwhile. Together, roots may thus run more threads
+than the limit, as OpenMP's contention groups do. The test runs 2 to 4 roots at once, with
+barriers, nested and serialized regions, and pushed team sizes.
 
 **S10. Nesting** (`nest`, with `OMP_MAX_ACTIVE_LEVELS=2`).
 
@@ -336,6 +334,23 @@ with a distinct tid.
 `POMP_SPIN` may change, while regions run; the others return `POMP_ERR_STATE`. With the
 environment variable set, calls succeed and change nothing, unless `POMP_IGNORE_ENV=1`.
 
+**S17. Host threads that come and go** (`rootchurn`).
+
+Each host thread runs a few regions and ends. Its root descriptor is reused by the next host
+thread: no more are allocated than roots run at once (counted with `-DPOMP_STATS`).
+
+**S18. Reuse while a worker may still wake the last owner** (`latepost`, run with
+`POMP_SPIN=0`).
+
+A host thread runs one region and ends at once, while its workers may still be waking it; the
+next host thread takes its descriptor and runs regions that sleep in their joins and barriers.
+Such a late wake-up must only make the new owner re-check (see "Root descriptors").
+
+**S19. A pushed size first, and a root in the pool** (`pushfirst`).
+
+`__kmpc_push_num_threads` as the first call of a host thread applies to its first region only.
+A host thread that has run regions may enter the pool, and runs regions again after it leaves.
+
 ### Rules for the host
 
 1. Call close and open from the leader, outside parallel regions. A close from another
@@ -350,8 +365,8 @@ environment variable set, calls succeed and change nothing, unless `POMP_IGNORE_
 4. To have exactly N-1 workers in the first region, wait until `pomp_pool_size()` reaches
    N-1 after entering. Without that, the first regions run with whoever has arrived, which is
    correct but slower.
-5. Only one leader at a time gets workers. Regions started meanwhile by another thread that is not
-   a pool thread run on that thread alone (S9).
+5. Any number of host threads may run regions at once (S9). They share the pool threads: a
+   region gets those that are idle, so with several roots each gets fewer.
 6. Never call `pomp_enter_pool`, `pomp_close_pool`, `pomp_open_pool` or
    `pomp_wait_pool_empty` from inside a parallel region; they return `POMP_ERR_STATE`.
 
@@ -562,13 +577,13 @@ namespace:
 | File | Contents |
 |---|---|
 | `pompSupport.inc` | Code not specific to pomp: `POMP_CONSTINIT`, `fatal`, `relax`, `Atomic<T>`, `Mutex`, `Condition`, `ScopedLock<T>`, `Post`, and `invoke`, the call of an outlined function through its exact type |
-| `pompIdentity.inc` | Slot sets, and the per-thread word |
+| `pompIdentity.inc` | Slot sets, and the calling thread's descriptor (`Self`) |
 | `pompSyncTypes.inc` | The types of the synchronization inside a team, which `Team` and `Thread` hold by value: `TeamWait`, `TeamJoin`, `TeamCentralBarrier`, `TeamTreeBarrier`, `MemberBarrier`, `TreeFlags`, `WorkerSync` |
-| `pompTypes.inc` | The descriptors and the globals: the region stack, `Team`, `Thread`, `Pool`, `Settings`, `Root` |
+| `pompTypes.inc` | The descriptors and the globals: the region stack, `Team`, `Thread`, `Pool`, `Settings`, `RootBlock`, `Roots` |
 | `pompInit.inc` | Settings from the environment, the thread limit and the allocation of the descriptors |
 | `pompPool.inc` | The idle wait, recruitment, and the host protocol of the pool |
 | `pompSync.inc` | The code of the synchronization inside a team |
-| `pompRegion.inc` | The region stack, root ownership, and fork/join |
+| `pompRegion.inc` | The region stack, the root descriptors, and fork/join |
 | `pompLoop.inc` | Static loop partitioning |
 
 As it is one translation unit, the inliner sees all of it, and the object code is the same as
@@ -579,22 +594,18 @@ pomp would be a link error.
 
 ## Design
 
-**Thread identity.** Each thread has one `__thread int32_t` word. It holds:
-- the thread's slot, set when the thread enters the pool (a thread that was never in the pool
-  reads 0);
-- the root-owner flag, set while this thread owns slot 0 (S9);
-- the team size pushed by `num_threads` for its next fork;
-- the depth of the regions it runs inline while another thread owns slot 0.
-
-The last three belong to the thread, not to slot 0, which every non-worker shares.
+**Thread identity.** Each thread has one `__thread` pointer to its descriptor: its slot's
+while it is in the pool, its root's otherwise (see "Root descriptors"), or null for a thread
+that has run no region. The descriptor holds the slot (0 for a root), its region stack, and the
+team size pushed by `num_threads` for its next fork.
 
 Build with `-DPOMP_USE_PTHREAD_KEY` (CMake: `-DPOMP_USE_PTHREAD_KEY=ON`) to use a pthread key
 instead, if `__thread` is unavailable in a static archive linked into `model.so`. The key is
-created at initialization, and is not read before that: until then, every thread reads 0.
+created at initialization, and is not read before that: until then, every thread reads null.
 
-Every entry point finds the calling thread from this word. The `gtid` argument of the
-`__kmpc_*` entry points is ignored: it is only what the caller says, while the word cannot name
-another thread, nor a slot out of range (see "Input checks" below).
+Every entry point finds the calling thread from this pointer. The `gtid` argument of the
+`__kmpc_*` entry points is ignored: it is only what the caller says, while the pointer cannot
+name another thread (see "Input checks" below). Every root reports gtid 0.
 
 **One word for the pool.** `busy` holds one bit per slot. A bit is clear iff that slot is a
 idle worker in the pool. All slots start busy:
@@ -610,21 +621,36 @@ never were. No descriptor is O(limit²): the memory is linear in the limit.
 - `threads[limit]`: per slot, one wake-up line with the wake-up epoch, the current assignment,
   the preferred workers for a level-2 team, and the sync words (done flag, tree barrier flags);
   the region stack and state, on lines of their own; and the sleep mutex and condition variable.
-- `teams[limit + 1]`: entry *i* is the team that slot *i* leads at level 2, and entry *limit*
-  the team the root leads at level 1.
+- `teams[limit]`: entry *i* is the team that pool thread *i* leads at level 2.
 
-Zero bytes are the initial state of both, so `calloc` is their whole construction, except for
-the sleep's mutex and condition. Those are initialized once per slot, on demand: slot 0's when
-the arrays are allocated, and a worker slot's by the first thread that enters as it, before it
-clears its `busy` bit. No other thread posts to a slot before that, as only idle workers and
-team members are posted to. A slot's sleep is never initialized again, since a waker that
-claimed a previous occupant's sleeping bit may still hold its mutex.
+Entry 0 of both is unused: each root has its own (see "Root descriptors"). Zero bytes are the
+initial state of both, so `calloc` is their whole construction, except for the sleep's mutex
+and condition. Those are initialized once per slot, on demand, by the first thread that enters
+as it, before it clears its `busy` bit. No other thread posts to a slot before that, as only
+idle workers and team members are posted to. A slot's sleep is never initialized again, since a
+waker that claimed a previous occupant's sleeping bit may still hold its mutex.
 
-Until the limit is set, there are no descriptors. Regions then run inline as foreign
-regions, as those of a second host thread do (S9), but without its warning: their nesting is
-kept in the thread's word, and they report what a serialized region would. A thread inside such
-a region when the limit is set stays foreign until it leaves it. The store of the limit publishes the arrays, and every path that reads
-them first loads the limit with acquire, or follows a step that did.
+Until the limit is set, there are no pool descriptors, and every team size is 0: regions run on
+their root alone, as serialized regions. The store of the limit publishes the arrays, and every
+path that reads them first loads the limit with acquire, or follows a step that did: a fork
+loads it before it recruits.
+
+**Root descriptors.** A host thread that is not in the pool becomes a root at its first region
+(or pushed team size): it takes a *root block*, one allocation with its descriptor, of slot 0,
+and the two teams it leads: at level 1, and at level 2 as tid 0 of its level-1 team. In a team's
+masks, slot 0 is that team's leader, which each team records at allocation. A root keeps its
+block until it ends, so its next region touches nothing global but the pool, and roots never
+share a descriptor.
+
+Blocks come from a free list under a mutex, taken only at a thread's first region. A pthread
+key, set once per root, has a destructor that returns the block to the free list when the thread
+ends; it is a pthread destructor, as a C++ `thread_local` destructor would need the C++ runtime.
+Blocks are never freed. A worker that has stored its `done` may still wake its leader, whose
+thread may have ended and whose block may have a new owner: that wake-up reads only fields set
+at allocation, and at worst posts to the new owner, which only makes it re-check. So a block is
+reused whole, its teams with it, and its post is never cleared. A thread that ends inside a
+region (`pthread_exit`) keeps its block, as a team may still use it. On z/OS, the destructor
+was checked to run for threads that return, call `pthread_exit` or are detached.
 
 A team descriptor holds:
 - the outlined function and arguments;
@@ -635,9 +661,7 @@ A team descriptor holds:
 - the central barrier, and the `sleepers` mask of members asleep in a team wait.
 
 **Fork.**
-1. If the calling thread is a non-worker that does not own slot 0, take ownership. If another
-   thread owns it, or no thread limit is set yet, run the region inline as a team of one,
-   outside slot 0 (S9).
+1. A host thread without a descriptor becomes a root (see "Root descriptors").
 2. Decide the team size: the pushed `num_threads`, otherwise the `OMP_NUM_THREADS` entry for
    the current active level, clamped to the limit.
 3. Run inline as a team of 1 in any of these cases:
@@ -658,8 +682,9 @@ A team descriptor holds:
 
 **Two levels.** When a level-1 team forks with `OMP_MAX_ACTIVE_LEVELS=2`, the leader splits the
 remaining idle workers into one contiguous group per member, and stores each group in that
-member's descriptor before waking it. Each member's level-2 fork prefers its own group. Only the
-root leads a level-1 team, so one group per slot is enough. Inner teams therefore do not compete with each other, and their caches stay
+member's descriptor before waking it. Each member's level-2 fork prefers its own group. Only
+roots lead level-1 teams, so one group per slot is enough; two roots that fork at once may give
+a slot two groups in turn, which only costs cache reuse. Inner teams therefore do not compete with each other, and their caches stay
 valid from one region to the next. For example, with 16 threads, a 4×4 split gives the same
 4 + 4×3 assignment every time.
 
@@ -719,13 +744,15 @@ leader does not return the thread to the pool. A woken thread thus finds its ass
 line it was polling, and a leader that forks the same team again already holds the lines whose
 `done` it last read. The region stack, written at every barrier, is on lines of its own, so it
 does not disturb a leader polling `done`. That is 1 line per slot for synchronization, where
-one line per member of each of the 65 teams would be 65.
+one line per member of each team would be one per team.
 
 The values are unique ids, so that a value left in a line by an earlier region, barrier or
 team never matches. A team has two sequences of ids, one for its joins and one for its tree
-barriers, each seeded with the team's index (the leader's slot for a level-2 team, 64 for the
-root's); each new id is the last one plus 65, the number of teams. So every id of a team is its
-index modulo 65, and two teams never meet, and a team's ids only grow. Every wait tests for
+barriers, each seeded with the team's index, set at allocation: the leader's slot for a pool
+thread's team, and 64 + 2*k and 65 + 2*k for the two teams of the *k*-th root block. Each new
+id is the last one plus 2^16, which every index is below: 2^16 bounds the root blocks to about
+32 700, and pomp aborts beyond. So every id of a team is its index modulo 2^16, two teams never
+meet, and a team's ids only grow, also when its block is reused. Every wait tests for
 equality, and nothing is ever reset. Ids are advanced before use, so no id is 0, which every
 line holds at first. A line keeps
 its `done` until the leader has read it, as the leader returns its workers to the pool only
@@ -733,7 +760,7 @@ after the join.
 
 **Barrier.** The compiler emits one after every worksharing loop. For the tree barrier, each
 thread keeps the unique id of its current barrier in its region-stack entry. The id starts from
-the id of the team's last barrier, the same for every member, and advances by 65 at each
+the id of the team's last barrier, the same for every member, and advances by 2^16 at each
 barrier.
 
 - *Central*, for teams below `POMP_TREE_BARRIER`: each arriving thread increments the team's
