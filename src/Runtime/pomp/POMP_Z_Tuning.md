@@ -28,8 +28,8 @@ environment set: threads `free` (Linux places them); libomp with `KMP_BLOCKTIME=
 default on Z; pomp at the commit named. **Best** means the best setting found for that scenario;
 the setting is named.
 
-pomp's default wait changed between the last two runs: 4f8cb8704 spun 200000 iterations before
-sleeping; 802336526 spins 5 µs (`POMP_SPIN=5`). Both are given where they differ.
+pomp's default wait changed between runs: up to 4f8cb8704 it spun 200000 iterations before
+sleeping; from 802336526 it spins 5 µs (`POMP_SPIN=5`). Both are given where they differ.
 
 | Scenario | libomp default | libomp best (setting) | pomp default, 200000 it. / 5 µs | pomp best (setting) |
 |---|---|---|---|---|
@@ -46,10 +46,9 @@ sleeping; 802336526 spins 5 µs (`POMP_SPIN=5`). Both are given where they diffe
 What this shows:
 - **The 5 µs spin fixes waiting next to a computing sibling** (excess 113 → 25 µs, like
   libomp's `KMP_BLOCKTIME=0`), **but breaks back-to-back and nested regions:** T=16 overhead
-  2.3 → 5.5 µs, nested 8x8 3.1 → 25 µs, worse than libomp. Their waits last longer than 5 µs (a
-  T=16 fork takes several µs to reach every worker; an inner team waits for the outer region),
-  so workers fall asleep and every fork pays the wake-up through the kernel. Section 6; the
-  default is not settled.
+  2.3 → 5.5–6.6 µs, nested 8x8 3.1 → 25 µs, worse than libomp. A spin of 50 µs keeps those as
+  fast as before (T=16 2.2 µs, nested 8x8 3.3 µs) but gives back part of the sibling gain
+  (about 0.3 µs of the sibling's work per µs of spin). Section 6; the default is not settled.
 
 What an app should do on Z:
 - **Keep the team on one chip** when it fits (12 CPUs here): `taskset`, a cpuset, or pinning.
@@ -58,7 +57,7 @@ What an app should do on Z:
 - **Match the wait to the work.** If threads that wait share a core with threads that still
   compute (uneven work, two threads per core), sleep almost at once: libomp `KMP_BLOCKTIME=0`,
   pomp `POMP_SPIN` ≤ 5. If regions follow each other with little work in between, or are
-  nested, spin long: libomp's default, pomp `POMP_SPIN` ≥ 100 (to be confirmed).
+  nested, spin: libomp's default, pomp `POMP_SPIN=50` to 100.
 - libomp's own binding: use `OMP_PLACES=cores OMP_PROC_BIND=close`, never `spread` (it puts
   threads on other chips on purpose).
 - At each runtime's best setting, pomp's overhead is 1.5–2.7x lower than libomp's; on real work
@@ -72,8 +71,8 @@ What an app should do on Z:
 - libomp: onnx-mlir's `libompruntime.a`, always built as Release, so the comparison is fair.
   Its wait policy in all timings: `KMP_BLOCKTIME=200` (spin 200 ms, then sleep).
 - Numbers come from runs at pomp commits fbae69c24, 7d6fe3917, aa1111068 and 4f8cb8704, with
-  `POMP_SPIN` counting iterations (default 200000), and 802336526, with `POMP_SPIN` in µs
-  (default 5). pomp's numbers are
+  `POMP_SPIN` counting iterations (default 200000), and 802336526, 42a3b0b8e and
+  c8b0916b8, with `POMP_SPIN` in µs (default 5). pomp's numbers are
   stable within about 5% across runs; libomp's free (unpinned) numbers vary by up to 15%.
 - Times are medians, in µs or ns.
 
@@ -101,8 +100,11 @@ Placements, the CPUs a team's threads run on:
 | `cores-spread` | by libomp | libomp only: `OMP_PLACES=cores OMP_PROC_BIND=spread`, one core per thread, spread over the machine |
 
 Wait policies: a waiting thread spins (polls a flag) for a while, then sleeps until woken.
-**`POMP_SPIN`** (pomp): microseconds of spinning before sleeping, default 5; 0 sleeps at once;
-never yields. Up to commit 4f8cb8704 it counted iterations (default 200000), and barrier and join
+**`POMP_SPIN`** (pomp): `auto` (default) adapts each thread's spin, separately for waiting for
+work and for team waits, between 2 and 100 µs: after a wait of *d* µs, the next spin covers 2·*d*
+if *d* ≤ 100, and halves (to at least 2) if *d* > 100; `auto:M` sets the ceiling to M. A number
+N spins exactly N µs (0 sleeps at once). Never yields. From commit 802336526 to the adaptive
+change, the default was a fixed 5 µs. Up to commit 4f8cb8704 it counted iterations (default 200000), and barrier and join
 waits called `sched_yield` after 4096 of them; numbers from those runs say "iterations". **`KMP_BLOCKTIME`**
 (libomp): time spent spinning before sleeping (`200` = 200 ms, `20us`, `0` = sleep at once).
 
@@ -311,9 +313,49 @@ Conclusions:
   In these, a waiting thread waits longer than 5 µs although nothing is computing next to it:
   at T=16 the fork must reach 15 workers, and in nested regions each inner team waits for the
   outer one. The waiters fall asleep, and each region then pays wake-ups through the kernel.
-- **So no single spin time suits both.** Uneven compute next to a sibling wants ≤ 5 µs;
-  back-to-back and nested regions want much longer. `run_z.sh` now sweeps `POMP_SPIN` 0–100 µs
-  and 200000 on those regions to find the shortest spin that keeps them fast.
+- **Spin sweep on regions where nothing computes between waits** (commit 42a3b0b8e, `free`, µs):
+
+  | `POMP_SPIN` | overhead T=8 | overhead T=16 | fork/join T=16 | nested 4x4 | nested 8x8 |
+  |---|---|---|---|---|---|
+  | 0 | 18.6 | 27.2 | 14.7 | 18.2 | 43.1 |
+  | 5 | 1.68 | 6.12 | 7.70 | 3.36 | 24.8 |
+  | 20 | 1.75 | 2.14 | 1.13 | 2.06 | 12.3 |
+  | 50 | 1.74 | 2.24 | 1.11 | 2.28 | 3.32 |
+  | 100 | 1.75 | 2.31 | 1.06 | 2.31 | 3.17 |
+  | 200000 | 1.73 | 2.44 | 1.31 | 2.41 | 3.91 |
+
+  Sleeping makes these regions 10–20x slower, and the cost falls off a cliff once the spin
+  covers the wait: 20 µs suffices for one level and nested 4x4, nested 8x8 needs 50 µs. Spinning
+  0.2 s is slightly worse than 100 µs everywhere (spinning threads slow each other's SMT
+  siblings). Each wake-up through the kernel is slow enough that one late region makes the next
+  waits longer than the spin, so threads keep falling asleep (a cascade; to be confirmed by the
+  counters of the next run).
+- **Counters confirm a cascade** (pomp built with `-DPOMP_STATS`, commit c8b0916b8), sleeps and
+  posts per region:
+
+  | `POMP_SPIN` | T=8 | T=16 | nested 8x8 |
+  |---|---|---|---|
+  | 5 | 0 sleeps | 9.1 idle sleeps, 8.8 posts at forks | 6.0 idle + 3.5 team-wait sleeps, 9.1 posts |
+  | 20 | 0 | 0 | 1.3 sleeps, 1.3 posts |
+  | 100 | 0 | 0 | 0.2 |
+  | 200000 | 0 | 0 | 0 |
+
+  Spinning, a T=16 worker waits about 1 µs between regions, far below 5 µs, yet 9 of 15 workers
+  sleep in every region. Once some sleep, the leader posts to each (about 0.6 µs each, in turn),
+  and the last one runs about 2 µs later: the next wait exceeds 5 µs, so they sleep again. At T=8
+  it never starts. A spin of 20 µs breaks it at one level, 100 µs in nested 8x8.
+- **A faster wake-up mechanism helps little** (zbench part 8, pinned): one post costs 370–570 ns
+  to the poster, and the sleeper runs 1.6–2.4 µs after it, with a mutex and condition (pomp's
+  `Post`) as with a futex (5–10% faster). Waking 15 sleepers, the last runs 10.3 µs after the
+  first post when posted in turn, 8.8 µs through a 4-ary tree, 8.1 µs with a futex tree. The
+  floor is the kernel's 1.6–2.4 µs from wake-up to running, not pomp's code: no mechanism makes
+  waking 15 sleepers cheap, so the fix is not to let them fall asleep in short waits.
+- **Hence an adaptive spin per thread** (`POMP_SPIN=auto`, the default after commit c8b0916b8),
+  not yet timed on Z. A faster wake-up mechanism gains only 15–20% (below), so it was not done.
+- **So no single fixed spin time suits both kinds of workload.** Uneven compute next to a sibling
+  wants ≤ 5 µs (each extra µs of spin costs about 0.3 µs of the sibling's work: 25 → 28 µs excess
+  at 20 µs); back-to-back and nested regions want ≥ 50 µs. A faster wake-up would move the
+  second requirement down; an adaptive spin could serve both.
 - With each runtime at its best wait policy, pomp and libomp are within 1–2 µs on every row:
   on real work, the wait policy matters more than the fork/join design.
 - The 26 µs that remain in `sibling` when sleeping are most likely the short thread's own work
@@ -329,6 +371,8 @@ Conclusions:
   per worker against pomp's one, and overstated pomp's wake loop 3x.
 - Trusting Mac results for Z: prefetching and the shared wake word won on the Mac, not on Z, and
   the Mac cannot pin threads.
+- Expecting a faster wake-up mechanism to fix sleeping in short waits: on Z the kernel takes
+  1.6–2.4 µs to run a woken thread whatever the mechanism (futex, condition, tree).
 - Choosing a spin time from one kind of workload: 5 µs was best on uneven compute and 2–8x
   worse on back-to-back and nested regions. Time every change to waits on both.
 - Validating a wait-protocol change with a benchmark where nothing sleeps: the release store
@@ -349,18 +393,10 @@ Conclusions:
 
 ## Open items
 
-- **Measure the wake-up path** (next run): pomp built with `-DPOMP_STATS` counts sleeps and posts
-  per region (`pomp_get_stats`), at `POMP_SPIN` 5, 20, 100 and 200000 µs, for T=8, 16 and nested
-  8x8. zbench part 8 times one post (mutex + condition against futex) and waking T-1 sleepers in
-  turn against through a 4-ary tree. Expected if the T=16 slowdown is a cascade (sleeping makes
-  forks slow, slow forks make waits long enough to sleep): about 15 posts per region at 5 µs,
-  near 0 at T=8.
-- **Choose pomp's spin** (section 6): 5 µs suits uneven work next to a computing sibling, but
-  makes T=16 and nested regions 2–8x slower. Next run sweeps `POMP_SPIN` 0–100 µs on those. Then
-  decide among: one longer default (the shortest that keeps them fast, if it stays good next to
-  a sibling); different spins per wait kind (the idle wait for the next region, which suffers
-  most, against barrier and join); or spinning long only when no SMT sibling of the waiter
-  is busy (needs placement or load information).
+- **Time the adaptive spin on Z** (`POMP_SPIN=auto`, now the default; section 6). It succeeds if
+  T=16 and nested 8x8 are within about 10% of their best fixed spin with near-zero sleeps per
+  region, uneven work next to a sibling stays within a few µs of sleeping at once, and on its
+  own core within about 1 µs of the best fixed spin. Fallback: a fixed 100 µs default.
 - **Put L's order in pomp:** in `Team::leaderLaunch`, wake the workers on other chips first. pomp
   needs each worker's chip: from sysfs (`physical_package_id`, `book_id`, `drawer_id`) for the
   CPU a worker runs on (`sched_getcpu` at pool entry). Then time the one-level runs again.

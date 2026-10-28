@@ -165,7 +165,7 @@ run() {
 }
 T="$B/tls"
 for L in 2 3 4 8 16 17; do
-  for S in 0 5 200000; do
+  for S in 0 5 200000 auto; do
     for TB in 2 65; do
       E="env OMP_THREAD_LIMIT=$L POMP_SPIN=$S POMP_TREE_BARRIER=$TB"
       run $E "$T/pomp_test" stress $N
@@ -190,8 +190,8 @@ for L in 2 3 4 8 16 17; do
 done
 echo "$runs runs, $fail failures"
 
-# Timings: median of 5 runs. libomp spins 200 ms before sleeping, pomp
-# POMP_SPIN microseconds (default 5). Every timing starts after 1000 untimed regions
+# Timings: median of 5 runs. libomp spins 200 ms before sleeping; pomp
+# adapts its spin per thread (POMP_SPIN=auto, 2-100 us). Every timing starts after 1000 untimed regions
 # of the same shape, so that libomp's threads exist and are hot: no timing
 # includes the creation of a thread.
 #
@@ -248,21 +248,21 @@ done
 
 # The spin time of pomp's waits against the cost of regions where nothing
 # computes while threads wait: back-to-back regions, nested regions.
-note "pomp spin time (POMP_SPIN, us), us per region (median of 5 runs)"
+note "pomp spin (POMP_SPIN: auto, or us), us per region (median of 5 runs of 20000)"
 echo "One level: overhead and fork/join, at T=8 and 16. Nested: overhead, 4x4 and 8x8."
 printf '%-8s %9s %9s %9s %9s %9s %9s\n' POMP_SPIN "ov T=8" "fj T=8" "ov T=16" "fj T=16" \
   "nest 4x4" "nest 8x8"
-for S in 0 5 20 50 100 200000; do
+for S in auto 0 5 20 50 100 200000; do
   row=
   for L in 8 16; do
     E="env OMP_THREAD_LIMIT=$L OMP_NUM_THREADS=$L POMP_SPIN=$S"
-    row="$row $(runs5 $E "$(exe pomp)" loop 100000 | med_of overhead)"
-    row="$row $(runs5 $E "$(exe pomp)" bench 100000 | med_of join)"
+    row="$row $(runs5 $E "$(exe pomp)" loop 20000 | med_of overhead)"
+    row="$row $(runs5 $E "$(exe pomp)" bench 20000 | med_of join)"
   done
   for sh in 4x4 8x8; do
     n1=${sh%x*} n2=${sh#*x}
     row="$row $(runs5 env POMP_SPIN=$S OMP_MAX_ACTIVE_LEVELS=2 OMP_THREAD_LIMIT=$((n1 * n2)) \
-      "$(exe pomp)" nestbench 50000 $n1 $n2 | med_of overhead)"
+      "$(exe pomp)" nestbench 20000 $n1 $n2 | med_of overhead)"
   done
   printf '%-8s %9s %9s %9s %9s %9s %9s\n' $S $row
 done
@@ -270,7 +270,7 @@ done
 note "pomp sleeps and wake-ups per region (pomp built with counters; one run each)"
 echo "idle: a worker slept waiting for the next region; team: a join or barrier"
 echo "wait slept; posts: wake-ups sent (at forks: by the leader's fork)."
-for S in 5 20 100 200000; do
+for S in auto 5 20 100 200000; do
   for w in "bench 8" "bench 16" "nest 8x8"; do
     set -- $w
     if [ $1 = nest ]; then
@@ -501,8 +501,9 @@ if [ -r /sys/devices/system/cpu/cpu0/topology/core_id ]; then
   echo "  own core: every thread on a core of its own, same chip."
   echo "  alone: the LONG work with one thread. excess = phase - alone: the runtime's"
   echo "  overhead plus the slowdown of the long work by its waiting sibling."
-  echo "Wait policies: pomp POMP_SPIN = microseconds spinning before sleeping"
-  echo "(default 5; 0 sleeps at once); libomp KMP_BLOCKTIME = the same, in ms or us."
+  echo "Wait policies: pomp POMP_SPIN = auto (default: adapts per thread, 2-100 us),"
+  echo "or a fixed number of us spinning before sleeping (0 sleeps at once);"
+  echo "libomp KMP_BLOCKTIME = time spinning before sleeping."
   # CPUs for T threads: pairs of SMT siblings, or one per core, on C0's chip.
   PAIRS=$(for c in $(echo "$CHIP1" | tr ',' ' '); do
     echo "$c,$(expand "$(topo $c thread_siblings_list)" | grep -vx $c | head -1)"
@@ -531,7 +532,7 @@ if [ -r /sys/devices/system/cpu/cpu0/topology/core_id ]; then
           esac
           for rt in $RUNTIMES; do
             if [ $rt = pomp ]; then
-              POLS="POMP_SPIN=200000 POMP_SPIN=20 POMP_SPIN=10 POMP_SPIN=5 POMP_SPIN=2 POMP_SPIN=0"
+              POLS="POMP_SPIN=auto POMP_SPIN=200000 POMP_SPIN=20 POMP_SPIN=5 POMP_SPIN=0"
             else
               POLS="KMP_BLOCKTIME=200 KMP_BLOCKTIME=20us KMP_BLOCKTIME=0"
             fi

@@ -233,6 +233,11 @@ private:
   bool initialized_ = false; // See init.
   // New line: used only after a spin.
   alignas(kCacheLine) Post post_;
+
+public:
+  // The spins of this thread's waits, under POMP_SPIN=auto: waiting for
+  // work, and waiting in a team (join, barrier). Used by this thread only.
+  AdaptiveSpin idleSpin_, teamSpin_;
 };
 
 // The pool: which pool threads are idle, sleeping or released, and whether it
@@ -309,7 +314,11 @@ public:
         Order::Relaxed);
   }
   int maxActive() const { return maxActive_; }
-  long spinUs() const { return spinUs_; } // POMP_SPIN.
+  // POMP_SPIN: a fixed spin in us, or -1 for auto, which adapts up to
+  // spinMaxUs().
+  bool spinAdaptive() const { return spinUs_ < 0; }
+  long spinUs() const { return spinUs_; }
+  long spinMaxUs() const { return spinMaxUs_; }
   int treeMin() const { return treeMin_; }
 
 private:
@@ -330,6 +339,7 @@ private:
   Atomic<int> limitMismatchSeen_;
   Atomic<int> noLimitSeen_;
   long spinUs_ = 0;
+  long spinMaxUs_ = 0;
   int treeMin_ = 0; // Team size from which the tree barrier is used.
 };
 

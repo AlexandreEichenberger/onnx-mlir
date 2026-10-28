@@ -52,12 +52,29 @@ private:
 // -----------------------------------------------------------------------------
 // TeamWait
 
-// Spin for POMP_SPIN microseconds, then sleep. No yield: a waiting thread
-// that yields still slows an SMT sibling that computes, and an oversubscribed
-// waitee gets its CPU back once the waiter sleeps.
+// Spin, then sleep: for POMP_SPIN us, or under auto for this thread's
+// adaptive team-wait spin, updated with the length of this wait. No yield: a
+// waiting thread that yields still slows an SMT sibling that computes, and
+// an oversubscribed waitee gets its CPU back once the waiter sleeps.
 template <class Cond>
 void TeamWait::until(Thread &self, Cond cond) {
-  SpinBudget spin(settings.spinUs());
+  bool adapt = settings.spinAdaptive();
+  long maxUs = settings.spinMaxUs();
+  // A wait that is already over costs no clock read.
+  if (cond())
+    return;
+  uint64_t t0 = adapt ? nowUs() : 0;
+  struct Update {
+    bool adapt;
+    long maxUs;
+    uint64_t t0;
+    AdaptiveSpin &spin;
+    ~Update() {
+      if (adapt)
+        spin.update(nowUs() - t0, maxUs);
+    }
+  } update{adapt, maxUs, t0, self.teamSpin_};
+  SpinBudget spin(adapt ? self.teamSpin_.next(maxUs) : settings.spinUs());
   SlotMask meMask = SlotMask::of(self.slot());
   while (!cond()) {
     if (spin.more()) {

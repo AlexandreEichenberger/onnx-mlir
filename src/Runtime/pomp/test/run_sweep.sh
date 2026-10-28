@@ -18,8 +18,8 @@
 #
 # Builds pomp twice (with __thread, and with -DPOMP_USE_PTHREAD_KEY). For each
 # build and limit, runs every test with POMP_TREE_BARRIER 2 (tree barrier from
-# 2 threads), 5 (the default) and 65 (central only), and POMP_SPIN 0 (sleep)
-# and 200000 (spin 0.2 s). A run fails if it exits nonzero, or prints a nonzero
+# 2 threads), 5 (the default) and 65 (central only), and POMP_SPIN 0 (sleep),
+# 200000 (spin 0.2 s) and auto (the default, adaptive). A run fails if it exits nonzero, or prints a nonzero
 # `bad` or `errors` count, or `short teams` in nestbench. Limits above the
 # CPU count oversubscribe, and are slow with POMP_SPIN=200000.
 #
@@ -73,7 +73,7 @@ for v in tls key; do
   T="$B/$v"
   for L in $LIMITS; do
     for TB in 2 5 65; do
-      for S in 0 200000; do
+      for S in 0 200000 auto; do
         E="env OMP_THREAD_LIMIT=$L POMP_SPIN=$S POMP_TREE_BARRIER=$TB"
         A2="$E OMP_MAX_ACTIVE_LEVELS=2"
         # 1 active level.

@@ -63,11 +63,14 @@ constexpr int kMaxDepth = 8;
 // Max nesting levels of any kind; deeper aborts. Fits SelfWord's foreign depth.
 constexpr int kMaxNesting = 256;
 constexpr int kMaxActive = 2; // Max active (more than 1 thread) levels.
-// Microseconds any wait (idle, join, barrier) spins before it sleeps. On z,
-// a thread spinning next to an SMT sibling that computes slows it by about
-// 30%, while sleeping costs 1-3 us per wake-up: spin for about that long.
-// See POMP_Z_Tuning.md, "Spin or sleep".
-constexpr long kDefaultSpinUs = 5;
+// How long a wait (idle, join, barrier) spins before it sleeps, in us. By
+// default (POMP_SPIN=auto) each thread adapts it between kSpinFloorUs and the
+// ceiling: on z, a thread spinning next to an SMT sibling that computes slows
+// it by about 30%, so long waits should sleep at once; but a wake-up costs
+// 2-10 us, so waits shorter than that must not sleep, or the next ones get
+// longer and sleep too. See POMP_Z_Tuning.md, "Spin or sleep".
+constexpr long kDefaultSpinMaxUs = 100;
+constexpr long kSpinFloorUs = 2;
 // Spin iterations between two reads of the clock.
 constexpr long kSpinClockStride = 64;
 constexpr long kYieldSpin = 4096; // spinUntil iterations before yield.

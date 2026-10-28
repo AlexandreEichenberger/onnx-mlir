@@ -64,10 +64,16 @@ void Pool::wakeReleased(int n) {
 // Wait for work or for release. Return true for work, with `last` updated to
 // the new epoch, and false when a release has claimed this thread.
 bool Pool::waitWork(Thread &t, SlotMask self, uint64_t &last) {
-  for (SpinBudget spin(settings.spinUs()); spin.more();) {
+  bool adapt = settings.spinAdaptive();
+  long maxUs = settings.spinMaxUs();
+  uint64_t t0 = adapt ? nowUs() : 0;
+  for (SpinBudget spin(adapt ? t.idleSpin_.next(maxUs) : settings.spinUs());
+       spin.more();) {
     uint64_t g = t.epoch(Order::Acquire);
     if (g != last) {
       last = g;
+      if (adapt)
+        t.idleSpin_.update(nowUs() - t0, maxUs);
       return true;
     }
     if (released_.load(Order::Relaxed) & self)
@@ -102,6 +108,8 @@ bool Pool::waitWork(Thread &t, SlotMask self, uint64_t &last) {
     return false;
   // Work and release never come together: both claim the busy bit.
   last = g;
+  if (adapt)
+    t.idleSpin_.update(nowUs() - t0, maxUs);
   return true;
 }
 

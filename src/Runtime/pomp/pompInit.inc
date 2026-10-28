@@ -82,10 +82,36 @@ void Settings::init() {
   if (s && (v = parseInt(s, nullptr)) >= 0)
     treeMin_ = int(v);
 
-  spinUs_ = kDefaultSpinUs;
+  // POMP_SPIN: auto (default), auto:MAX, or a fixed number of us.
+  spinUs_ = -1;
+  spinMaxUs_ = kDefaultSpinMaxUs;
   s = getenv("POMP_SPIN");
-  if (s && (v = parseInt(s, nullptr)) >= 0)
-    spinUs_ = v;
+  if (s) {
+    while (*s == ' ' || *s == '\t')
+      ++s;
+    if (!strncmp(s, "auto", 4)) {
+      s += 4;
+      if (*s == ':') {
+        v = parseInt(s + 1, &end);
+        if (v >= 0 && !*end)
+          spinMaxUs_ = v;
+        else
+          fprintf(stderr, "pomp: warning: POMP_SPIN=auto:%s is invalid; "
+                          "using auto:%ld\n",
+              s + 1, kDefaultSpinMaxUs);
+      } else if (*s) {
+        fprintf(stderr, "pomp: warning: POMP_SPIN=auto%s is invalid; using "
+                        "auto\n", s);
+      }
+    } else if ((v = parseInt(s, &end)) >= 0 && !*end) {
+      spinUs_ = v;
+    } else {
+      fprintf(stderr,
+          "pomp: warning: POMP_SPIN=\"%s\" is invalid (auto, auto:MAX or a "
+          "number of us); using auto\n",
+          s);
+    }
+  }
 
   s = getenv("OMP_THREAD_LIMIT");
   if (s) {

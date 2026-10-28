@@ -89,6 +89,33 @@ private:
   long n_ = 0;
 };
 
+// The spin of one kind of wait of one thread, under POMP_SPIN=auto:
+// covers twice the last short wait, so that waits like it do not sleep, and
+// halves after each wait longer than the ceiling, down to the floor.
+class AdaptiveSpin {
+public:
+  // The spin for the next wait; starts at the ceiling.
+  long next(long maxUs) const { return us_ ? us_ : maxUs; }
+  // After a wait of `waitedUs`, from its start to its end.
+  void update(uint64_t waitedUs, long maxUs) {
+    long cur = next(maxUs);
+    long floor = kSpinFloorUs < maxUs ? kSpinFloorUs : maxUs;
+    if (waitedUs <= uint64_t(maxUs)) {
+      long want = long(2 * waitedUs);
+      cur = want > cur ? want : cur;
+      cur = cur < maxUs ? cur : maxUs;
+    } else {
+      cur = cur / 2 > floor ? cur / 2 : floor;
+    }
+    // 0 means "not started", so store at least 1 (a ceiling of 0 never
+    // spins: SpinBudget(0) ends at once).
+    us_ = cur > 0 ? cur : 1;
+  }
+
+private:
+  long us_ = 0; // 0: not started.
+};
+
 inline void relax() {
 #if defined(__x86_64__) || defined(__i386__)
   __asm__ volatile("pause" ::: "memory");
