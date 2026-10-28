@@ -41,6 +41,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 
 namespace {
@@ -163,6 +164,11 @@ int pomp_is_pool_open(void) {
 int pomp_pool_size(void) {
   settings.ensureInit();
   return pool.size();
+}
+
+int pomp_set_option(const char *name, const char *value) {
+  settings.ensureInit();
+  return settings.setOption(name, value, Settings::kCall);
 }
 
 int pomp_get_stats(unsigned long long *counts, int n) {

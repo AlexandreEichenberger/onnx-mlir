@@ -251,6 +251,8 @@ public:
   int close();
   int waitEmpty();
   bool isOpen(Order o = Order::SeqCst) const { return state_.load(o) == kOpen; }
+  // Whether the pool has ever been opened.
+  bool wasOpened() const { return state_.load() != kNeverOpened; }
   int size() const { return numPoolThreads_.load(); }
   // Fork that finds the pool not open: warn once if it was never opened.
   void warnIfNeverOpened();
@@ -290,9 +292,21 @@ private:
   Atomic<int> neverOpenedSeen_;
 };
 
-// Settings, fixed at init, and the init of pomp.
+// Settings: defaults, then pomp_set_option calls, then the environment.
+// Each is read from the environment at init (the first call of any entry
+// point); a set environment variable takes precedence over calls, unless
+// POMP_IGNORE_ENV=1. See "Environment" in POMP.md.
 class Settings {
 public:
+  // Where a setting's value comes from, by increasing precedence.
+  enum Source : int8_t { kDefault, kCall, kEnv };
+  // pomp_set_option: set setting `name` (its environment variable's name)
+  // from `value`. POMP_ERR_LIMIT: unknown name or invalid value;
+  // POMP_ERR_STATE: the setting cannot change now.
+  int setOption(const char *name, const char *value, Source from);
+  // OMP_DISPLAY_ENV: print the settings on stderr, once, at the first open
+  // of the pool (when only POMP_SPIN can still change).
+  void displayOnce();
   // Init pomp, once, on the first call of any entry point.
   void ensureInit() {
     if (initialized_.load(Order::Acquire) != 2)
@@ -313,23 +327,40 @@ public:
     return nthreads_[active < kMaxActive ? active : kMaxActive - 1].load(
         Order::Relaxed);
   }
-  int maxActive() const { return maxActive_; }
+  int maxActive() const { return maxActive_.load(Order::Relaxed); }
   // POMP_SPIN: a fixed spin in us, or -1 for auto, which adapts up to
   // spinMaxUs().
-  bool spinAdaptive() const { return spinUs_ < 0; }
-  long spinUs() const { return spinUs_; }
-  long spinMaxUs() const { return spinMaxUs_; }
-  int treeMin() const { return treeMin_; }
+  bool spinAdaptive() const { return spinUs_.load(Order::Relaxed) < 0; }
+  long spinUs() const { return spinUs_.load(Order::Relaxed); }
+  long spinMaxUs() const { return spinMaxUs_.load(Order::Relaxed); }
+  int treeMin() const { return treeMin_.load(Order::Relaxed); }
 
 private:
   // Run init() once; concurrent callers wait for it.
   void initOnce();
   // Read the environment, and set the limit from OMP_THREAD_LIMIT.
   void init();
+  // Parsers: return false if `s` is invalid; otherwise set the setting,
+  // unless `apply` is false (validation only). Under optionMutex_.
+  bool setNumThreads(const char *s, bool apply);
+  bool setMaxActive(const char *s, bool apply);
+  bool setTreeMin(const char *s, bool apply);
+  bool setSpin(const char *s, bool apply);
+  // Settings with a source, indexed as kOptions in pompInit.inc.
+  static constexpr int kNumOptions = 4;
 
   Atomic<int> initialized_;          // 0: no, 1: in progress, 2: done.
+  // Serializes setOption (calls, and init's reads of the environment).
+  Mutex optionMutex_;
+  Source sources_[kNumOptions] = {};
+  bool ignoreEnv_ = false;           // POMP_IGNORE_ENV=1.
+  int displayEnv_ = 0;               // OMP_DISPLAY_ENV: 0, 1 (true), 2 (verbose).
+  Atomic<int> displayed_;
   int envNthreads_[kMaxActive] = {}; // OMP_NUM_THREADS, 0: unset.
-  int maxActive_ = 0;
+  // Whether OMP_NUM_THREADS listed more than one level, for the default of
+  // OMP_MAX_ACTIVE_LEVELS.
+  bool nthreadsNested_ = false;
+  Atomic<int> maxActive_;
   // Set once with the thread limit (setLimit).
   Mutex limitMutex_;
   Atomic<int> limit_; // Root included; 0 until set.
@@ -338,9 +369,10 @@ private:
   bool limitFromEnv_ = false;        // Under limitMutex_.
   Atomic<int> limitMismatchSeen_;
   Atomic<int> noLimitSeen_;
-  long spinUs_ = 0;
-  long spinMaxUs_ = 0;
-  int treeMin_ = 0; // Team size from which the tree barrier is used.
+  // Read at every wait: atomics, as POMP_SPIN may change while regions run.
+  Atomic<long> spinUs_;
+  Atomic<long> spinMaxUs_;
+  Atomic<int> treeMin_; // Team size from which the tree barrier is used.
 };
 
 // Ownership of slot 0; see "Root ownership".

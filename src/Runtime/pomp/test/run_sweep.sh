@@ -111,6 +111,9 @@ for v in tls key; do
     # No OMP_THREAD_LIMIT: the limit, and the descriptors, come from a call.
     run env POMP_SPIN=0 "$T/pomp_host_test" nolimit 50 $L
     run env POMP_SPIN=0 "$T/pomp_host_test" lateopen $L
+    run "$T/pomp_host_test" options $L
+    run env OMP_NUM_THREADS=3 POMP_SPIN=7 "$T/pomp_host_test" options $L
+    run env OMP_NUM_THREADS=3 POMP_SPIN=7 POMP_IGNORE_ENV=1 "$T/pomp_host_test" options $L
     run env POMP_SPIN=0 OMP_MAX_ACTIVE_LEVELS=2 "$T/pomp_host_test" lateopen $L
   done
 done

@@ -30,6 +30,9 @@
 //              call that sets the limit (and allocates the descriptors)
 //   rejoin   : S15, workers leave and enter again as the same slots, many
 //              times, while they sleep and are posted to (POMP_SPIN=0)
+//   options  : S16, pomp_set_option: values, errors, when it is allowed, and
+//              the environment's precedence (run with and without
+//              OMP_NUM_THREADS=3 POMP_SPIN=7, and with POMP_IGNORE_ENV=1)
 //   latency  : leader time in release, and to the next region
 //
 //===----------------------------------------------------------------------===//
@@ -863,12 +866,93 @@ static void test_rejoin(long cycles) {
   printf("rejoin: %ld cycles, errors %ld\n", cycles, errors);
 }
 
+// -----------------------------------------------------------------------------
+// S16: pomp_set_option, before the pool is first opened and after. The limit
+// comes from a call (no OMP_THREAD_LIMIT), so that this test also runs with
+// POMP_IGNORE_ENV. With OMP_NUM_THREADS set and POMP_IGNORE_ENV unset, the
+// environment wins: calls succeed but change nothing.
+// -----------------------------------------------------------------------------
+
+int omp_get_max_threads(void);
+int omp_get_max_active_levels(void);
+
+static void test_options(int lim) {
+  const char *env_nt = getenv("OMP_NUM_THREADS");
+  const char *ign = getenv("POMP_IGNORE_ENV");
+  int env_wins = env_nt && !(ign && *ign && strcmp(ign, "0"));
+  limit = lim;
+  // Unknown names and invalid values: refused, nothing changes.
+  CHECK(pomp_set_option("NO_SUCH_OPTION", "1") == POMP_ERR_LIMIT);
+  CHECK(pomp_set_option(NULL, "1") == POMP_ERR_LIMIT);
+  CHECK(pomp_set_option("POMP_SPIN", NULL) == POMP_ERR_LIMIT);
+  CHECK(pomp_set_option("POMP_SPIN", "fast") == POMP_ERR_LIMIT);
+  CHECK(pomp_set_option("POMP_SPIN", "auto:x") == POMP_ERR_LIMIT);
+  CHECK(pomp_set_option("POMP_SPIN", "-3") == POMP_ERR_LIMIT);
+  CHECK(pomp_set_option("OMP_NUM_THREADS", "0") == POMP_ERR_LIMIT);
+  CHECK(pomp_set_option("OMP_NUM_THREADS", "2x") == POMP_ERR_LIMIT);
+  CHECK(pomp_set_option("OMP_MAX_ACTIVE_LEVELS", "two") == POMP_ERR_LIMIT);
+  CHECK(pomp_set_option("POMP_TREE_BARRIER", "") == POMP_ERR_LIMIT);
+  // The limit, through pomp_set_option as through pomp_set_thread_limit.
+  CHECK(pomp_set_option("OMP_THREAD_LIMIT", "0") == POMP_ERR_LIMIT);
+  CHECK(pomp_get_thread_limit() == 0);
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%d", lim);
+  CHECK(pomp_set_option("OMP_THREAD_LIMIT", buf) == POMP_OK);
+  CHECK(pomp_get_thread_limit() == lim);
+  snprintf(buf, sizeof(buf), "%d", lim + 1);
+  CHECK(pomp_set_option("OMP_THREAD_LIMIT", buf) == POMP_ERR_LIMIT);
+  // Before the first open: every setting may change.
+  CHECK(pomp_set_option("OMP_MAX_ACTIVE_LEVELS", "2") == POMP_OK);
+  CHECK(omp_get_max_active_levels() == 2);
+  CHECK(pomp_set_option("OMP_MAX_ACTIVE_LEVELS", "1") == POMP_OK);
+  CHECK(omp_get_max_active_levels() == 1);
+  CHECK(pomp_set_option("POMP_TREE_BARRIER", "2") == POMP_OK);
+  CHECK(pomp_set_option("POMP_SPIN", "auto:20") == POMP_OK);
+  CHECK(pomp_set_option("OMP_NUM_THREADS", "2") == POMP_OK);
+  int want = env_wins ? omp_get_max_threads() : (lim < 2 ? lim : 2);
+  CHECK(omp_get_max_threads() == want);
+  CHECK(env_wins || omp_get_max_threads() == (lim < 2 ? lim : 2));
+  // Regions use the team size set.
+  CHECK(pomp_open_pool() == POMP_OK);
+  host_start();
+  host_enter_all();
+  wait_pool_size(lim - 1);
+  for (int i = 0; i < 100; ++i)
+    CHECK(run_region() == want);
+  // Once opened: only POMP_SPIN may change; the others are refused.
+  CHECK(pomp_set_option("OMP_NUM_THREADS", "1") == POMP_ERR_STATE);
+  CHECK(pomp_set_option("OMP_MAX_ACTIVE_LEVELS", "2") == POMP_ERR_STATE);
+  CHECK(pomp_set_option("POMP_TREE_BARRIER", "65") == POMP_ERR_STATE);
+  CHECK(omp_get_max_threads() == want);
+  CHECK(omp_get_max_active_levels() == 1);
+  // POMP_SPIN, while regions run: fixed, sleep at once, adaptive again.
+  static const char *const spins[] = {"0", "5", "auto", "auto:0", "200000",
+      "auto"};
+  for (int k = 0; k < 6; ++k) {
+    CHECK(pomp_set_option("POMP_SPIN", spins[k]) == POMP_OK);
+    for (int i = 0; i < 200; ++i)
+      CHECK(run_region() == want);
+  }
+  CHECK(pomp_close_pool() == POMP_OK);
+  host_stop();
+  CHECK(pomp_wait_pool_empty() == POMP_OK);
+  // Still refused once closed: the pool has been opened.
+  CHECK(pomp_set_option("OMP_NUM_THREADS", "2") == POMP_ERR_STATE);
+  printf("options: limit %d, env %s, errors %ld\n", lim,
+      env_wins ? "wins" : "does not win", errors);
+}
+
 int main(int argc, char **argv) {
   const char *test = argc > 1 ? argv[1] : "reuse";
   long n = argc > 2 ? atol(argv[2]) : 200;
   if (!strcmp(test, "nolimit")) {
     // Run without OMP_THREAD_LIMIT; argv[3] is the limit to set.
     test_nolimit(n, argc > 3 ? atoi(argv[3]) : 4);
+    return errors ? 1 : 0;
+  }
+  if (!strcmp(test, "options")) {
+    // Run without OMP_THREAD_LIMIT; argv[2] is the limit to set.
+    test_options(argc > 2 ? atoi(argv[2]) : 4);
     return errors ? 1 : 0;
   }
   if (!strcmp(test, "lateopen")) {

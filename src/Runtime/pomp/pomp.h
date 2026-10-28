@@ -123,6 +123,23 @@ int pomp_is_pool_open(void);
 // returning to the host.
 int pomp_pool_size(void);
 
+// Set one of pomp's settings from code, for hosts that cannot set
+// environment variables (a JVM, for one). `name` is the setting's environment
+// variable and `value` takes the same strings:
+//   OMP_THREAD_LIMIT      as pomp_set_thread_limit
+//   OMP_NUM_THREADS       "n" or "n1,n2"
+//   OMP_MAX_ACTIVE_LEVELS 1 or 2
+//   POMP_TREE_BARRIER     the smallest team that uses the tree barrier
+//   POMP_SPIN             "auto", "auto:MAX" or a number of microseconds
+// POMP_SPIN may be set at any time and applies to the next waits; the others
+// only before the first pomp_open_pool (POMP_ERR_STATE after). If the
+// environment variable is set, it takes precedence: the call returns POMP_OK
+// (or POMP_ERR_LIMIT for an invalid value, as always) and changes nothing, unless POMP_IGNORE_ENV=1 is set, which makes calls take
+// precedence over the environment (OMP_THREAD_LIMIT is then not read at all:
+// the host must set the limit). POMP_ERR_LIMIT: unknown name, or invalid
+// value (the setting is unchanged).
+int pomp_set_option(const char *name, const char *value);
+
 // Diagnosis: copy up to `n` of pomp's sleep and wake-up counters into
 // `counts` and return how many; 0 unless pomp is built with -DPOMP_STATS. In
 // order: regions forked with workers, idle sleeps, team-wait sleeps, posts,

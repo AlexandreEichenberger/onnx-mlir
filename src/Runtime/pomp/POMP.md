@@ -49,6 +49,15 @@ other than the two above aborts at run time.
 
 ## Environment
 
+Each setting below can also be set from code with `pomp_set_option(name, value)`, which takes the
+variable's name and the same strings; for hosts that cannot set environment variables, such as a
+JVM. A set environment variable takes precedence over calls (the call returns `POMP_OK` and
+changes nothing), so an operator can still override at launch; `POMP_IGNORE_ENV=1` reverses that,
+for hosts that must not be affected by variables meant for another OpenMP library in the process.
+`POMP_SPIN` may change at any time and applies to the next waits; the others only before the
+first `pomp_open_pool` (`POMP_ERR_STATE` after). The environment is read once, at pomp's first
+call.
+
 | Variable | Meaning |
 |---|---|
 | `OMP_THREAD_LIMIT` | In `[1, 64]`, initial thread included. Fixes the thread limit for the whole process, and takes precedence over `pomp_set_thread_limit` (see "The thread limit"). If unset, the first valid `pomp_set_thread_limit(limit)` gives it; until then the pool is closed, regions run on one thread, and `omp_get_max_threads` and `omp_get_thread_limit` return 1, with one warning on stderr. If set but invalid, it is ignored with a warning on stderr, as if unset. Nothing aborts |
@@ -56,6 +65,8 @@ other than the two above aborts at run time.
 | `OMP_MAX_ACTIVE_LEVELS` | 1 (default) or 2; 0 means 1 and larger values mean 2. As in libomp, a list in `OMP_NUM_THREADS` implies 2 |
 | `POMP_SPIN` | How long any wait spins before it sleeps: an idle worker, the leader at the join, a thread in a barrier. `auto` (default): each thread adapts, separately for waiting for work and for team waits, between 2 µs and 100 µs: after a wait of *d* µs, the next spin covers 2·*d* if *d* ≤ 100, and halves (down to 2) if *d* > 100. `auto:M` sets the ceiling to M µs (`auto:0` sleeps at once). A number N spins exactly N µs, without adapting (0 sleeps at once). Waits never yield. Why: on z a spinning thread slows an SMT sibling that computes by about 30%, so long waits should sleep; but a wake-up costs 2–10 µs, so short waits that sleep make the next ones longer, and the team keeps falling asleep (see `POMP_Z_Tuning.md`) |
 | `POMP_TREE_BARRIER` | Smallest team that uses the tree barrier instead of the central one. Default 5 on s390x, never elsewhere; 0 or 2 forces the tree, 65 (`POMP_MAX_THREADS` + 1) forces central |
+| `OMP_DISPLAY_ENV` | `TRUE` (or `1`) prints every setting on stderr once, at the first `pomp_open_pool`, in OpenMP's format, each followed by its source: default, environment, or the call that set it. `VERBOSE` adds pomp's build constants. Read from the environment only |
+| `POMP_IGNORE_ENV` | `1`: `pomp_set_option` and `pomp_set_thread_limit` take precedence over the environment, and `OMP_THREAD_LIMIT` is not read at all (the host must set the limit). Read from the environment only |
 
 ## Host interface (`pomp.h`)
 
@@ -316,6 +327,14 @@ the pool; `pomp_open_pool()` does.
 Level-1 and level-2 teams change size every cycle, so inner teams take workers outside their
 group, and workers move from one inner team to another. Every member must run the right work
 with a distinct tid.
+
+**S16. Settings from code** (`options`, run without `OMP_THREAD_LIMIT`; also with
+`OMP_NUM_THREADS` and `POMP_SPIN` set, and with `POMP_IGNORE_ENV=1`).
+
+`pomp_set_option` refuses unknown names and invalid values, sets the limit as
+`pomp_set_thread_limit` does, and changes every setting before the first open. After it, only
+`POMP_SPIN` may change, while regions run; the others return `POMP_ERR_STATE`. With the
+environment variable set, calls succeed and change nothing, unless `POMP_IGNORE_ENV=1`.
 
 ### Rules for the host
 

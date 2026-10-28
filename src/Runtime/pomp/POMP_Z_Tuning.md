@@ -25,39 +25,36 @@ tools: [test/ZBENCH.md](test/ZBENCH.md).
 
 Numbers from the latest runs, µs. **Default** means each runtime as an app gets it, with no
 environment set: threads `free` (Linux places them); libomp with `KMP_BLOCKTIME=200`, its
-default on Z; pomp at the commit named. **Best** means the best setting found for that scenario;
-the setting is named.
+default on Z; pomp with `POMP_SPIN=auto`, its default since commit f99008082 (an adaptive spin,
+section 6). **Best** means the best setting found for that scenario; the setting is named.
 
-pomp's default wait changed between runs: up to 4f8cb8704 it spun 200000 iterations before
-sleeping; from 802336526 it spins 5 µs (`POMP_SPIN=5`). Both are given where they differ.
-
-| Scenario | libomp default | libomp best (setting) | pomp default, 200000 it. / 5 µs | pomp best (setting) |
+| Scenario | libomp default | libomp best (setting) | pomp default (`auto`) | pomp best (setting) |
 |---|---|---|---|---|
-| Region overhead, T=2 | 1.38–1.46 | 0.70 (`chip-free`) | 0.88 / 0.79 | 0.26 (`pinned`); 0.30 unpinned (`chip1-free`) |
-| Region overhead, T=4 | 1.76–1.84 | 0.82 (`chip-free`) | 1.34 / 1.25 | 0.49 (`pinned`, `chip-free`) |
-| Region overhead, T=8 | 2.38–2.47 | 1.24 (`chip-free`) | 1.75 / 1.66 | 0.64 (`pinned`, 200000 it.); 0.73–0.78 unpinned (`chip-free`) |
-| Region overhead, T=16 | 2.63–2.83 | 2.40 (`cores-close`) | 2.26 / **5.48** | 1.54 (`pinned`, 200000 it.) |
-| Barrier, T=2 / 4 / 8 / 16 | 0.33 / 0.44 / 0.60 / 0.87 | 0.16 / 0.17 / 0.33 / 0.74 | 0.13 / 0.54 / 0.55 / 0.69 (both) | 0.05 / 0.16 / 0.21 / 0.42 |
-| Nested 8x8, hot teams | 11–15 | 8.0 (`pinned`) | 3.1 / **25.4** | 3.1 (`free`, 200000 it.) |
-| Waiting next to a computing SMT sibling, 200 µs of work, barrier (excess) | 113 | 25 (`KMP_BLOCKTIME=0`) | 113 (61 at `POMP_SPIN=200000` µs) / **25** | 25 (`POMP_SPIN` ≤ 5 µs) |
-| Same, short work (20 µs) | 11 | 4.7 (`KMP_BLOCKTIME=0`) | 10 / **4.9** | 4.5 (`POMP_SPIN=0`) |
-| Waiting on its own core, 20 µs of work, barrier (excess) | 0.8 | 0.8 (default) | 0.8 / 1.3 | 0.8 (`POMP_SPIN` ≥ 20 µs) |
+| Region overhead, T=2 | 1.38–1.52 | 0.70 (`chip-free`) | 0.93 | 0.26–0.28 (`pinned`); 0.33 unpinned (`chip-free`) |
+| Region overhead, T=4 | 1.76–1.95 | 0.82 (`chip1-free`) | 1.34 | 0.49 (`chip-free`) |
+| Region overhead, T=8 | 2.38–2.47 | 1.24 (`chip-free`) | 1.83 | 0.64–0.76 (`pinned`); 0.83 unpinned (`chip-free`) |
+| Region overhead, T=16 | 2.61–2.83 | 2.40–2.49 (`cores-close`) | 2.29 | 1.64 (`pinned`) |
+| Barrier, T=2 / 4 / 8 / 16 | 0.40 / 0.51 / 0.63 / 0.72 | 0.15 / 0.17 / 0.35 / 0.72 | 0.13 / 0.56 / 0.72 / 0.67 | 0.05 / 0.16 / 0.31 / 0.51 |
+| Nested 8x8, hot teams | 11–15 | 8.0 (`pinned`) | 3.4 | 3.1–3.3 (`free`, `pinned`) |
+| Waiting next to a computing SMT sibling, 200 µs of work, barrier (excess) | 113 | 25 (`KMP_BLOCKTIME=0`) | **26** | 26 (`auto`, or `POMP_SPIN=0`) |
+| Same, short work (20 µs) | 11 | 4.7 (`KMP_BLOCKTIME=0`) | 6.2 | 4.4 (`POMP_SPIN=0`) |
+| Waiting on its own core, 20 µs of work, barrier (excess) | 0.8 | 0.8 (default) | 0.8 | 0.8 (`auto`) |
 
 What this shows:
-- **The 5 µs spin fixes waiting next to a computing sibling** (excess 113 → 25 µs, like
-  libomp's `KMP_BLOCKTIME=0`), **but breaks back-to-back and nested regions:** T=16 overhead
-  2.3 → 5.5–6.6 µs, nested 8x8 3.1 → 25 µs, worse than libomp. A spin of 50 µs keeps those as
-  fast as before (T=16 2.2 µs, nested 8x8 3.3 µs) but gives back part of the sibling gain
-  (about 0.3 µs of the sibling's work per µs of spin). Section 6; the default is not settled.
+- **pomp's adaptive spin gets each case within a few µs of its best fixed setting,** where every
+  fixed spin, pomp's or libomp's, loses badly in one of them: libomp's default costs 113 µs next
+  to a computing sibling; `KMP_BLOCKTIME=0` (and pomp's earlier 5 µs) make back-to-back T=16 and
+  nested regions 2–10x slower. The one case it leaves: short uneven waits next to a sibling
+  (20 µs of work), 6–9 µs against 4–6 sleeping at once (section 6).
 
 What an app should do on Z:
 - **Keep the team on one chip** when it fits (12 CPUs here): `taskset`, a cpuset, or pinning.
   Left free, Linux spreads threads over chips, which doubles the cost of every handoff. This
   roughly halves libomp's overhead and is worth 2–3x for pomp at T ≤ 8.
-- **Match the wait to the work.** If threads that wait share a core with threads that still
-  compute (uneven work, two threads per core), sleep almost at once: libomp `KMP_BLOCKTIME=0`,
-  pomp `POMP_SPIN` ≤ 5. If regions follow each other with little work in between, or are
-  nested, spin: libomp's default, pomp `POMP_SPIN=50` to 100.
+- **pomp: keep the default `POMP_SPIN=auto`.** **libomp: choose `KMP_BLOCKTIME` for the workload:**
+  `0` if threads that wait share a core with threads that still compute (uneven work, two
+  threads per core); the default if regions follow each other with little work in between, or
+  are nested.
 - libomp's own binding: use `OMP_PLACES=cores OMP_PROC_BIND=close`, never `spread` (it puts
   threads on other chips on purpose).
 - At each runtime's best setting, pomp's overhead is 1.5–2.7x lower than libomp's; on real work
@@ -72,7 +69,7 @@ What an app should do on Z:
   Its wait policy in all timings: `KMP_BLOCKTIME=200` (spin 200 ms, then sleep).
 - Numbers come from runs at pomp commits fbae69c24, 7d6fe3917, aa1111068 and 4f8cb8704, with
   `POMP_SPIN` counting iterations (default 200000), and 802336526, 42a3b0b8e and
-  c8b0916b8, with `POMP_SPIN` in µs (default 5). pomp's numbers are
+  c8b0916b8, with `POMP_SPIN` in µs (default 5), and f99008082, with `POMP_SPIN=auto` (default). pomp's numbers are
   stable within about 5% across runs; libomp's free (unpinned) numbers vary by up to 15%.
 - Times are medians, in µs or ns.
 
@@ -350,8 +347,33 @@ Conclusions:
   first post when posted in turn, 8.8 µs through a 4-ary tree, 8.1 µs with a futex tree. The
   floor is the kernel's 1.6–2.4 µs from wake-up to running, not pomp's code: no mechanism makes
   waking 15 sleepers cheap, so the fix is not to let them fall asleep in short waits.
-- **Hence an adaptive spin per thread** (`POMP_SPIN=auto`, the default after commit c8b0916b8),
-  not yet timed on Z. A faster wake-up mechanism gains only 15–20% (below), so it was not done.
+- **Hence an adaptive spin per thread** (`POMP_SPIN=auto`, the default from commit f99008082).
+  A faster wake-up mechanism gains only 15–20% (below), so it was not done. Results, µs:
+
+  | | `auto` | best fixed (value) | 5 µs fixed | 200000 µs fixed |
+  |---|---|---|---|---|
+  | overhead T=8 / T=16, back to back | 1.78 / 2.30 | 1.60 (5) / 2.19 (20) | 1.60 / 3.85 | 1.81 / 2.51 |
+  | nested 4x4 / 8x8 | 2.25 / 3.84 | 1.94 (20) / 3.45 (100) | 2.45 / 23.1 | 2.50 / 3.90 |
+  | sleeps per region, T=16 / nested 8x8 | 0 / 0.01 | | 8.3 / 9.8 | 0 / 0 |
+  | sibling, 200 µs work, barrier / join,ldr-short (T=2) | 25.6 / 27.8 | 25.9 / 28.6 (0) | 26.7 / 28.6 | 63.8 / 90.0 |
+  | sibling, 20 µs work, barrier / join (T=2) | 6.2 / 7.0 | 4.4 / 4.1 (0) | 4.9 / 5.0 | 6.2 / 7.0 |
+  | own core, 20 µs work, join,ldr-short (T=2 / T=4) | 1.26 / 1.65 | 1.09 / 1.66 (20) | 3.0 / 3.2 | 1.23 / 1.63 |
+  | own core, 200 µs work (T=2 / T=4) | 9.4–14.8 / 16.7–17.1 | within 1–2 µs | | |
+
+  - **It meets the three goals:** back-to-back and nested regions do not sleep (0 and 0.01
+    sleeps per region) and are within 5–10% of the best fixed spin; long uneven waits next to a
+    sibling sleep and match sleeping at once (25.6 against 25.9 µs); on its own core it is
+    within 0.2 µs of the best fixed spin on short waits and within 1–2 µs on long ones.
+  - **What it gives up: short waits next to a computing sibling.** With 20 µs of work the wait
+    is about 18 µs, under the 100 µs ceiling, so `auto` spins through it, like 200000 (6.2
+    against 4.4 µs at `POMP_SPIN=0`). That is by design: it cannot tell a short wait next to a
+    computing sibling from a short wait between back-to-back regions, and sleeping in the
+    second costs 10x more. A ceiling of 20 µs (`POMP_SPIN=auto:20`) would sleep through these
+    waits but brings back the nested 8x8 slowdown (16.6 µs at a fixed 20).
+  - **One-level overhead at T ≤ 8 rose 5–15% since the 200000-iteration spin** (T=8 pinned 0.64 →
+    0.76 µs, barrier 0.21 → 0.31 µs; also at a fixed 5 µs, so it comes with the timed spin, not
+    with `auto`). Likely the clock read every 64 spins, or the clock read at the start of a
+    wait; not yet checked.
 - **So no single fixed spin time suits both kinds of workload.** Uneven compute next to a sibling
   wants ≤ 5 µs (each extra µs of spin costs about 0.3 µs of the sibling's work: 25 → 28 µs excess
   at 20 µs); back-to-back and nested regions want ≥ 50 µs. A faster wake-up would move the
@@ -393,10 +415,9 @@ Conclusions:
 
 ## Open items
 
-- **Time the adaptive spin on Z** (`POMP_SPIN=auto`, now the default; section 6). It succeeds if
-  T=16 and nested 8x8 are within about 10% of their best fixed spin with near-zero sleeps per
-  region, uneven work next to a sibling stays within a few µs of sleeping at once, and on its
-  own core within about 1 µs of the best fixed spin. Fallback: a fixed 100 µs default.
+- **Find the 5–15% one-level regression at T ≤ 8 since the timed spin** (section 6): time a
+  `SpinBudget` that reads the clock less often (every 256 or 1024 spins), and no clock read at
+  the start of a wait that ends within its first spins.
 - **Put L's order in pomp:** in `Team::leaderLaunch`, wake the workers on other chips first. pomp
   needs each worker's chip: from sysfs (`physical_package_id`, `book_id`, `drawer_id`) for the
   CPU a worker runs on (`sched_getcpu` at pool entry). Then time the one-level runs again.

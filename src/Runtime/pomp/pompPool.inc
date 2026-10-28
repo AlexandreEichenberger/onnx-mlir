@@ -210,6 +210,7 @@ int Pool::open() {
   if (!settings.limit())
     return POMP_ERR_LIMIT;
   state_.store(kOpen);
+  settings.displayOnce();
   return POMP_OK;
 }
 

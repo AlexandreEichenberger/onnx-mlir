@@ -95,7 +95,8 @@ private:
 class AdaptiveSpin {
 public:
   // The spin for the next wait; starts at the ceiling.
-  long next(long maxUs) const { return us_ ? us_ : maxUs; }
+  // POMP_SPIN may lower the ceiling at any time: never above it.
+  long next(long maxUs) const { return us_ && us_ < maxUs ? us_ : maxUs; }
   // After a wait of `waitedUs`, from its start to its end.
   void update(uint64_t waitedUs, long maxUs) {
     long cur = next(maxUs);
