@@ -154,7 +154,7 @@ void Team::leaderPartition() {
   for (int32_t t = 0; t < nth_; ++t) {
     int k = n / nth_ + (t < n % nth_ ? 1 : 0);
     SlotMask group = spare.lowest(k);
-    threads[slot].setPreferred(group);
+    member(slot).setPreferred(group);
     spare -= group;
     if (rest) {
       slot = rest.lowest();

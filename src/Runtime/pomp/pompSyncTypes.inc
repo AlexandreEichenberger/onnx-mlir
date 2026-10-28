@@ -34,8 +34,8 @@ struct Level;
 
 // Unique ids. The join and the tree barrier store and wait for ids that are
 // never stored twice, by any team: a team's ids start at its index (below
-// kTeams) and grow by kTeams, so they are its index modulo kTeams and only
-// grow. Flags are never reset and waits test for equality, so a value left
+// kIdStride) and grow by kIdStride, so they are its index modulo kIdStride
+// and only grow. Flags are never reset and waits test for equality, so a value left
 // by an earlier region, barrier or team never matches. Ids advance before
 // use, so none is 0, the initial value of every flag.
 //
@@ -46,9 +46,9 @@ struct Level;
 class UniqueId {
 public:
   constexpr UniqueId() = default;
-  // The first id of team `index`, in [0, kTeams).
+  // The first id of team `index`, in [0, kIdStride).
   static UniqueId seed(int32_t index) {
-    if (uint32_t(index) >= uint32_t(kTeams))
+    if (uint64_t(uint32_t(index)) >= kIdStride)
       fatal("unique id seed out of range");
     UniqueId id;
     id.v_ = uint64_t(index);
@@ -56,7 +56,7 @@ public:
   }
   // Move to the next id of the same team; return it.
   UniqueId advance() {
-    v_ += kTeams;
+    v_ += kIdStride;
     return *this;
   }
   bool operator==(UniqueId other) const { return v_ == other.v_; }
@@ -89,10 +89,11 @@ public:
   // Wait, as `self`, until `cond` holds.
   template <class Cond>
   void until(Thread &self, Cond cond);
-  // Wake those of the members in `slots` that sleep in a wait of this team.
-  void wake(SlotMask slots);
-  // Wake member `slot` if it sleeps in a wait of this team.
-  void wakeOne(int32_t slot);
+  // Wake those of the members of `team` in `slots` that sleep in a wait of
+  // this team (`team`'s own).
+  void wake(const Team &team, SlotMask slots);
+  // Wake member `t` if it sleeps in a wait of this team.
+  void wakeOne(Thread &t);
 
 private:
   // Clear the bits of the sleepers among `slots`; return those it cleared.
@@ -149,9 +150,10 @@ private:
 struct MemberBarrier {
   // Id of the current (or last) barrier; the same for every member.
   UniqueId currUniqueBarrierId;
-  // Slots, not tids, of the tree children and parent (unused for tid 0).
+  // Slots, not tids, of the tree children; the parent (unused for tid 0),
+  // which may be the leader, so not a slot.
   SlotMask children;
-  int32_t parent = 0;
+  Thread *parent = nullptr;
 };
 
 // Tree barrier flags of a member: `arrive` is written by the member and

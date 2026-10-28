@@ -317,12 +317,15 @@ int Settings::setLimit(long limit, bool fromEnv) {
   Team *m = reinterpret_cast<Team *>(p + tBytes);
   // Slot 0 may sleep before any pool thread enters; those init on entry.
   t[0].init();
-  // Set before Team::init, which reads index(). Not yet visible to other
-  // threads: the limit_ store below publishes the descriptors.
+  // Not yet visible to other threads: the limit_ store below publishes the
+  // descriptors.
   threads = t;
   teams = m;
-  for (int32_t i = 0; i <= limit; ++i)
-    m[i].init();
+  for (int32_t i = 0; i < limit; ++i)
+    t[i].setSlot(i);
+  for (int32_t i = 0; i < limit; ++i)
+    m[i].init(i, t[i]);
+  m[limit].init(limit, t[0]);
   for (int i = 0; i < kMaxActive; ++i) {
     int n = envNthreads_[i];
     nthreads_[i].store(n && n < limit ? n : int(limit));

@@ -71,9 +71,8 @@ private:
 // A team: written by its leader before the wake-up, read by the members.
 class Team {
 public:
-  // Once, at allocation, after teams is set: seed the unique ids with
-  // index().
-  void init();
+  // Once, at allocation: team `index` (see "Unique ids"), led by `leader`.
+  void init(int32_t index, Thread &leader);
 
   // Give the work to `workers` and wake them.
   void leaderLaunch(SlotMask workers, int32_t level, int32_t depth,
@@ -88,6 +87,8 @@ public:
 
   // Team size, leader included.
   int32_t size() const { return nth_; }
+  // The member of slot `slot`: in a team, slot 0 is its leader, a root.
+  Thread &member(int32_t slot) const;
   // Member `tid`'s region-stack entry.
   Level levelFor(int32_t tid) const;
   // Recruitment cache: the last pick for `want` workers if all are idle.
@@ -100,15 +101,13 @@ private:
   friend class TeamCentralBarrier;
   friend class TeamTreeBarrier;
 
-  // The leader's slot: 0 for the root's team.
-  int32_t leaderSlot() const;
+  // The leader's slot: 0 for a root's team.
+  int32_t leaderSlot() const { return leaderSlot_; }
   // Every member, leader included.
-  SlotMask members() const { return workers_ | SlotMask::of(leaderSlot()); }
+  SlotMask members() const { return workers_ | SlotMask::of(leaderSlot_); }
   // Level 1: split the idle pool threads among the members, as their
   // preferred workers at level 2.
   void leaderPartition();
-  // Index in `teams`: the leader's slot at level 2, the limit for the root.
-  int32_t index() const;
   // Whether a team of `nth` threads uses the tree barrier. Static, so a
   // barrier reads only the member's own entry.
   static bool usesTreeBarriers(int32_t nth);
@@ -125,6 +124,9 @@ private:
   // New cache line (a Team is line-aligned). The fields up to central_ take
   // one line on s390x, two where a line is 128 bytes.
 
+  // Set at allocation, never changed.
+  Thread *leader_ = nullptr;
+  int32_t leaderSlot_ = 0;
   // Work, written before the wake-up of the members.
   Microtask fn_ = nullptr;
   int32_t argc_ = 0;
@@ -168,8 +170,10 @@ public:
   void fork(
       int32_t gtid, int32_t want, Microtask fn, int32_t argc, void **argv);
 
-  // This thread's slot.
-  int32_t slot() const;
+  // This thread's slot: 0 for a root.
+  int32_t slot() const { return slot_; }
+  // At allocation: the slot of this descriptor.
+  void setSlot(int32_t slot) { slot_ = slot; }
 
   // Recruiter: assign the next work, and wake the thread.
   void assign(Team *team, int32_t tid);
@@ -228,6 +232,7 @@ private:
   // New line: private, and written at every barrier while the leader may
   // poll `sync`.
   alignas(kCacheLine) RegionStack regions_;
+  int32_t slot_ = 0; // Set at allocation.
   // kFree, kInPool or kLeaving; also serializes entries as this slot.
   Atomic<int> present_;
   bool initialized_ = false; // See init.
@@ -410,11 +415,6 @@ POMP_CONSTINIT Team *teams = nullptr;
 inline Team &rootTeam() { return teams[settings.limit()]; }
 inline Team &slotTeam(int32_t slot) { return teams[slot]; }
 
-inline int32_t Team::leaderSlot() const {
-  int32_t i = index();
-  return i == settings.limit() ? 0 : i;
+inline Thread &Team::member(int32_t slot) const {
+  return slot ? threads[slot] : *leader_;
 }
-
-// From the descriptors' addresses: no init needed.
-inline int32_t Team::index() const { return int32_t(this - teams); }
-inline int32_t Thread::slot() const { return int32_t(this - threads); }

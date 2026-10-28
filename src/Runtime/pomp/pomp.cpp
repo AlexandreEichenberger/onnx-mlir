@@ -53,8 +53,9 @@ namespace {
 // From pomp.h; at most 64, as slots are bits of one word.
 constexpr int kMaxThreads = POMP_MAX_THREADS;
 static_assert(kMaxThreads <= 64, "slots are bits of one 64-bit word");
-// Teams: one led by each slot at level 2, and the root's at level 1.
-constexpr int kTeams = kMaxThreads + 1;
+// Unique ids of a team grow by this; every team index is below it (see
+// "Unique ids" in pompSyncTypes.inc).
+constexpr uint64_t kIdStride = uint64_t(1) << 16;
 
 // Max shared args of an outlined fn (libomp's portable invoke allows 15).
 constexpr int kMaxArgs = 16;

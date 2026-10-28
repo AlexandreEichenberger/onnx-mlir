@@ -106,14 +106,14 @@ inline SlotMask TeamWait::claimSleepers(SlotMask slots) {
   return s ? sleepers_.clearAndReport(s) : SlotMask();
 }
 
-inline void TeamWait::wake(SlotMask slots) {
+inline void TeamWait::wake(const Team &team, SlotMask slots) {
   for (int32_t slot : claimSleepers(slots))
-    threads[slot].post();
+    team.member(slot).post();
 }
 
-inline void TeamWait::wakeOne(int32_t slot) {
-  if (claimSleepers(SlotMask::of(slot)))
-    threads[slot].post();
+inline void TeamWait::wakeOne(Thread &t) {
+  if (claimSleepers(SlotMask::of(t.slot())))
+    t.post();
 }
 
 // -----------------------------------------------------------------------------
@@ -129,13 +129,16 @@ inline UniqueId TeamJoin::workerDoneValue(const Team &team) {
   return team.join_.currUniqueJoinId_;
 }
 
-// After the store the leader may reuse the team: the wake-up that follows
-// uses only the team's address.
+// After the store the leader may reuse the team, and its thread may end: the
+// wake-up that follows reads only fields set at allocation (see "Root
+// blocks" in pompRegion.inc).
 inline void TeamJoin::workerFinish(Team &team, Thread &self, UniqueId done) {
+  Thread &leader = *team.leader_;
   self.sync().done.store(done);
-  team.wait_.wakeOne(team.leaderSlot());
+  team.wait_.wakeOne(leader);
 }
 
+// Workers are pool threads, never slot 0: `threads` is enough.
 inline void TeamJoin::leaderWait(Team &team, Thread &leader) {
   UniqueId done = team.join_.currUniqueJoinId_;
   for (int32_t slot : team.workers_)
@@ -171,10 +174,11 @@ inline void Team::leaderEndBarrier(UniqueId currUniqueBarrierId) {
 }
 
 // Join and tree ids share a seed: they go to different flags.
-inline void Team::init() {
-  int32_t i = index();
-  join_.seed(i);
-  tree_.seed(i);
+inline void Team::init(int32_t index, Thread &leader) {
+  leader_ = &leader;
+  leaderSlot_ = leader.slot();
+  join_.seed(index);
+  tree_.seed(index);
 }
 
 // -----------------------------------------------------------------------------
@@ -194,7 +198,7 @@ inline void TeamCentralBarrier::wait(
     // to the next barrier, and wake the members.
     count_.store(0, Order::Relaxed);
     epoch_.store(epoch + 1, Order::Release);
-    team.wait_.wake(team.members() - SlotMask::of(self.slot()));
+    team.wait_.wake(team, team.members() - SlotMask::of(self.slot()));
   } else {
     team.wait_.until(self, FlagLeaves(epoch_, epoch));
   }
@@ -237,8 +241,9 @@ inline MemberBarrier TeamTreeBarrier::enter(
     m.children = (workers - workers.lowest(first - 1)).lowest(n);
   if (tid != 0) {
     int32_t ptid = (tid - 1) / kTreeArity;
-    m.parent = ptid == 0 ? team.leaderSlot()
-                         : (workers - workers.lowest(ptid - 1)).lowest();
+    m.parent = ptid == 0
+                   ? team.leader_
+                   : &threads[(workers - workers.lowest(ptid - 1)).lowest()];
   }
   return m;
 }
@@ -264,12 +269,12 @@ void TeamTreeBarrier::wait(Team &team, Thread &self, Level &innermost) {
   if (innermost.tid != 0) {
     TreeFlags &flags = self.sync().tree;
     flags.arrive.store(v);
-    team.wait_.wake(SlotMask::of(m.parent));
+    team.wait_.wakeOne(*m.parent);
     team.wait_.until(self, FlagIs(flags.release, v));
   }
   // Release: pass it down to the children.
   for (int32_t c : m.children)
     threads[c].sync().tree.release.store(v);
   if (m.children)
-    team.wait_.wake(m.children);
+    team.wait_.wake(team, m.children);
 }
