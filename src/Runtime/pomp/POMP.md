@@ -114,7 +114,7 @@ and enters the pool, or gets `POMP_ERR_CLOSED` if no limit is known yet.
 
 ### Design goal: the leader never waits for workers
 
-The initial thread (the *leader*: the one that runs the model, slot 0) is on the critical path,
+The initial thread (the *leader*: a root that runs the model, slot 0 of its teams) is on the critical path,
 so nothing in the protocol makes it wait for workers to arrive or to leave:
 
 - **`pomp_close_pool` does not wait for anything.** It closes the pool with one store, claims
@@ -145,7 +145,9 @@ so nothing in the protocol makes it wait for workers to arrive or to leave:
 ### The thread limit
 
 The thread limit is the most threads a team can have, the initial thread included. It also
-bounds the slots, `[1, limit−1]`. pomp treats it as OpenMP's `thread-limit-var`: **it is set
+bounds the slots: slot 0 is the initial thread of a team, a role any host thread outside the
+pool takes in the teams it leads (each root has its own descriptor, see "Root descriptors"), and
+the pool threads are slots `[1, limit−1]`. pomp treats it as OpenMP's `thread-limit-var`: **it is set
 once per process and never changes**.
 
 Where it comes from, in order:

@@ -391,7 +391,7 @@ private:
   Atomic<int> maxActive_;
   // Set once with the thread limit (setLimit).
   Mutex limitMutex_;
-  Atomic<int> limit_; // Root included; 0 until set.
+  Atomic<int> limit_; // Slot 0 (a team's root) included; 0 until set.
   AtomicMask limitSlots_;
   Atomic<int> nthreads_[kMaxActive]; // Default team sizes.
   bool limitFromEnv_ = false;        // Under limitMutex_.

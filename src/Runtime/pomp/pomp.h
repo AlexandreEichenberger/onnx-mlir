@@ -23,8 +23,10 @@
 extern "C" {
 #endif
 
-// Maximum value of OMP_THREAD_LIMIT, including the initial thread (slot 0). The pool is
-// described by one 64-bit word, one bit per thread slot.
+// Maximum value of OMP_THREAD_LIMIT, including the initial thread. The pool is
+// described by one 64-bit word, one bit per thread slot: slot 0 is the
+// initial thread of a team, which any host thread outside the pool may be;
+// slots 1..limit-1 are the pool threads.
 #define POMP_MAX_THREADS 64
 
 // Return codes of the host interface.
