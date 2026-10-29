@@ -157,6 +157,11 @@ inline void ensureInit() {
 
 } // namespace
 
+// Every exported function, in one block: C linkage, as pomp.h declares the
+// pomp_* ones; and a definition whose signature drifts from its declaration is
+// then a compile error here, not a C++ overload missing at link time.
+extern "C" {
+
 // -----------------------------------------------------------------------------
 // Host interface: the pool (pomp.h)
 // -----------------------------------------------------------------------------
@@ -217,8 +222,6 @@ int pomp_get_stats(unsigned long long *counts, int n) {
 // -----------------------------------------------------------------------------
 // __kmpc entry points
 // -----------------------------------------------------------------------------
-
-extern "C" {
 
 // Often the first call into pomp. Needs no init: before init, no thread has a
 // descriptor, and a thread without one is slot 0, as any root.

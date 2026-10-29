@@ -9,8 +9,7 @@
 // =============================================================================
 //
 // Part of pomp.cpp: the settings, read from the environment once and set by
-// pomp_set_option, and the thread limit. Settings depends on no other pomp
-// type, so it comes first.
+// pomp_set_option, and the thread limit.
 //
 //===----------------------------------------------------------------------===//
 
@@ -67,7 +66,7 @@ private:
   // Settings with a source, indexed as kOptions below.
   static constexpr int kNumOptions = 4;
 
-  Atomic<int> frozen_;               // Set by the first open (freeze).
+  Atomic<int> frozen_; // Set by the first open (freeze).
   // Serializes setOption (calls, and init's reads of the environment).
   Mutex optionMutex_;
   Source sources_[kNumOptions] = {};
