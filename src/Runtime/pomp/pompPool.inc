@@ -207,19 +207,18 @@ void Pool::warnIfNeverOpened() {
 void Pool::init() { openMutex_.init(); }
 
 // One caller opens a cycle: the others find it open and get POMP_ERR_OPEN,
-// with its limit. The cycle's limit is set while the pool is closed, before
-// the state store that lets threads enter.
-int Pool::open(int *limit) {
+// with the limit. The first open fixes the limit and allocates, before the
+// state store that lets threads enter.
+int Pool::open(int fallback, int *limit) {
   if (Thread::callerInPomp())
     return POMP_ERR_STATE;
-  if (!limit || *limit < 0 || *limit > kMaxThreads)
+  if (!limit || fallback < 0 || fallback > kMaxThreads)
     return POMP_ERR_LIMIT;
   ScopedLock<Mutex> lock(openMutex_);
-  if (isOpen()) {
-    *limit = settings.limit();
+  *limit = settings.limit();
+  if (isOpen())
     return POMP_ERR_OPEN;
-  }
-  int rc = settings.openLimit(*limit);
+  int rc = settings.openLimit(fallback);
   if (rc != POMP_OK)
     return rc;
   *limit = settings.limit();
@@ -229,9 +228,8 @@ int Pool::open(int *limit) {
 }
 
 int Pool::enter(int32_t slot) {
-  if (!settings.capacityAcquire())
+  if (!settings.allocatedAcquire())
     return POMP_ERR_CLOSED; // No descriptors before the first open.
-  // Slots of the current cycle; one of an earlier, larger cycle is refused.
   if (slot < 1 || slot >= settings.limit())
     return POMP_ERR_SLOT;
   // Not from a pool thread, nor from inside a region.
@@ -288,13 +286,11 @@ int Pool::enter(int32_t slot) {
 }
 
 // Claim every idle pool thread, as a fork would, mark it released, and start
-// the wake-ups. Called once the pool is marked closed. All slots of the
-// descriptors, not only the cycle's: none outside it is idle, but this needs
-// no proof.
+// the wake-ups. Called once the pool is marked closed.
 void Pool::releaseIdle() {
   SlotMask old = busy_.load(), idle;
   do {
-    idle = settings.capacitySlots() - old - SlotMask::of(0);
+    idle = settings.limitSlots() - old - SlotMask::of(0);
   } while (idle && !busy_.compareExchangeWeak(old, old | idle));
   if (!idle)
     return;
@@ -310,8 +306,7 @@ int Pool::close() {
   if (Thread::callerInPomp())
     return POMP_ERR_STATE;
   // Mark closed first: a concurrent entry then backs out or is claimed below.
-  // Under the lock of open: an open sets the next cycle's limit only while
-  // the pool is closed.
+  // Under the lock of open, so that opens and closes are ordered.
   ScopedLock<Mutex> lock(openMutex_);
   state_.store(kClosed);
   releaseIdle();
@@ -321,13 +316,15 @@ int Pool::close() {
 int Pool::waitEmpty() {
   if (Thread::callerInPomp())
     return POMP_ERR_STATE;
-  int capacity = settings.capacityAcquire();
+  if (!settings.allocatedAcquire())
+    return POMP_OK; // Never opened: no pool thread.
+  int limit = settings.limit();
   // Wake any claimed thread still asleep, until all have left.
-  while (released_.load() & settings.capacitySlots()) {
+  while (released_.load() & settings.limitSlots()) {
     wakeReleased(kMaxThreads);
     sched_yield();
   }
-  for (int32_t slot = 1; slot < capacity; ++slot)
+  for (int32_t slot = 1; slot < limit; ++slot)
     spinUntil(NotLeaving(threads[slot]));
   return POMP_OK;
 }

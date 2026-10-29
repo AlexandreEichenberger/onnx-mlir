@@ -96,7 +96,7 @@ for v in tls key; do
         run $A2 "$T/pomp_host_test" nest
         run $A2 "$T/pomp_host_test" steal $((N / 4))
         # Host protocol. late and swap assume a slot 1 exists.
-        for sc in fresh reuse server overlap errors tworoots rootchurn pushfirst cyclelimit; do
+        for sc in fresh reuse server overlap errors tworoots rootchurn pushfirst openrace; do
           run $E "$T/pomp_host_test" $sc
         done
         [ $L -ge 2 ] && run $E "$T/pomp_host_test" late
@@ -111,6 +111,7 @@ for v in tls key; do
     done
     # No OMP_THREAD_LIMIT: the limit, and the descriptors, come from a call.
     run env POMP_SPIN=0 "$T/pomp_host_test" nolimit 50 $L
+    run "$T/pomp_host_test" fewer 200 $L
     run env POMP_SPIN=0 "$T/pomp_host_test" lateopen $L
     run "$T/pomp_host_test" options $L
     run env OMP_NUM_THREADS=3 POMP_SPIN=7 "$T/pomp_host_test" options $L

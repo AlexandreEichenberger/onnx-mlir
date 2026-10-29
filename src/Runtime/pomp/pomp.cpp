@@ -130,12 +130,12 @@ namespace {
 
 int pomp_get_thread_limit(void) {
   settings.ensureInit();
-  return settings.threadLimit();
+  return settings.limit();
 }
 
-int pomp_open_pool(int *limit) {
+int pomp_open_pool(int fallback_limit, int *limit) {
   settings.ensureInit();
-  return pool.open(limit);
+  return pool.open(fallback_limit, limit);
 }
 
 int pomp_enter_pool(int slot) {
@@ -312,7 +312,7 @@ int omp_get_max_threads(void) {
 
 int omp_get_thread_limit(void) {
   settings.ensureInit();
-  int n = settings.threadLimit();
+  int n = settings.limit();
   if (n > 0)
     return n;
   settings.warnNoLimit();

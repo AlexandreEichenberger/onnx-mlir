@@ -277,7 +277,7 @@ public:
   void init();
   // The host calls of pomp.h, in the order of a cycle: pomp_open_pool,
   // pomp_enter_pool, pomp_close_pool and pomp_wait_pool_empty.
-  int open(int *limit);
+  int open(int fallback, int *limit);
   int enter(int32_t slot);
   int close();
   int waitEmpty();
@@ -346,34 +346,20 @@ public:
     if (initialized_.load(Order::Acquire) != 2)
       initOnce();
   }
-  // pomp_open_pool, while the pool is closed: set the limit of the cycle it
-  // opens from the request `req`, in [0, kMaxThreads] (0: OMP_THREAD_LIMIT).
-  // The first one fixes the thread limit and allocates the pool's
-  // descriptors. POMP_ERR_LIMIT: no limit known; POMP_ERR_NOMEM.
-  int openLimit(int req);
+  // pomp_open_pool, while the pool is closed: the limit is OMP_THREAD_LIMIT if
+  // set, else `fallback`, in [0, kMaxThreads] (0: none). The first successful
+  // call fixes it and allocates the pool's descriptors. POMP_ERR_LIMIT: no
+  // limit; POMP_ERR_NOMEM.
+  int openLimit(int fallback);
 
-  // Two limits (see "The thread limit" in POMP.md):
-  // - The thread limit, OpenMP's thread-limit-var: OMP_THREAD_LIMIT, else the
-  //   limit of the first open. Fixed by the first open, the capacity of the
-  //   pool's descriptors. 0 while unknown.
-  // - The limit of the current cycle, at most the thread limit: what its open
-  //   asked for, or OMP_THREAD_LIMIT before the first open. It caps team
-  //   sizes and the slots that may enter. 0 while unknown.
-  // Both include slot 0, a team's root.
-  int threadLimit() const {
-    int c = capacity_.load(Order::Relaxed);
-    return c ? c : envLimit_;
-  }
+  // The thread limit, OpenMP's thread-limit-var, slot 0 (a team's root)
+  // included: OMP_THREAD_LIMIT if set, else the fallback of the first
+  // successful open. 0 while neither is known; never changes once set.
   int limit() const { return limit_.load(Order::Relaxed); }
-  // The capacity of the descriptors, 0 before the first open; acquired
-  // before reading them.
-  int capacityAcquire() const { return capacity_.load(Order::Acquire); }
-  // Slots 0..limit-1, of the current cycle: those forks recruit.
+  // Whether the pool's descriptors exist; acquired before reading them.
+  bool allocatedAcquire() const { return allocated_.load(Order::Acquire); }
+  // Slots 0..limit-1.
   SlotMask limitSlots() const { return limitSlots_.load(Order::Relaxed); }
-  // Slots 0..capacity-1: those a close releases, of any cycle.
-  SlotMask capacitySlots() const {
-    return SlotMask::below(capacity_.load(Order::Relaxed));
-  }
   // Warn once that no limit is known.
   void warnNoLimit();
   // Default team size of a fork at `active` enclosing active levels.
@@ -397,8 +383,8 @@ private:
   // Under limitMutex_: allocate the pool's descriptors for `n` slots, once;
   // false if out of memory.
   bool allocate(int n);
-  // Under limitMutex_: make `lim` the limit of the current cycle.
-  void applyLimit(int lim);
+  // Under limitMutex_: make `lim` the limit, once.
+  void setLimit(int lim);
   // Parsers: return false if `s` is invalid (the setting is unchanged);
   // otherwise set the setting. Under optionMutex_.
   bool setNumThreads(const char *s);
@@ -419,13 +405,13 @@ private:
   // OMP_MAX_ACTIVE_LEVELS.
   bool nthreadsNested_ = false;
   Atomic<int> maxActive_;
-  // The limits (see limit()); written under limitMutex_.
+  // The limit (see limit()); written under limitMutex_.
   Mutex limitMutex_;
-  int envLimit_ = 0;      // OMP_THREAD_LIMIT if valid, else 0; set at init.
-  Atomic<int> capacity_;  // Of the descriptors; 0 before the first open.
-  Atomic<int> limit_;     // Of the current cycle.
-  AtomicMask limitSlots_; // Slots 0..limit_-1.
+  Atomic<int> limit_;
+  AtomicMask limitSlots_;            // Slots 0..limit_-1.
   Atomic<int> nthreads_[kMaxActive]; // Default team sizes, clamped to limit_.
+  Atomic<int> allocated_;            // The pool's descriptors exist.
+  bool limitFromEnv_ = false;        // For OMP_DISPLAY_ENV; set at init.
   Atomic<int> noLimitSeen_;
   // Read at every wait: atomics, as POMP_SPIN may change while regions run.
   Atomic<long> spinUs_;

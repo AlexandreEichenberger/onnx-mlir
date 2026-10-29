@@ -136,8 +136,8 @@ static void *member(void *arg) {
 }
 
 static void enter_all(void) {
-  int i, n = 0; // The whole thread limit.
-  if (pomp_open_pool(&n) != POMP_OK) {
+  int i, n; // OMP_THREAD_LIMIT, required here (see start).
+  if (pomp_open_pool(0, &n) != POMP_OK) {
     fprintf(stderr, "open failed\n");
     exit(1);
   }

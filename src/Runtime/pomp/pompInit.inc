@@ -76,8 +76,8 @@ void Settings::init() {
       fprintf(stderr, "pomp: warning: %s=\"%s\" is invalid and ignored\n",
           name, s);
 
-  // OMP_THREAD_LIMIT caps every open, and is the limit until the first one;
-  // nothing is allocated before it (see openLimit).
+  // OMP_THREAD_LIMIT, if valid, is the limit; nothing is allocated before
+  // the first open (see openLimit).
   if ((s = getenv("OMP_THREAD_LIMIT"))) {
     const char *end;
     long v = parseInt(s, &end);
@@ -88,7 +88,8 @@ void Settings::init() {
           s, kMaxThreads);
     else {
       ScopedLock<Mutex> lock(limitMutex_);
-      applyLimit(envLimit_ = int(v));
+      limitFromEnv_ = true;
+      setLimit(int(v));
     }
   }
 }
@@ -146,12 +147,9 @@ void Settings::displayOnce() {
   char v[64];
   fprintf(stderr, "OPENMP DISPLAY ENVIRONMENT BEGIN\n");
   fprintf(stderr, "  %-22s = '%s'\n", "_OPENMP", "pomp (onnx-mlir)");
-  snprintf(v, sizeof(v), "'%d'", threadLimit());
-  fprintf(stderr, "  %-22s = %-12s [%s]\n", "OMP_THREAD_LIMIT", v,
-      envLimit_ ? "environment" : "pomp_open_pool");
   snprintf(v, sizeof(v), "'%d'", limit());
-  fprintf(stderr, "  %-22s = %-12s [%s]\n", "[pomp] cycle limit", v,
-      "pomp_open_pool");
+  fprintf(stderr, "  %-22s = %-12s [%s]\n", "OMP_THREAD_LIMIT", v,
+      limitFromEnv_ ? "environment" : "pomp_open_pool fallback");
   // Team sizes as used: clamped to the limit.
   snprintf(v, sizeof(v), "'%d,%d'", numThreads(0), numThreads(1));
   fprintf(stderr, "  %-22s = %-12s [%s]\n", "OMP_NUM_THREADS", v,
@@ -188,7 +186,7 @@ void Settings::displayOnce() {
 }
 
 // "n" or "n1,n2"; missing entries repeat the last one. Clamped to the limit
-// once it is known (applyLimit), or now if it is.
+// once it is known (setLimit), or now if it is.
 bool Settings::setNumThreads(const char *s) {
   int vals[kMaxActive] = {};
   int n = 0;
@@ -206,7 +204,7 @@ bool Settings::setNumThreads(const char *s) {
     return false;
   for (int i = n; i < kMaxActive; ++i)
     vals[i] = vals[i - 1];
-  // Under limitMutex_ too: applyLimit reads envNthreads_.
+  // Under limitMutex_ too: setLimit reads envNthreads_.
   ScopedLock<Mutex> lock(limitMutex_);
   for (int i = 0; i < kMaxActive; ++i)
     envNthreads_[i] = vals[i];
@@ -270,23 +268,17 @@ bool Settings::setSpin(const char *s) {
   return true;
 }
 
-int Settings::openLimit(int req) {
+int Settings::openLimit(int fallback) {
   ScopedLock<Mutex> lock(limitMutex_);
-  int cap = capacity_.load(Order::Relaxed);
-  // The ceiling: the thread limit once fixed, else OMP_THREAD_LIMIT.
-  int ceil = cap ? cap : envLimit_;
-  int lim = req ? req : ceil;
-  if (!lim)
-    return POMP_ERR_LIMIT;
-  if (ceil && lim > ceil)
-    lim = ceil;
-  if (!cap) {
-    // The first open: the thread limit is OMP_THREAD_LIMIT if set, else
-    // this limit. On failure nothing is fixed, so a later open may retry.
-    if (!allocate(envLimit_ ? envLimit_ : lim))
-      return POMP_ERR_NOMEM;
+  if (!limit()) {
+    if (!fallback)
+      return POMP_ERR_LIMIT;
+    setLimit(fallback);
   }
-  applyLimit(lim);
+  // The first open allocates. On failure the limit stays as set, and a later
+  // open may retry.
+  if (!allocated_.load(Order::Relaxed) && !allocate(limit()))
+    return POMP_ERR_NOMEM;
   return POMP_OK;
 }
 
@@ -301,7 +293,7 @@ bool Settings::allocate(int n) {
     return false;
   Thread *t = reinterpret_cast<Thread *>(p);
   Team *m = reinterpret_cast<Team *>(p + tBytes);
-  // Not yet visible to other threads: the capacity_ store below publishes
+  // Not yet visible to other threads: the allocated_ store below publishes
   // the descriptors. Pool threads init their sleep on entry.
   threads = t;
   teams = m;
@@ -309,15 +301,12 @@ bool Settings::allocate(int n) {
     t[i].initIdentity(i, nullptr, &m[i]);
     m[i].init(i, t[i]);
   }
-  // Publishes the descriptors (see capacityAcquire).
-  capacity_.store(n, Order::Release);
+  // Publishes the descriptors (see allocatedAcquire).
+  allocated_.store(1, Order::Release);
   return true;
 }
 
-// The pool is closed, or not yet open, when this runs at an open; forks read
-// the default team sizes, and recruit within limitSlots_, at any time. Each is
-// a single atomic, so a fork sees an old or a new value, either in range.
-void Settings::applyLimit(int lim) {
+void Settings::setLimit(int lim) {
   for (int i = 0; i < kMaxActive; ++i) {
     int n = envNthreads_[i];
     nthreads_[i].store(n && n < lim ? n : lim);

@@ -175,7 +175,7 @@ for L in 2 3 4 8 16 17; do
       [ $L -ge 3 ] && run $E OMP_MAX_ACTIVE_LEVELS=2 "$T/pomp_test" lockstep $((N / 8))
       run $E OMP_MAX_ACTIVE_LEVELS=2 "$T/pomp_host_test" nest
       run $E OMP_MAX_ACTIVE_LEVELS=2 "$T/pomp_host_test" steal $((N / 4))
-      for sc in fresh reuse server late overlap errors tworoots rootchurn pushfirst cyclelimit; do
+      for sc in fresh reuse server late overlap errors tworoots rootchurn pushfirst openrace; do
         run $E "$T/pomp_host_test" $sc
       done
       [ $L -ge 3 ] && run $E "$T/pomp_host_test" swap
@@ -187,6 +187,7 @@ for L in 2 3 4 8 16 17; do
   done
   # No OMP_THREAD_LIMIT: the limit, and the descriptors, come from a call.
   run env POMP_SPIN=0 "$T/pomp_host_test" nolimit 50 $L
+  run "$T/pomp_host_test" fewer 200 $L
   run env POMP_SPIN=0 "$T/pomp_host_test" lateopen $L
   run "$T/pomp_host_test" options $L
   run env OMP_NUM_THREADS=3 POMP_SPIN=7 "$T/pomp_host_test" options $L
