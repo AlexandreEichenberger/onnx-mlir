@@ -14,21 +14,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-// -----------------------------------------------------------------------------
-// Terms used in Pool.
-//
-// Idle: a pool thread in no team, waiting for work; its busy bit is clear.
-//
-// Recruit: a fork claims idle pool threads as its workers, setting their busy
-//   bits. After the join, they are returned: idle again.
-//
-// Release: the pool close claims every idle pool thread, as a fork would, but
-//   sets its released bit instead of giving it work. Threads in a team are
-//   released when returned.
-//
-// Leave: a released thread returns from pomp_enter_pool to the host.
-// -----------------------------------------------------------------------------
-
+// The pool: which pool threads are idle, sleeping or released, and whether it
+// is open.
 class Pool {
 public:
   // At init: the lock of open and close.
@@ -92,8 +79,9 @@ POMP_CONSTINIT Pool pool;
 // -----------------------------------------------------------------------------
 // Wake-up and sleep
 //
-// An idle pool thread spins on its `go` epoch and its `released` bit, then
-// sleeps with its bit set in `sleeping`. A waker publishes, then posts only to
+// An idle pool thread spins on its `go` epoch, which moves for work and for
+// release alike, then sleeps with its bit set in `sleeping`. A waker
+// publishes, then posts only to
 // the sleepers whose bit it clears. Waking spinning threads costs one load of
 // `sleeping`, and no system call.
 // -----------------------------------------------------------------------------
@@ -130,35 +118,25 @@ void Pool::wakeReleased(int n) {
   }
 }
 
-// Wait for work or for release. Return true for work, with `last` updated to
-// the new epoch, and false when a release has claimed this thread.
+// Wait for the epoch to move. Return true for work, false when a release has
+// claimed this thread; `last` gets the new epoch. Work and release never come
+// together: both claim the busy bit, so the epoch moves once per claim.
 bool Pool::waitWork(Thread &t, SlotMask self, uint64_t &last) {
   bool adapt = settings.spinAdaptive();
   long maxUs = settings.spinMaxUs();
   uint64_t t0 = adapt ? nowUs() : 0;
+  uint64_t g = last;
   for (SpinBudget spin(adapt ? t.idleSpin_.next(maxUs) : settings.spinUs());
-       spin.more();) {
-    uint64_t g = t.epoch(Order::Acquire);
-    if (g != last) {
-      last = g;
-      if (adapt)
-        t.idleSpin_.update(nowUs() - t0, maxUs);
-      return true;
-    }
-    if (released_.load(Order::Relaxed) & self)
-      return false;
+       spin.more() && (g = t.epoch(Order::Acquire)) == last;)
     relax();
-  }
   // Sleep: set our bit, then re-check. A waker publishes, then reads
   // `sleeping`; all seq_cst, so either we see its publish or it sees our
   // bit: no wake-up is lost.
-  uint64_t g;
-  for (;;) {
+  while (g == last) {
     POMP_STAT(kStatIdleSleeps);
     sleeping_.fetchSet(self);
     g = t.epoch();
-    bool rel = bool(released_.load() & self);
-    if (g != last || rel) {
+    if (g != last) {
       // Leave the sleepers. If a waker cleared our bit first, it has posted
       // or will: wait for that post, so that it does not stay pending and
       // end a later sleep of this thread.
@@ -169,14 +147,10 @@ bool Pool::waitWork(Thread &t, SlotMask self, uint64_t &last) {
     // A post only means "re-check": it may be meant for an earlier sleep.
     t.waitPost();
     g = t.epoch();
-    rel = bool(released_.load() & self);
-    if (g != last || rel)
-      break;
   }
-  if (g == last)
-    return false;
-  // Work and release never come together: both claim the busy bit.
   last = g;
+  if (t.assignedRelease())
+    return false;
   if (adapt)
     t.idleSpin_.update(nowUs() - t0, maxUs);
   return true;
@@ -275,16 +249,14 @@ bool Pool::allocate(int n) {
     return false;
   Thread *t = reinterpret_cast<Thread *>(p);
   Team *m = reinterpret_cast<Team *>(p + tBytes);
-  // Not yet visible to other threads: the allocated_ store below publishes
-  // the descriptors. Pool threads init their sleep on entry.
+  // Not yet visible to other threads: open publishes them, with allocated_,
+  // once the limit is set. Pool threads init their sleep on entry.
   threads = t;
   teams = m;
   for (int32_t i = 1; i < n; ++i) {
     t[i].initIdentity(i, nullptr, &m[i]);
     m[i].init(i, t[i]);
   }
-  // Publishes the descriptors (see allocatedAcquire).
-  allocated_.store(1, Order::Release);
   return true;
 }
 
@@ -310,6 +282,9 @@ int Pool::open(int fallback, int *limit) {
       return POMP_ERR_NOMEM;
     if (!settings.limit())
       settings.setLimit(lim);
+    // Publishes the descriptors, and the limit: an entry that sees them also
+    // sees the limit, so its slot check is right (see allocatedAcquire).
+    allocated_.store(1, Order::Release);
   }
   *limit = settings.limit();
   // Freeze before the store that lets forks recruit (see Settings::freeze).
@@ -376,8 +351,8 @@ int Pool::enter(int32_t slot) {
   return POMP_OK;
 }
 
-// Claim every idle pool thread, as a fork would, mark it released, and start
-// the wake-ups. Called once the pool is marked closed.
+// Claim every idle pool thread, as a fork would, mark it released, assign it
+// no team, and start the wake-ups. Called once the pool is marked closed.
 void Pool::releaseIdle() {
   SlotMask old = busy_.load(), idle;
   do {
@@ -386,7 +361,9 @@ void Pool::releaseIdle() {
   if (!idle)
     return;
   released_.fetchSet(idle);
-  // Spinning threads see their bit and leave, waking sleepers as they go. If
+  for (int32_t slot : idle)
+    threads[slot].assign(nullptr, 0);
+  // Spinning threads see their epoch move and leave, waking sleepers as they go. If
   // all claimed threads sleep, post to one to start that chain.
   if ((sleeping_.load() & idle) == idle)
     wakeSleepers(SlotMask::of(idle.lowest()));

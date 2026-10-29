@@ -195,10 +195,12 @@ public:
     return nth;
   }
 
-  // Recruiter: assign the next work, and wake the thread.
+  // Recruiter: assign the next work, and wake the thread. Release: assign no
+  // team.
   void assign(Team *team, int32_t tid);
-  // Pool thread: the wake-up epoch, and its assignment.
+  // Pool thread: the wake-up epoch, and its assignment; no team once released.
   uint64_t epoch(Order o = Order::SeqCst) const { return wake_.go.load(o); }
+  bool assignedRelease() const { return !wake_.team; }
   Team &assignedTeam() const { return *wake_.team; }
   int32_t assignedTid() const { return wake_.tid; }
 
@@ -235,11 +237,11 @@ private:
   // Wake-up and team words, on one line, used in turn: the recruiter writes
   // it only while the thread is idle, the team only while it runs the work.
   struct alignas(kCacheLine) WakeLine {
-    // The epoch the pool thread waits on. Incremented by 1 by
-    // the recruiter, then by 1 by the team after the join. The pool thread
-    // spins on it, then sleeps if it does not change.
+    // The epoch the pool thread waits on. Incremented by 1 by whoever claimed
+    // the idle thread: a recruiter, or a release. The pool thread spins on
+    // it, then sleeps if it does not change.
     Atomic<uint64_t> go;
-    // Assignment, written before `go`.
+    // Assignment, written before `go`; no team for a release.
     Team *team = nullptr;
     SlotMask preferred;
     int32_t tid = 0;
