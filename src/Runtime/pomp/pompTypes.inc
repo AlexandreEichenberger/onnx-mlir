@@ -308,8 +308,8 @@ private:
   // Post to the sleepers among `workers` whose bit this call clears.
   int wakeSleepers(SlotMask workers);
 
-  // Slot i is out iff it is an idle pool thread.
-  alignas(kCacheLine) AtomicMask busy_{SlotMask::below(64)};
+  // Slot i is out iff it is an idle pool thread. Every slot starts busy.
+  alignas(kCacheLine) AtomicMask busy_{SlotMask::below(kMaxThreads)};
   // Slot i is in while pool thread i sleeps, or is about to.
   alignas(kCacheLine) AtomicMask sleeping_;
   // Slot i is in from the release that claimed pool thread i until it leaves.
@@ -348,8 +348,8 @@ public:
   }
   // pomp_open_pool, while the pool is closed: the limit is OMP_THREAD_LIMIT if
   // set, else `fallback`, in [0, kMaxThreads] (0: none). The first successful
-  // call fixes it and allocates the pool's descriptors. POMP_ERR_LIMIT: no
-  // limit; POMP_ERR_NOMEM.
+  // call allocates the pool's descriptors, and then fixes it. POMP_ERR_LIMIT:
+  // no limit; POMP_ERR_NOMEM, with nothing fixed.
   int openLimit(int fallback);
 
   // The thread limit, OpenMP's thread-limit-var, slot 0 (a team's root)

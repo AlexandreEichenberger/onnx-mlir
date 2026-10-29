@@ -39,6 +39,7 @@ inline void Thread::init() {
 }
 
 // Concurrent first calls wait for the one that does it.
+// Initialized values: 0: no, 1: in progress, 2: done.
 void Settings::initOnce() {
   int expected = 0;
   if (initialized_.compareExchange(expected, 1)) {
@@ -73,8 +74,8 @@ void Settings::init() {
       "OMP_MAX_ACTIVE_LEVELS", "POMP_TREE_BARRIER", "POMP_SPIN"};
   for (const char *name : names)
     if ((s = getenv(name)) && setOption(name, s, kEnv) != POMP_OK)
-      fprintf(stderr, "pomp: warning: %s=\"%s\" is invalid and ignored\n",
-          name, s);
+      fprintf(
+          stderr, "pomp: warning: %s=\"%s\" is invalid and ignored\n", name, s);
 
   // OMP_THREAD_LIMIT, if valid, is the limit; nothing is allocated before
   // the first open (see openLimit).
@@ -132,7 +133,7 @@ int Settings::setOption(const char *name, const char *value, Source from) {
 
 namespace {
 const char *sourceName(Settings::Source s) {
-  return s == Settings::kEnv ? "environment"
+  return s == Settings::kEnv    ? "environment"
          : s == Settings::kCall ? "pomp_set_option"
                                 : "default";
 }
@@ -270,15 +271,18 @@ bool Settings::setSpin(const char *s) {
 
 int Settings::openLimit(int fallback) {
   ScopedLock<Mutex> lock(limitMutex_);
-  if (!limit()) {
-    if (!fallback)
-      return POMP_ERR_LIMIT;
-    setLimit(fallback);
-  }
-  // The first open allocates. On failure the limit stays as set, and a later
-  // open may retry.
-  if (!allocated_.load(Order::Relaxed) && !allocate(limit()))
+  if (allocated_.load(Order::Relaxed))
+    return POMP_OK;
+  // The first open: allocate for OMP_THREAD_LIMIT, else for `fallback`, and
+  // only then fix the limit. On failure nothing is fixed, so a later open may
+  // retry, with another fallback.
+  int lim = limit() ? limit() : fallback;
+  if (!lim)
+    return POMP_ERR_LIMIT;
+  if (!allocate(lim))
     return POMP_ERR_NOMEM;
+  if (!limit())
+    setLimit(lim);
   return POMP_OK;
 }
 

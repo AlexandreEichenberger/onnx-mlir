@@ -894,7 +894,8 @@ ends of every IV type.
 
 **Failures and resources.** pomp allocates memory in two places, and never frees it:
 - the pool's descriptors, once, at the first open. If that fails, `pomp_open_pool` returns
-  `POMP_ERR_NOMEM`, the pool stays closed and no thread limit is fixed;
+  `POMP_ERR_NOMEM` and the pool stays closed; its fallback is not kept, so a later open may
+  retry, with another one;
 - one root descriptor per host thread running regions at once, at the first region of a thread
   when none is free (about 3 KB on s390x). If that fails, pomp aborts, as an entry point of
   compiled code cannot report an error.

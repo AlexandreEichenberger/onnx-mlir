@@ -97,7 +97,10 @@ extern "C" {
 // regions at once, each as the initial thread of its own regions: each
 // region gets the idle pool threads it can, up to the thread limit, so that
 // together they may run more threads than the limit. Each such thread has a
-// small descriptor, reused by another thread once it ends.
+// small descriptor (about 3 KB on s390x), allocated at its first parallel
+// region and reused by another thread once it ends. If it cannot be
+// allocated, pomp prints an error on stderr and aborts the process: the
+// compiled code that starts a region has no way to report an error.
 
 //===----------------------------------------------------------------------===//
 // Interface calls
@@ -117,7 +120,7 @@ extern "C" {
 // POMP_ERR_LIMIT: `limit` is null, `fallback_limit` is out of range, or no
 // limit is known; the pool stays closed.
 // POMP_ERR_NOMEM: the first open cannot allocate pomp's descriptors; the pool
-// stays closed, and a later open may try again.
+// stays closed, its fallback is not kept, and a later open may try again.
 // POMP_ERR_STATE: called from a pool thread or inside a parallel region.
 // Does not wait for anything: threads of the previous cycle still leaving are
 // never used.
