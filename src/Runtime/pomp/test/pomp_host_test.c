@@ -33,8 +33,8 @@
 //   options  : S16, pomp_set_option: values, errors, when it is allowed, and
 //              that calls override the environment (run with and without
 //              OMP_NUM_THREADS=3 POMP_SPIN=7)
-//   rootchurn: S17, host threads come and go; their root blocks are reused
-//   latepost : S18, root blocks reused while workers may still wake their
+//   rootchurn: S17, host threads come and go; their Roots are reused
+//   latepost : S18, Roots reused while workers may still wake their
 //              last owner (POMP_SPIN=0)
 //   pushfirst: S19, a pushed team size as a thread's first call; a root that
 //              enters the pool and is a root again
@@ -572,9 +572,9 @@ static void test_tworoots(long cycles) {
 }
 
 // -----------------------------------------------------------------------------
-// S17: host threads come and go, each a root for a few regions. Their root
-// blocks are recycled: no more are allocated than roots ran at once (only
-// counted with -DPOMP_STATS).
+// S17: host threads come and go, each a root for a few regions. Their Roots
+// are recycled: no more are allocated than roots ran at once (only counted
+// with -DPOMP_STATS).
 // -----------------------------------------------------------------------------
 
 #define ROOTS_WIDTH 4
@@ -601,7 +601,7 @@ static void *churn_host(void *arg) {
   return NULL;
 }
 
-static long root_blocks(void) {
+static long roots_allocated(void) {
   unsigned long long c[8];
   return pomp_get_stats(c, 8) == 8 ? (long)c[7] : -1;
 }
@@ -619,11 +619,11 @@ static void test_rootchurn(long cycles) {
     for (int k = 0; k < ROOTS_WIDTH; ++k)
       pthread_join(b[k], NULL);
   }
-  long blocks = root_blocks();
+  long blocks = roots_allocated();
   CHECK(blocks < 0 || blocks <= 1 + ROOTS_WIDTH);
   CHECK(pomp_close_pool() == POMP_OK);
   host_stop();
-  printf("rootchurn: %ld cycles, %ld root blocks, errors %ld\n", cycles, blocks,
+  printf("rootchurn: %ld cycles, %ld Roots, errors %ld\n", cycles, blocks,
       errors);
 }
 
@@ -695,7 +695,7 @@ static void *rootinpool_host(void *arg) {
   CHECK(run_region() == limit - 1); // Slot 1 is not in the pool yet.
   atomic_store(&rip_entered, 1);
   atomic_store(&rip_rc, pomp_enter_pool(1));
-  // A root again, with its block: regions, queries and gtid as before.
+  // A root again, with its Root: regions, queries and gtid as before.
   CHECK(__kmpc_global_thread_num(NULL) == 0 && omp_get_level() == 0);
   CHECK(run_region() == 1); // Closed now.
   return NULL;

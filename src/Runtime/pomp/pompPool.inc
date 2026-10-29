@@ -346,10 +346,10 @@ int Pool::enter(int32_t slot) {
     sched_yield();
   }
 
-  // Init before the slot becomes recruitable, below. A root that enters
-  // keeps its block for when it leaves.
+  // Init before the slot becomes recruitable, below. An initial thread (a
+  // root) that enters keeps its Root for when it leaves.
   self.init();
-  Thread *root = Self::get();
+  Thread *initial = Self::get();
   Self::set(&self);
   self.regions().startAt(0, 0);
   self.clearPost();
@@ -362,7 +362,7 @@ int Pool::enter(int32_t slot) {
   if (!isOpen()) {
     if (!(busy_.fetchSet(me) & me)) {
       // Nobody claimed this slot: back out.
-      Self::set(root);
+      Self::set(initial);
       self.setPresence(Thread::kFree, Order::Release);
       return POMP_ERR_CLOSED;
     }
@@ -378,7 +378,7 @@ int Pool::enter(int32_t slot) {
   self.setPresence(Thread::kLeaving);
   released_.fetchClear(me);
   wakeReleased(2);
-  Self::set(root);
+  Self::set(initial);
   numPoolThreads_.fetchSub(1);
   self.setPresence(Thread::kFree, Order::Release);
   return POMP_OK;

@@ -126,7 +126,7 @@ private:
   // one line on s390x, two where a line is 128 bytes.
 
   // Set at allocation, never changed: a worker's late wake-up reads them
-  // after its region (see "Root blocks" in pompRoots.inc).
+  // after its region (see "Roots" in pompRoots.inc).
   Thread *leader_ = nullptr;
   int32_t leaderSlot_ = 0;
   // Work, written before the wake-up of the members.
@@ -272,7 +272,7 @@ public:
 
 // The pool's descriptors, zero-allocated by Settings::allocate: threads[i] is
 // pool thread i and teams[i] the level-2 team it leads. Index 0 is unused:
-// each root has its own (RootBlock).
+// each root has its own (Root).
 POMP_CONSTINIT Thread *threads = nullptr;
 POMP_CONSTINIT Team *teams = nullptr;
 
@@ -285,10 +285,10 @@ inline Thread &Team::member(int32_t slot) const {
 // -----------------------------------------------------------------------------
 
 // Called on each entry as this slot, before it is recruitable, and at the
-// allocation of a root block. Entries as a slot are serialized by `present_`.
+// allocation of a Root. Entries as a slot are serialized by `present_`.
 // The post is initialized once per descriptor, never again: a waker of a
-// previous occupant (or owner, for a root block) may still be inside its
-// post() ("Root blocks", rule 2, in pompRoots.inc).
+// previous occupant (or owner, for a Root) may still be inside its
+// post() ("Roots", rule 2, in pompRoots.inc).
 inline void Thread::init() {
   if (!initialized_) {
     post_.init();
@@ -297,8 +297,8 @@ inline void Thread::init() {
 }
 
 // Join and tree ids share a seed: they go to different flags. Once per team,
-// at allocation: never again, even when a root block is reused ("Root
-// blocks", rule 3).
+// at allocation: never again, even when a Root is reused ("Roots", rule
+// 3).
 inline void Team::init(int32_t index, Thread &leader) {
   leader_ = &leader;
   leaderSlot_ = leader.slot();

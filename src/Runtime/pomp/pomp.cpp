@@ -142,7 +142,7 @@ void initOnce() {
     settings.init();
     pool.init();
     Self::createStorage();
-    roots.init();
+    rootRegistry.init();
     initState.store(2, Order::Release);
   } else {
     while (initState.load(Order::Acquire) != 2)

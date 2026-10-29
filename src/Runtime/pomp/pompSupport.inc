@@ -271,7 +271,7 @@ enum StatKind {
   kStatForkPosts,  // Posts by a leader waking its workers at a fork.
   kStatPostNs,     // Time inside post(), in ns.
   kStatSleepNs,    // Time asleep (waitPost), in ns.
-  kStatRootBlocks, // Root blocks allocated (not recycled ones).
+  kStatRoots,      // Roots allocated (not recycled ones).
   kStats
 };
 #ifdef POMP_STATS

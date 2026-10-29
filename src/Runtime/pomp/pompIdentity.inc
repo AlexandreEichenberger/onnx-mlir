@@ -19,14 +19,15 @@
 // Threads, by their place in the pool:
 // - Pool thread: a thread lent to the pool (pomp_enter_pool), as slot
 //   1..limit-1. Between teams it waits idle in the pool.
-// - Root: any other thread, once it starts a region. Each root has a
-//   descriptor of its own, of slot 0, and the two teams it leads (see "Root
-//   blocks" in pompRoots.inc). Before its first region, a thread has no
-//   descriptor.
+// - Root: any other thread, once it starts a region: OpenMP's initial
+//   thread. Each root has a Root, the data it needs: a descriptor of its
+//   own, of slot 0, and the two teams it leads (see "Roots" in
+//   pompRoots.inc). Before its first region, a thread has no descriptor.
 //
 // Threads, by their place in a team (an active region):
-// - Leader: the thread that forks the region, tid 0. It sets up the team,
-//   wakes the workers, runs its share, and joins.
+// - Leader: the thread that forks the region, tid 0: OpenMP's primary thread
+//   ("leader" pairs with "worker" and "member"). It sets up the team, wakes
+//   the workers, runs its share, and joins.
 // - Worker: a pool thread recruited into the team, tid 1..nth-1. It leaves
 //   after its done report, without waiting.
 // - Member: any of the team's nth threads, leader included.

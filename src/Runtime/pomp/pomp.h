@@ -183,7 +183,7 @@ int pomp_set_option(const char *name, const char *value);
 // Diagnosis: copy up to `n` of pomp's sleep and wake-up counters into
 // `counts` and return how many; 0 unless pomp is built with -DPOMP_STATS. In
 // order: regions forked with workers, idle sleeps, team-wait sleeps, posts,
-// posts at forks, ns spent posting, ns spent asleep, root blocks allocated
+// posts at forks, ns spent posting, ns spent asleep, Roots allocated
 // (one per host thread running regions at once; ended ones are reused).
 int pomp_get_stats(unsigned long long *counts, int n);
 

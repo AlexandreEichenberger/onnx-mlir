@@ -634,7 +634,7 @@ namespace:
 | `pompSyncTypes.inc` | The types of the synchronization inside a team, which `Team` and `Thread` hold by value: `TeamWait`, `TeamJoin`, `TeamCentralBarrier`, `TeamTreeBarrier`, `MemberBarrier`, `TreeFlags`, `WorkerSync` |
 | `pompDescriptors.inc` | The descriptors: the region stack, `Team`, `Thread`, the `threads` and `teams` globals, and their small methods |
 | `pompPool.inc` | `Pool`: the allocation of the pool's descriptors, the idle wait, recruitment, and the host protocol (open, enter, close, wait) |
-| `pompRoots.inc` | `RootBlock`, `Roots`: the descriptors of the threads that run regions outside the pool, and the rules of their reuse |
+| `pompRoots.inc` | `Root`, `RootRegistry`: the data of the threads that run regions outside the pool (OpenMP's initial threads), and the rules of their reuse |
 | `pompSync.inc` | The code of the synchronization inside a team |
 | `pompRegion.inc` | The region stack, and fork/join |
 | `pompLoop.inc` | Static loop partitioning |
@@ -650,6 +650,11 @@ The tests are C programs and link with the C driver alone, so a C++ runtime symb
 pomp would be a link error.
 
 ## Design
+
+**Terms.** A *root* is OpenMP's initial thread: any thread outside the pool, once it starts a
+region; a `Root` is the data it needs. A *leader* is OpenMP's primary thread, tid 0 of the team
+it forks; pomp says "leader" to pair with *worker* (a recruited pool thread) and *member* (any
+of the team's threads).
 
 **Thread identity.** Each thread has one `__thread` pointer to its descriptor: its slot's
 while it is in the pool, its root's otherwise (see "Root descriptors"), or null for a thread
@@ -698,23 +703,23 @@ The limit is set before the first open allocates, and never changes after; an op
 take the same lock, so the cycles they delimit are ordered.
 
 **Root descriptors.** A host thread that is not in the pool becomes a root at its first region
-(or pushed team size): it takes a *root block*, one allocation with its descriptor, of slot 0,
+(or pushed team size): it takes a *Root*, one allocation with its descriptor, of slot 0,
 and the two teams it leads: at level 1, and at level 2 as tid 0 of its level-1 team. In a team's
 masks, slot 0 is that team's leader, which each team records at allocation. A root keeps its
-block until it ends, so its next region touches nothing global but the pool, and roots never
+Root until it ends, so its next region touches nothing global but the pool, and roots never
 share a descriptor.
 
-Blocks come from a free list under a mutex, taken only at a thread's first region. A pthread
-key, set once per root, has a destructor that returns the block to the free list when the thread
+Roots come from a free list under a mutex, taken only at a thread's first region. A pthread
+key, set once per root, has a destructor that returns the Root to the free list when the thread
 ends; it is a pthread destructor, as a C++ `thread_local` destructor would need the C++ runtime.
-Blocks are never freed. A worker that has stored its `done` may still wake its leader, whose
-thread may have ended and whose block may have a new owner: that wake-up reads only fields set
-at allocation, and at worst posts to the new owner, which only makes it re-check. So a block is
+Roots are never freed. A worker that has stored its `done` may still wake its leader, whose
+thread may have ended and whose Root may have a new owner: that wake-up reads only fields set
+at allocation, and at worst posts to the new owner, which only makes it re-check. So a Root is
 reused whole, its teams with it, and its post is never cleared. The rules a change must keep
-for this (never free a block, never initialize its post or reset its ids again, recycle it
+for this (never free a Root, never initialize its post or reset its ids again, recycle it
 whole, and read nothing of a team after a worker's `done` but fields set at allocation) are
-listed in the "Root blocks" comment of `pompRegion.inc`. A thread that ends inside a region
-(`pthread_exit`) keeps its block, as a team may still use it. On z/OS, the destructor
+listed in the "Roots" comment of `pompRoots.inc`. A thread that ends inside a region
+(`pthread_exit`) keeps its Root, as a team may still use it. On z/OS, the destructor
 was checked to run for threads that return, call `pthread_exit` or are detached.
 
 A team descriptor holds:
@@ -815,10 +820,10 @@ one line per member of each team would be one per team.
 The values are unique ids, so that a value left in a line by an earlier region, barrier or
 team never matches. A team has two sequences of ids, one for its joins and one for its tree
 barriers, each seeded with the team's index, set at allocation: the leader's slot for a pool
-thread's team, and 64 + 2*k and 65 + 2*k for the two teams of the *k*-th root block. Each new
-id is the last one plus 2^16, which every index is below: 2^16 bounds the root blocks to about
+thread's team, and 64 + 2*k and 65 + 2*k for the two teams of the *k*-th `Root`. Each new
+id is the last one plus 2^16, which every index is below: 2^16 bounds the Roots to about
 32 700, and pomp aborts beyond. So every id of a team is its index modulo 2^16, two teams never
-meet, and a team's ids only grow, also when its block is reused. Every wait tests for
+meet, and a team's ids only grow, also when its Root is reused. Every wait tests for
 equality, and nothing is ever reset. Ids are advanced before use, so no id is 0, which every
 line holds at first. A line keeps its `done` until the leader has read it, as the leader
 returns its workers to the pool only after the join.
