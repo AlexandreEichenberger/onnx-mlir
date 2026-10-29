@@ -52,6 +52,36 @@ extern "C" {
 //   pomp_close_pool()            owner: close; pool threads return
 //   pomp_wait_pool_empty()       optional: wait until they have returned
 //
+// A typical host, for one cycle (error handling shortened):
+//
+//   static void *pool_thread(void *slot) {      // a pool thread
+//     pomp_enter_pool((int)(intptr_t)slot);     // returns at the close
+//     return NULL;
+//   }
+//
+//   int n = 16;                                 // the limit wanted
+//   int rc = pomp_open_pool(&n);                // n: the limit it gets
+//   if (rc == POMP_OK) {
+//     // This thread owns the cycle: it starts the pool threads.
+//     for (int slot = 1; slot < n; ++slot)
+//       pthread_create(&th[slot], NULL, pool_thread, (void *)(intptr_t)slot);
+//     while (pomp_pool_size() < n - 1)          // optional: all of them
+//       sched_yield();                          // for the first region
+//   } else if (rc != POMP_ERR_OPEN) {
+//     // POMP_ERR_LIMIT or POMP_ERR_NOMEM: the pool stays closed, and
+//     // models run on one thread.
+//   }
+//   // POMP_ERR_OPEN: another thread owns the cycle; use its pool as is.
+//
+//   run_model();                                // any number of times
+//
+//   if (rc == POMP_OK) {
+//     // Only the owner closes, once every thread's models are done.
+//     pomp_close_pool();
+//     for (int slot = 1; slot < n; ++slot)
+//       pthread_join(th[slot], NULL);           // they return at once
+//   }
+//
 // There is no init call. Every entry point, including the __kmpc_* ones,
 // initializes pomp on first use: it reads the environment. Concurrent first
 // calls are safe. The pool starts closed. Until it is opened, parallel regions
