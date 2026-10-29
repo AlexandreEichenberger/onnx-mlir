@@ -26,8 +26,16 @@ public:
   // from `value`. POMP_ERR_LIMIT: unknown name or invalid value;
   // POMP_ERR_STATE: the setting cannot change now.
   int setOption(const char *name, const char *value, Source from);
-  // At each successful open: from the first one on, only POMP_SPIN may
-  // change; and OMP_DISPLAY_ENV prints the settings, once.
+  // Freeze the settings: from now on, pomp_set_option changes only POMP_SPIN
+  // and refuses the others with POMP_ERR_STATE; never undone, also not by a
+  // close. Before the first open no team exists, so a setting may change at
+  // any time; once teams may exist, the members of one must agree on what
+  // they read at each barrier and fork. POMP_TREE_BARRIER above all: members
+  // that chose different barrier algorithms would wait forever on each other.
+  // POMP_SPIN is the exception: each wait reads it once, and every value is
+  // safe. So Pool::open calls this before the pool can be seen open, and the
+  // check in setOption and the change it allows are under optionMutex_, as
+  // the store here is. Then, with OMP_DISPLAY_ENV, print the settings, once.
   void freeze();
   // Read the environment, once, at init.
   void init();
@@ -66,7 +74,7 @@ private:
   // Settings with a source, indexed as kOptions below.
   static constexpr int kNumOptions = 4;
 
-  Atomic<int> frozen_; // Set by the first open (freeze).
+  Atomic<int> frozen_; // Set by the first open (freeze); under optionMutex_.
   // Serializes setOption (calls, and init's reads of the environment).
   Mutex optionMutex_;
   Source sources_[kNumOptions] = {};
@@ -137,8 +145,9 @@ void Settings::init() {
 }
 
 // The settings pomp_set_option knows, in the order of sources_. Whether each
-// may change once the pool has opened: team sizes and the barrier kind are
-// read at forks, so only before; POMP_SPIN at every wait, so at any time.
+// may change once frozen (see Settings::freeze): team sizes and the barrier
+// kind are read at forks and barriers, so only before; POMP_SPIN at every
+// wait, so at any time.
 namespace {
 struct OptionDesc {
   const char *name;
@@ -161,11 +170,12 @@ int Settings::setOption(const char *name, const char *value, Source from) {
     ++k;
   if (k == kNumOptions)
     return POMP_ERR_LIMIT;
-  if (from == kCall && !kOptions[k].anytime && frozen_.load())
-    return POMP_ERR_STATE;
   // As in OpenMP, the environment gives the initial value (init reads it
-  // before any call is served) and a call overrides it.
+  // before any call is served) and a call overrides it. The freeze check and
+  // the change, under one lock with freeze (see there).
   ScopedLock<Mutex> lock(optionMutex_);
+  if (from == kCall && !kOptions[k].anytime && frozen_.load(Order::Relaxed))
+    return POMP_ERR_STATE;
   if (!(this->*kOptions[k].set)(value))
     return POMP_ERR_LIMIT;
   sources_[k] = from;
@@ -183,10 +193,10 @@ const char *sourceName(Settings::Source s) {
 // OMP_DISPLAY_ENV: in OpenMP's format, each line followed by where the value
 // comes from.
 void Settings::freeze() {
-  frozen_.store(1);
+  ScopedLock<Mutex> lock(optionMutex_);
+  frozen_.store(1, Order::Relaxed);
   if (!displayEnv_ || displayed_.exchange(1))
     return;
-  ScopedLock<Mutex> lock(optionMutex_);
   char v[64];
   fprintf(stderr, "OPENMP DISPLAY ENVIRONMENT BEGIN\n");
   fprintf(stderr, "  %-22s = '%s'\n", "_OPENMP", "pomp (onnx-mlir)");

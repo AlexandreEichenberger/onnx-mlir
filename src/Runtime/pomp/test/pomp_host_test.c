@@ -41,6 +41,8 @@
 //   openrace : S20, threads open at once: one owner, the others told
 //   fewer    : S21, a host lends fewer threads than the limit (no
 //              OMP_THREAD_LIMIT; OMP_NUM_THREADS set by a call)
+//   freeze   : S22, pomp_set_option racing the first open (no
+//              OMP_THREAD_LIMIT; one race per process: run it many times)
 //   latency  : leader time in release, and to the next region
 //
 //===----------------------------------------------------------------------===//
@@ -1202,6 +1204,77 @@ static void test_fewer(long cycles, int lim) {
   printf("fewer: limit %d, team %d, errors %ld\n", lim, k, errors);
 }
 
+// -----------------------------------------------------------------------------
+// S22: pomp_set_option racing the first open. A thread flips
+// POMP_TREE_BARRIER between the two barrier kinds while this one opens the
+// pool, then runs regions with barriers at once: the pool threads retry their
+// entry until the open lets them in. Every call either took effect before the
+// open or was refused after it: the members of every team agree on the
+// barrier kind, so every region completes (a late change makes members mix
+// barrier kinds, and hang or crash). The first open happens once per process:
+// the scripts run this many times. Run without OMP_THREAD_LIMIT; the limit is
+// the argument.
+// -----------------------------------------------------------------------------
+
+static atomic_int freeze_go, freeze_stop, freeze_late_ok;
+
+static void *freeze_setter(void *arg) {
+  (void)arg;
+  while (!atomic_load(&freeze_go))
+    ;
+  int opened = 0;
+  for (long i = 0; !atomic_load(&freeze_stop); ++i) {
+    int rc = pomp_set_option("POMP_TREE_BARRIER", i & 1 ? "2" : "65");
+    // Refused once frozen, and from then on, never accepted again.
+    if (rc == POMP_ERR_STATE)
+      opened = 1;
+    else if (rc == POMP_OK && opened)
+      atomic_fetch_add(&freeze_late_ok, 1);
+  }
+  return NULL;
+}
+
+// Enter as soon as the first open lets in.
+static void *freeze_enter(void *arg) {
+  while (pomp_enter_pool((int)(intptr_t)arg) == POMP_ERR_CLOSED &&
+         !atomic_load(&freeze_stop))
+    ;
+  return NULL;
+}
+
+static void freeze_body(int32_t *gtid, int32_t *tid) {
+  for (int b = 0; b < 4; ++b)
+    __kmpc_barrier(NULL, *gtid);
+  atomic_fetch_add(&region_sum, *tid);
+}
+
+static void test_freeze(long cycles, int lim) {
+  pthread_t s, th[64];
+  limit = lim;
+  for (int i = 1; i < lim; ++i)
+    pthread_create(&th[i], NULL, freeze_enter, (void *)(intptr_t)i);
+  pthread_create(&s, NULL, freeze_setter, NULL);
+  atomic_store(&freeze_go, 1);
+  for (int i = 0; i < 2000; ++i)
+    sched_yield();
+  int n = 0;
+  CHECK(pomp_open_pool(lim, &n) == POMP_OK && n == lim);
+  wait_pool_size(lim - 1);
+  for (long c = 0; c < cycles; ++c) {
+    atomic_store(&region_sum, 0);
+    __kmpc_fork_call(NULL, 0, (void *)freeze_body);
+    CHECK(atomic_load(&region_sum) == (long)lim * (lim - 1) / 2);
+  }
+  atomic_store(&freeze_stop, 1);
+  pthread_join(s, NULL);
+  CHECK(atomic_load(&freeze_late_ok) == 0);
+  CHECK(pomp_set_option("POMP_TREE_BARRIER", "2") == POMP_ERR_STATE);
+  CHECK(pomp_close_pool() == POMP_OK);
+  for (int i = 1; i < lim; ++i)
+    pthread_join(th[i], NULL);
+  printf("freeze: limit %d, errors %ld\n", lim, errors);
+}
+
 int main(int argc, char **argv) {
   const char *test = argc > 1 ? argv[1] : "reuse";
   long n = argc > 2 ? atol(argv[2]) : 200;
@@ -1213,6 +1286,11 @@ int main(int argc, char **argv) {
   if (!strcmp(test, "options")) {
     // Run without OMP_THREAD_LIMIT; argv[2] is the limit to set.
     test_options(argc > 2 ? atoi(argv[2]) : 4);
+    return errors ? 1 : 0;
+  }
+  if (!strcmp(test, "freeze")) {
+    // Run without OMP_THREAD_LIMIT; argv[3] is the limit to set.
+    test_freeze(n, argc > 3 ? atoi(argv[3]) : 4);
     return errors ? 1 : 0;
   }
   if (!strcmp(test, "fewer")) {

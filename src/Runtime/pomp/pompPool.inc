@@ -14,8 +14,21 @@
 //
 //===----------------------------------------------------------------------===//
 
-// The pool: which pool threads are idle, sleeping or released, and whether it
-// is open.
+// -----------------------------------------------------------------------------
+// Terms used in Pool.
+//
+// Idle: a pool thread in no team, waiting for work; its busy bit is clear.
+//
+// Recruit: a fork claims idle pool threads as its workers, setting their busy
+//   bits. After the join, they are returned: idle again.
+//
+// Release: the pool close claims every idle pool thread, as a fork would, but
+//   sets its released bit instead of giving it work. Threads in a team are
+//   released when returned.
+//
+// Leave: a released thread returns from pomp_enter_pool to the host.
+// -----------------------------------------------------------------------------
+
 class Pool {
 public:
   // At init: the lock of open and close.
@@ -299,8 +312,9 @@ int Pool::open(int fallback, int *limit) {
       settings.setLimit(lim);
   }
   *limit = settings.limit();
-  state_.store(kOpen);
+  // Freeze before the store that lets forks recruit (see Settings::freeze).
   settings.freeze();
+  state_.store(kOpen);
   return POMP_OK;
 }
 
