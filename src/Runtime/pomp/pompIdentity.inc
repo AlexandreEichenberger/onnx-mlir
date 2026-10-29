@@ -21,7 +21,7 @@
 //   1..limit-1. Between teams it waits idle in the pool.
 // - Root: any other thread, once it starts a region. Each root has a
 //   descriptor of its own, of slot 0, and the two teams it leads (see "Root
-//   blocks" in pompRegion.inc). Before its first region, a thread has no
+//   blocks" in pompRoots.inc). Before its first region, a thread has no
 //   descriptor.
 //
 // Threads, by their place in a team (an active region):

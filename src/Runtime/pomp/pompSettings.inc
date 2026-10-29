@@ -64,14 +64,14 @@ private:
   bool setMaxActive(const char *s);
   bool setTreeMin(const char *s);
   bool setSpin(const char *s);
-  // Settings with a source, indexed as kOptions in pompInit.inc.
+  // Settings with a source, indexed as kOptions below.
   static constexpr int kNumOptions = 4;
 
   Atomic<int> frozen_;               // Set by the first open (freeze).
   // Serializes setOption (calls, and init's reads of the environment).
   Mutex optionMutex_;
   Source sources_[kNumOptions] = {};
-  int displayEnv_ = 0;               // OMP_DISPLAY_ENV: 0, 1 (true), 2 (verbose).
+  int displayEnv_ = 0; // OMP_DISPLAY_ENV: 0, 1 (true), 2 (verbose).
   Atomic<int> displayed_;
   int envNthreads_[kMaxActive] = {}; // OMP_NUM_THREADS as set, 0: unset.
   // Whether OMP_NUM_THREADS listed more than one level, for the default of

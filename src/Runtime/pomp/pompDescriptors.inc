@@ -126,7 +126,7 @@ private:
   // one line on s390x, two where a line is 128 bytes.
 
   // Set at allocation, never changed: a worker's late wake-up reads them
-  // after its region (see "Root blocks" in pompRegion.inc).
+  // after its region (see "Root blocks" in pompRoots.inc).
   Thread *leader_ = nullptr;
   int32_t leaderSlot_ = 0;
   // Work, written before the wake-up of the members.
@@ -288,7 +288,7 @@ inline Thread &Team::member(int32_t slot) const {
 // allocation of a root block. Entries as a slot are serialized by `present_`.
 // The post is initialized once per descriptor, never again: a waker of a
 // previous occupant (or owner, for a root block) may still be inside its
-// post() ("Root blocks", rule 2, in pompRegion.inc).
+// post() ("Root blocks", rule 2, in pompRoots.inc).
 inline void Thread::init() {
   if (!initialized_) {
     post_.init();

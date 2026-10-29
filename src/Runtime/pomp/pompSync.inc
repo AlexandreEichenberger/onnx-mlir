@@ -132,7 +132,7 @@ inline UniqueId TeamJoin::workerDoneValue(const Team &team) {
 // After the store the leader may reuse the team, and its thread may end and
 // its root block go to another root: read `leader_` first, and nothing of
 // the team after the store but the wake-up, which uses only fields set at
-// allocation. See the rules of "Root blocks" in pompRegion.inc before adding
+// allocation. See the rules of "Root blocks" in pompRoots.inc before adding
 // anything here.
 inline void TeamJoin::workerFinish(Team &team, Thread &self, UniqueId done) {
   Thread &leader = *team.leader_;

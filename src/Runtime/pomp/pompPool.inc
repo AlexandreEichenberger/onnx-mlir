@@ -8,8 +8,9 @@
 //
 // =============================================================================
 //
-// Part of pomp.cpp: the pool of threads. The idle wait and its wake-ups,
-// recruitment, and the host protocol: entry, close, release and reopen.
+// Part of pomp.cpp: the pool of threads. Pool, the allocation of the pool's
+// descriptors, the idle wait and its wake-ups, recruitment, and the host
+// protocol: open, entry, close, release.
 //
 //===----------------------------------------------------------------------===//
 

@@ -13,7 +13,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-// Defined in pompTypes.inc, after these types.
+// Defined in pompDescriptors.inc, after these types.
 class Team;
 class Thread;
 struct Level;

@@ -110,7 +110,12 @@ constexpr int32_t kSchModifierMask = (1 << 29) | (1 << 30);
 
 namespace {
 
-// pomp itself, in dependency order: not to be sorted.
+// pomp itself, in dependency order: not to be sorted. A class's declaration
+// and code share a file, unless another class holds it by value
+// (pompSyncTypes.inc, pompDescriptors.inc: declared before their holders,
+// coded after); small methods live with their class; the code of a protocol
+// (pool, roots, sync, region, loop) lives in its file. Code may call code of
+// a later file: the whole unit is declared before any of it is compiled.
 // clang-format off
 #include "pompIdentity.inc"
 #include "pompSettings.inc"

@@ -628,15 +628,20 @@ namespace:
 
 | File | Contents |
 |---|---|
-| `pompSupport.inc` | Code not specific to pomp: `POMP_CONSTINIT`, `fatal`, `relax`, `Atomic<T>`, `Mutex`, `Condition`, `ScopedLock<T>`, `Post`, and `invoke`, the call of an outlined function through its exact type |
+| `pompSupport.inc` | Code not specific to pomp: `POMP_CONSTINIT`, `fatal`, `relax`, `Atomic<T>`, `Mutex`, `Condition`, `ScopedLock<T>`, `Post`, `allocLines`, and `invoke`, the call of an outlined function through its exact type |
 | `pompIdentity.inc` | Slot sets, and the calling thread's descriptor (`Self`) |
+| `pompSettings.inc` | `Settings`: the environment, `pomp_set_option`, the thread limit's value, `OMP_DISPLAY_ENV` |
 | `pompSyncTypes.inc` | The types of the synchronization inside a team, which `Team` and `Thread` hold by value: `TeamWait`, `TeamJoin`, `TeamCentralBarrier`, `TeamTreeBarrier`, `MemberBarrier`, `TreeFlags`, `WorkerSync` |
-| `pompTypes.inc` | The descriptors and the globals: the region stack, `Team`, `Thread`, `Pool`, `Settings`, `RootBlock`, `Roots` |
-| `pompInit.inc` | Settings from the environment, the thread limit and the allocation of the descriptors |
-| `pompPool.inc` | The idle wait, recruitment, and the host protocol of the pool |
+| `pompDescriptors.inc` | The descriptors: the region stack, `Team`, `Thread`, the `threads` and `teams` globals, and their small methods |
+| `pompPool.inc` | `Pool`: the allocation of the pool's descriptors, the idle wait, recruitment, and the host protocol (open, enter, close, wait) |
+| `pompRoots.inc` | `RootBlock`, `Roots`: the descriptors of the threads that run regions outside the pool, and the rules of their reuse |
 | `pompSync.inc` | The code of the synchronization inside a team |
-| `pompRegion.inc` | The region stack, the root descriptors, and fork/join |
+| `pompRegion.inc` | The region stack, and fork/join |
 | `pompLoop.inc` | Static loop partitioning |
+
+A class's declaration and its code share a file, unless another class holds it by value: those
+(`pompSyncTypes.inc`, `pompDescriptors.inc`) are declared before their holders, and their larger
+code comes later, with the protocol it belongs to. Small methods live with their class.
 
 As it is one translation unit, the inliner sees all of it, and the object code is the same as
 with one file. The `.inc` files are not compiled on their own: copy them with `pomp.cpp`.

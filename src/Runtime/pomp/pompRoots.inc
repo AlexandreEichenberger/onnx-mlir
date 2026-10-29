@@ -14,8 +14,8 @@
 //===----------------------------------------------------------------------===//
 
 // A root's descriptor and the teams it leads, allocated together, recycled
-// together and never freed; see "Root blocks" in pompRegion.inc for the
-// rules that keep a late wake-up of a recycled block harmless.
+// together and never freed; see "Root blocks" below for the rules that keep a
+// late wake-up of a recycled block harmless.
 struct RootBlock {
   Thread thread;
   Team levelOne;

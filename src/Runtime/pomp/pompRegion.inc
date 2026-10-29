@@ -8,8 +8,7 @@
 //
 // =============================================================================
 //
-// Part of pomp.cpp: parallel regions. The region stack, the root blocks,
-// and fork/join.
+// Part of pomp.cpp: parallel regions. The region stack, and fork/join.
 //
 //===----------------------------------------------------------------------===//
 
