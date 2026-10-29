@@ -273,9 +273,11 @@ public:
 // is open.
 class Pool {
 public:
+  // At init: the lock of open and close.
+  void init();
   // The host calls of pomp.h, in the order of a cycle: pomp_open_pool,
   // pomp_enter_pool, pomp_close_pool and pomp_wait_pool_empty.
-  int open();
+  int open(int *limit);
   int enter(int32_t slot);
   int close();
   int waitEmpty();
@@ -317,6 +319,8 @@ private:
   static constexpr int kOpen = 1;
   static constexpr int kClosed = 2;
   alignas(kCacheLine) Atomic<int> state_;
+  // Serializes open and close: an open that finds the pool open fails.
+  Mutex openMutex_;
   Atomic<int> numPoolThreads_;
   Atomic<int> neverOpenedSeen_;
 };
@@ -342,15 +346,35 @@ public:
     if (initialized_.load(Order::Acquire) != 2)
       initOnce();
   }
-  // Set the thread limit, once per process; `fromEnv` if by OMP_THREAD_LIMIT.
-  int setLimit(long limit, bool fromEnv);
+  // pomp_open_pool, while the pool is closed: set the limit of the cycle it
+  // opens from the request `req`, in [0, kMaxThreads] (0: OMP_THREAD_LIMIT).
+  // The first one fixes the thread limit and allocates the pool's
+  // descriptors. POMP_ERR_LIMIT: no limit known; POMP_ERR_NOMEM.
+  int openLimit(int req);
 
+  // Two limits (see "The thread limit" in POMP.md):
+  // - The thread limit, OpenMP's thread-limit-var: OMP_THREAD_LIMIT, else the
+  //   limit of the first open. Fixed by the first open, the capacity of the
+  //   pool's descriptors. 0 while unknown.
+  // - The limit of the current cycle, at most the thread limit: what its open
+  //   asked for, or OMP_THREAD_LIMIT before the first open. It caps team
+  //   sizes and the slots that may enter. 0 while unknown.
+  // Both include slot 0, a team's root.
+  int threadLimit() const {
+    int c = capacity_.load(Order::Relaxed);
+    return c ? c : envLimit_;
+  }
   int limit() const { return limit_.load(Order::Relaxed); }
-  // The limit, acquired before reading the descriptors.
-  int limitAcquire() const { return limit_.load(Order::Acquire); }
-  // Slots 0..limit-1.
+  // The capacity of the descriptors, 0 before the first open; acquired
+  // before reading them.
+  int capacityAcquire() const { return capacity_.load(Order::Acquire); }
+  // Slots 0..limit-1, of the current cycle: those forks recruit.
   SlotMask limitSlots() const { return limitSlots_.load(Order::Relaxed); }
-  // Warn once that no limit is set.
+  // Slots 0..capacity-1: those a close releases, of any cycle.
+  SlotMask capacitySlots() const {
+    return SlotMask::below(capacity_.load(Order::Relaxed));
+  }
+  // Warn once that no limit is known.
   void warnNoLimit();
   // Default team size of a fork at `active` enclosing active levels.
   int numThreads(int active) const {
@@ -368,8 +392,13 @@ public:
 private:
   // Run init() once; concurrent callers wait for it.
   void initOnce();
-  // Read the environment, and set the limit from OMP_THREAD_LIMIT.
+  // Read the environment.
   void init();
+  // Under limitMutex_: allocate the pool's descriptors for `n` slots, once;
+  // false if out of memory.
+  bool allocate(int n);
+  // Under limitMutex_: make `lim` the limit of the current cycle.
+  void applyLimit(int lim);
   // Parsers: return false if `s` is invalid (the setting is unchanged);
   // otherwise set the setting. Under optionMutex_.
   bool setNumThreads(const char *s);
@@ -390,13 +419,13 @@ private:
   // OMP_MAX_ACTIVE_LEVELS.
   bool nthreadsNested_ = false;
   Atomic<int> maxActive_;
-  // Set once with the thread limit (setLimit).
+  // The limits (see limit()); written under limitMutex_.
   Mutex limitMutex_;
-  Atomic<int> limit_; // Slot 0 (a team's root) included; 0 until set.
-  AtomicMask limitSlots_;
-  Atomic<int> nthreads_[kMaxActive]; // Default team sizes.
-  bool limitFromEnv_ = false;        // Under limitMutex_.
-  Atomic<int> limitMismatchSeen_;
+  int envLimit_ = 0;      // OMP_THREAD_LIMIT if valid, else 0; set at init.
+  Atomic<int> capacity_;  // Of the descriptors; 0 before the first open.
+  Atomic<int> limit_;     // Of the current cycle.
+  AtomicMask limitSlots_; // Slots 0..limit_-1.
+  Atomic<int> nthreads_[kMaxActive]; // Default team sizes, clamped to limit_.
   Atomic<int> noLimitSeen_;
   // Read at every wait: atomics, as POMP_SPIN may change while regions run.
   Atomic<long> spinUs_;
@@ -437,7 +466,7 @@ private:
 POMP_CONSTINIT Settings settings;
 POMP_CONSTINIT Pool pool;
 POMP_CONSTINIT Roots roots;
-// The pool's descriptors, zero-allocated by Settings::setLimit: threads[i] is
+// The pool's descriptors, zero-allocated by Settings::allocate: threads[i] is
 // pool thread i and teams[i] the level-2 team it leads. Index 0 is unused:
 // each root has its own (RootBlock).
 POMP_CONSTINIT Thread *threads = nullptr;

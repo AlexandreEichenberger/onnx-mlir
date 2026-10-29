@@ -42,7 +42,8 @@ int main(void) {
     fprintf(stderr, "no thread limit: set OMP_THREAD_LIMIT\n");
     return 1;
   }
-  pomp_open_pool();
+  if (pomp_open_pool(&L) != POMP_OK)
+    return 1;
   for (int i = 1; i < L; ++i)
     pthread_create(&th[i], 0, member, (void *)(intptr_t)i);
   while (pomp_pool_size() != L - 1)

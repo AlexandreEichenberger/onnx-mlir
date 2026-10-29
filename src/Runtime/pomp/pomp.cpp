@@ -128,19 +128,14 @@ namespace {
 // Host interface: the pool (pomp.h)
 // -----------------------------------------------------------------------------
 
-int pomp_set_thread_limit(int thread_limit) {
-  settings.ensureInit();
-  return settings.setLimit(thread_limit, false);
-}
-
 int pomp_get_thread_limit(void) {
   settings.ensureInit();
-  return settings.limit();
+  return settings.threadLimit();
 }
 
-int pomp_open_pool(void) {
+int pomp_open_pool(int *limit) {
   settings.ensureInit();
-  return pool.open();
+  return pool.open(limit);
 }
 
 int pomp_enter_pool(int slot) {
@@ -317,7 +312,7 @@ int omp_get_max_threads(void) {
 
 int omp_get_thread_limit(void) {
   settings.ensureInit();
-  int n = settings.limit();
+  int n = settings.threadLimit();
   if (n > 0)
     return n;
   settings.warnNoLimit();

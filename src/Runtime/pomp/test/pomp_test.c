@@ -136,8 +136,11 @@ static void *member(void *arg) {
 }
 
 static void enter_all(void) {
-  int i, n = pomp_get_thread_limit();
-  pomp_open_pool();
+  int i, n = 0; // The whole thread limit.
+  if (pomp_open_pool(&n) != POMP_OK) {
+    fprintf(stderr, "open failed\n");
+    exit(1);
+  }
   for (i = 1; i < n; ++i)
     pthread_create(&members[i], NULL, member, (void *)(intptr_t)i);
   while (pomp_pool_size() != n - 1)

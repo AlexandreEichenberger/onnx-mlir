@@ -31,33 +31,36 @@ extern "C" {
 
 // Return codes of the host interface.
 #define POMP_OK 0
-#define POMP_ERR_LIMIT 1  /* Thread limit missing, out of range, or changed. */
+#define POMP_ERR_LIMIT 1  /* Thread limit missing or out of range. */
 #define POMP_ERR_SLOT 2   /* Slot number out of range or already in use. */
 #define POMP_ERR_STATE 3  /* Call not valid in the current state. */
 #define POMP_ERR_CLOSED 4 /* Entry refused: the pool is closed. */
-#define POMP_ERR_NOMEM                                                         \
-  5 /* The thread limit's descriptors cannot be allocated. */
+#define POMP_ERR_NOMEM 5  /* The thread limit's descr. cannot be allocated. */
+#define POMP_ERR_OPEN 6   /* Open refused: the pool is already open. */
 
 //===----------------------------------------------------------------------===//
 // General interface description
 
 // The pool is the set of host threads lent to pomp, the pool threads. A host
-// (e.g. Java) uses it in cycles, from any number of host threads:
+// (e.g. Java) uses it in cycles. One host thread, the cycle's owner, opens
+// and closes each cycle; any number of host threads run models in it:
 //
-//   pomp_set_thread_limit(n)    once per process, before the first open
-//   pomp_open_pool()            leader: open (once per cycle; see below)
-//   pomp_enter_pool(slot)       each pool thread: work until the pool closes
-//   ... run the model ...       leader: parallel regions use the pool
-//   pomp_close_pool()           leader: close; pool threads return
-//   pomp_wait_pool_empty()      optional, any host thread: wait for them
+//   n = 16; pomp_open_pool(&n)   owner: open; n is now the cycle's limit
+//   pomp_enter_pool(slot)        n-1 pool threads, slots 1..n-1: work until
+//                                the pool closes
+//   ... run models ...           any host threads: regions use the pool
+//   pomp_close_pool()            owner: close; pool threads return
+//   pomp_wait_pool_empty()       optional: wait until they have returned
 //
-// There is no init call. Every entry point, including pomp_enter_pool and the
-// __kmpc_* ones, initializes pomp on first use: it reads the environment, and
-// the thread limit from OMP_THREAD_LIMIT if it is set. Concurrent first calls
-// are safe. The pool starts closed: pomp_open_pool opens it, also when
-// OMP_THREAD_LIMIT gave the limit. An OMP_THREAD_LIMIT that is set but invalid
-// is ignored with a warning on stderr; a host can detect it as
-// pomp_get_thread_limit() == 0.
+// There is no init call. Every entry point, including the __kmpc_* ones,
+// initializes pomp on first use: it reads the environment. Concurrent first
+// calls are safe. The pool starts closed. Until it is opened, parallel regions
+// run on one thread.
+//
+// The thread limit. OMP_THREAD_LIMIT, if set, caps every cycle; otherwise the
+// first open fixes the cap. Each open asks for a limit and gets at most the
+// cap: see pomp_open_pool. A host should open the pool before model code runs,
+// so that code sizing its work by omp_get_max_threads sees the right value.
 //
 // Any number of host threads that are not in the pool may run parallel
 // regions at once, each as the initial thread of its own regions: each
@@ -68,41 +71,40 @@ extern "C" {
 //===----------------------------------------------------------------------===//
 // Interface calls
 
-// Set the thread limit (initial thread included), once per process; like
-// OpenMP's thread-limit-var, it never changes afterwards. A valid
-// OMP_THREAD_LIMIT sets it first and takes precedence: the call then returns
-// POMP_OK whatever `thread_limit` is, warning once on stderr if it differs.
-// (The only setting where the environment wins over a call: OpenMP has no
-// call to set thread-limit-var, so this call is a pomp addition and the
-// variable keeps the role it has in OpenMP.)
-// Otherwise the first call with `thread_limit` in [1, POMP_MAX_THREADS] sets
-// it; later calls return POMP_OK with the same value and POMP_ERR_LIMIT with
-// any other. Setting the limit does not open the pool. It allocates pomp's
-// per-thread descriptors, once; if that fails, the call returns
-// POMP_ERR_NOMEM, no limit is set, and a later call may try again.
-int pomp_set_thread_limit(int thread_limit);
-
-// The thread limit, or 0 while none is set (OMP_THREAD_LIMIT unset or
-// invalid, and no successful pomp_set_thread_limit yet).
+// Open the pool for a cycle: threads may enter it, and parallel regions use
+// the threads that have entered. `*limit` gives the limit wanted for this
+// cycle, initial thread included, and returns the one it gets:
+//   - the cap: OMP_THREAD_LIMIT if set; otherwise, once a first open has
+//     succeeded, that open's limit. A larger request gets the cap.
+//   - 0 asks for the cap; with no OMP_THREAD_LIMIT and no earlier open,
+//     there is none: POMP_ERR_LIMIT.
+// The cycle's limit caps its team sizes (omp_get_max_threads) and the slots
+// that may enter; the cap is the thread limit (omp_get_thread_limit), which
+// never changes once the first open has fixed it.
 //
-// omp_get_thread_limit returns this limit, and omp_get_max_threads returns at
-// most this limit. While no limit is set, both return 1, and the first such
-// call prints a warning on stderr: until a limit is set, the pool is closed and
-// every parallel region runs on one thread. A host should therefore call
-// pomp_set_thread_limit before any code calls these two to size its work.
+// POMP_OK: this call opened the pool. Its caller owns the cycle: it starts
+// `*limit` - 1 pool threads, on slots 1..*limit-1, and closes the cycle.
+// POMP_ERR_OPEN: the pool is already open; nothing changes, and `*limit`
+// returns the open cycle's limit. Such a caller should not start pool
+// threads nor close: the cycle is another caller's.
+// POMP_ERR_LIMIT: `limit` is null, or `*limit` is not in [0,
+// POMP_MAX_THREADS], or no limit is known; the pool stays closed.
+// POMP_ERR_NOMEM: the first open cannot allocate pomp's descriptors; the pool
+// stays closed, and a later open may try again.
+// POMP_ERR_STATE: called from a pool thread or inside a parallel region.
+// Does not wait for anything: threads of the previous cycle still leaving are
+// never used.
+int pomp_open_pool(int *limit);
+
+// The thread limit: OMP_THREAD_LIMIT if set, else the limit of the first
+// open; 0 while neither is known. It is what omp_get_thread_limit returns;
+// until it is known, omp_get_thread_limit and omp_get_max_threads return 1,
+// and the first such call prints a warning on stderr.
 int pomp_get_thread_limit(void);
 
-// Open the pool: threads may enter it, and parallel regions use the threads
-// that have entered. Once per cycle, the first one included. Until the first
-// open, parallel regions run on one thread, with one warning on stderr.
-// Returns POMP_ERR_LIMIT, with the pool left closed, while no thread limit is
-// set. Must be called by a thread that is not in the pool, outside of any
-// parallel region (POMP_ERR_STATE). Does not wait for anything: threads of the
-// previous cycle still leaving are never used.
-int pomp_open_pool(void);
-
 // The calling thread enters the pool as pool thread `slot`, in
-// [1, thread_limit - 1]; slot 0 is any thread that is not in the pool. While
+// [1, limit - 1] for the current cycle's limit; slot 0 is any thread that is
+// not in the pool. While
 // the pool is open, the call returns only once pomp_close_pool releases the
 // thread, with POMP_OK. It returns at once with POMP_ERR_CLOSED if the pool is
 // closed (including while no thread limit is set), with POMP_ERR_SLOT if
@@ -138,7 +140,6 @@ int pomp_pool_size(void);
 // Set one of pomp's settings from code, for hosts that cannot set
 // environment variables (a JVM, for one). `name` is the setting's environment
 // variable and `value` takes the same strings:
-//   OMP_THREAD_LIMIT      as pomp_set_thread_limit
 //   OMP_NUM_THREADS       "n" or "n1,n2"
 //   OMP_MAX_ACTIVE_LEVELS 1 or 2
 //   POMP_TREE_BARRIER     the smallest team that uses the tree barrier
@@ -146,8 +147,7 @@ int pomp_pool_size(void);
 // POMP_SPIN may be set at any time and applies to the next waits; the others
 // only before the first pomp_open_pool (POMP_ERR_STATE after). As in OpenMP,
 // the environment variable, if set, only gives the initial value, and a call
-// overrides it. The exception is OMP_THREAD_LIMIT, which OpenMP gives no call
-// to change: if set, it wins, as described at pomp_set_thread_limit.
+// overrides it. The thread limit is not one of them: pomp_open_pool sets it.
 // POMP_ERR_LIMIT: unknown name, or invalid value (the setting is unchanged).
 int pomp_set_option(const char *name, const char *value);
 

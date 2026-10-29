@@ -175,7 +175,7 @@ for L in 2 3 4 8 16 17; do
       [ $L -ge 3 ] && run $E OMP_MAX_ACTIVE_LEVELS=2 "$T/pomp_test" lockstep $((N / 8))
       run $E OMP_MAX_ACTIVE_LEVELS=2 "$T/pomp_host_test" nest
       run $E OMP_MAX_ACTIVE_LEVELS=2 "$T/pomp_host_test" steal $((N / 4))
-      for sc in fresh reuse server late overlap errors tworoots rootchurn pushfirst; do
+      for sc in fresh reuse server late overlap errors tworoots rootchurn pushfirst cyclelimit; do
         run $E "$T/pomp_host_test" $sc
       done
       [ $L -ge 3 ] && run $E "$T/pomp_host_test" swap

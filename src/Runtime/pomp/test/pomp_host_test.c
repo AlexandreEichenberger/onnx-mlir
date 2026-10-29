@@ -38,6 +38,7 @@
 //              last owner (POMP_SPIN=0)
 //   pushfirst: S19, a pushed team size as a thread's first call; a root that
 //              enters the pool and is a root again
+//   cyclelimit: S20, cycles smaller than the thread limit; racing opens
 //   latency  : leader time in release, and to the next region
 //
 //===----------------------------------------------------------------------===//
@@ -56,6 +57,9 @@
 int omp_get_thread_num(void);
 int omp_get_num_threads(void);
 int omp_get_level(void);
+int omp_get_max_threads(void);
+int omp_get_max_active_levels(void);
+int omp_get_thread_limit(void);
 int omp_get_active_level(void);
 int32_t __kmpc_global_thread_num(void *loc);
 void __kmpc_push_num_threads(void *loc, int32_t gtid, int32_t nth);
@@ -105,6 +109,15 @@ static int run_region(void) {
   CHECK(nth >= 1 && nth <= limit);
   CHECK(atomic_load(&region_sum) == (long)nth * (nth - 1) / 2);
   return nth;
+}
+
+// Open a cycle of the test's limit, as its owner.
+static int open_pool(void) {
+  int n = limit;
+  int rc = pomp_open_pool(&n);
+  if (rc == POMP_OK)
+    CHECK(n == limit);
+  return rc;
 }
 
 static void wait_pool_size(int n) {
@@ -177,7 +190,7 @@ static void host_stop(void) {
 static void test_fresh(long cycles) {
   pthread_t th[64];
   for (long c = 0; c < cycles; ++c) {
-    CHECK(pomp_open_pool() == POMP_OK);
+    CHECK(open_pool() == POMP_OK);
     for (int i = 1; i < limit; ++i)
       pthread_create(&th[i], NULL, enter_once, (void *)(intptr_t)i);
     wait_pool_size(limit - 1);
@@ -199,7 +212,7 @@ static void test_fresh(long cycles) {
 static void test_reuse(long cycles) {
   host_start();
   for (long c = 0; c < cycles; ++c) {
-    CHECK(pomp_open_pool() == POMP_OK);
+    CHECK(open_pool() == POMP_OK);
     host_enter_all();
     wait_pool_size(limit - 1);
     for (int r = 0; r < 5; ++r)
@@ -223,7 +236,7 @@ static void test_reuse(long cycles) {
 
 static void test_server(long inferences) {
   pthread_t th[64];
-  CHECK(pomp_open_pool() == POMP_OK);
+  CHECK(open_pool() == POMP_OK);
   for (int i = 1; i < limit; ++i)
     pthread_create(&th[i], NULL, enter_once, (void *)(intptr_t)i);
   wait_pool_size(limit - 1);
@@ -244,7 +257,7 @@ static void test_late(long cycles) {
   pthread_t th[64];
   long refused = 0, served = 0;
   for (long c = 0; c < cycles; ++c) {
-    CHECK(pomp_open_pool() == POMP_OK);
+    CHECK(open_pool() == POMP_OK);
     // Start members and close without waiting for them: each entry
     // either is claimed by the release or refused; none may stay.
     for (int i = 1; i < limit; ++i)
@@ -293,7 +306,7 @@ static void test_swap(long cycles) {
     // Rotate slots: host thread i enters as slot (i + c) mod (limit-1) + 1.
     for (int i = 1; i < limit; ++i)
       host[i].slot = (int)((i - 1 + c) % (limit - 1)) + 1;
-    CHECK(pomp_open_pool() == POMP_OK);
+    CHECK(open_pool() == POMP_OK);
     host_enter_all();
     wait_pool_size(limit - 1);
     CHECK(run_region() == limit);
@@ -326,7 +339,7 @@ static void test_swap(long cycles) {
 static void test_overlap(long cycles) {
   host_start();
   for (long c = 0; c < cycles; ++c) {
-    CHECK(pomp_open_pool() == POMP_OK);
+    CHECK(open_pool() == POMP_OK);
     host_enter_all();
     // Do not wait for everyone: regions take whoever is idle.
     for (int r = 0; r < 3; ++r)
@@ -350,7 +363,7 @@ static void test_overlap(long cycles) {
 static void test_sleepers(long cycles) {
   pthread_t th[64];
   for (long c = 0; c < cycles; ++c) {
-    CHECK(pomp_open_pool() == POMP_OK);
+    CHECK(open_pool() == POMP_OK);
     for (int i = 1; i < limit; ++i)
       pthread_create(&th[i], NULL, enter_once, (void *)(intptr_t)i);
     wait_pool_size(limit - 1);
@@ -376,7 +389,8 @@ static void release_inside(int32_t *gtid, int32_t *tid) {
   if (*tid == 0) {
     int rc = pomp_close_pool();
     // Open and reclaim are refused the same way.
-    if (pomp_open_pool() != POMP_ERR_STATE ||
+    int n = 0;
+    if (pomp_open_pool(&n) != POMP_ERR_STATE ||
         pomp_wait_pool_empty() != POMP_ERR_STATE)
       rc = -1;
     atomic_store(&inner_rc, rc);
@@ -399,7 +413,7 @@ static void *enter_twice(void *arg) {
 static void test_errors(void) {
   pthread_t a, b;
   void *rc;
-  CHECK(pomp_open_pool() == POMP_OK);
+  CHECK(open_pool() == POMP_OK);
   CHECK(pomp_enter_pool(0) == POMP_ERR_SLOT);
   CHECK(pomp_enter_pool(limit) == POMP_ERR_SLOT);
   if (limit > 2) {
@@ -415,17 +429,27 @@ static void test_errors(void) {
     // So is an entry, and an open.
     __kmpc_fork_call(NULL, 0, (void *)enter_inside);
     CHECK(atomic_load(&inner_enter_rc) == POMP_ERR_STATE);
-    // OMP_THREAD_LIMIT set the limit: any other request is ignored, and
-    // does not open or close the pool.
-    CHECK(pomp_set_thread_limit(limit == 1 ? 2 : limit - 1) == POMP_OK);
-    CHECK(pomp_set_thread_limit(POMP_MAX_THREADS + 1) == POMP_OK);
-    CHECK(pomp_set_thread_limit(-3) == POMP_OK);
-    CHECK(pomp_get_thread_limit() == limit && pomp_is_pool_open());
+    // A second open while open: refused, with the cycle's limit back.
+    int n = 2;
+    CHECK(pomp_open_pool(&n) == POMP_ERR_OPEN && n == limit);
+    CHECK(pomp_is_pool_open());
+    // Bad requests: refused, the pool unchanged.
+    CHECK(pomp_open_pool(NULL) == POMP_ERR_LIMIT);
+    n = -1;
+    CHECK(pomp_open_pool(&n) == POMP_ERR_LIMIT);
+    n = POMP_MAX_THREADS + 1;
+    CHECK(pomp_open_pool(&n) == POMP_ERR_LIMIT);
     CHECK(pomp_close_pool() == POMP_OK);
-    CHECK(pomp_set_thread_limit(limit) == POMP_OK);
-    CHECK(pomp_get_thread_limit() == limit && !pomp_is_pool_open());
-    CHECK(pomp_open_pool() == POMP_OK);
+    // A close while closed is harmless.
     CHECK(pomp_close_pool() == POMP_OK);
+    // OMP_THREAD_LIMIT is the cap: a larger request gets it, 0 asks for it.
+    n = POMP_MAX_THREADS;
+    CHECK(pomp_open_pool(&n) == POMP_OK && n == limit);
+    CHECK(pomp_close_pool() == POMP_OK);
+    n = 0;
+    CHECK(pomp_open_pool(&n) == POMP_OK && n == limit);
+    CHECK(pomp_close_pool() == POMP_OK);
+    CHECK(pomp_get_thread_limit() == limit);
     pthread_join(a, NULL);
   }
   printf("errors: errors %ld\n", errors);
@@ -440,7 +464,7 @@ static void test_latency(long cycles) {
   host_start();
   for (long c = 0; c < cycles; ++c) {
     double t0, t1, t2;
-    CHECK(pomp_open_pool() == POMP_OK);
+    CHECK(open_pool() == POMP_OK);
     host_enter_all();
     wait_pool_size(limit - 1);
     run_region();
@@ -521,7 +545,7 @@ static void *root_host(void *arg) {
 
 static void test_tworoots(long cycles) {
   host_start();
-  CHECK(pomp_open_pool() == POMP_OK);
+  CHECK(open_pool() == POMP_OK);
   host_enter_all();
   wait_pool_size(limit - 1);
   for (long c = 0; c < cycles; ++c) {
@@ -582,7 +606,7 @@ static long root_blocks(void) {
 
 static void test_rootchurn(long cycles) {
   host_start();
-  CHECK(pomp_open_pool() == POMP_OK);
+  CHECK(open_pool() == POMP_OK);
   host_enter_all();
   wait_pool_size(limit - 1);
   run_region(); // This thread's block.
@@ -632,7 +656,7 @@ static void *latepost_host(void *arg) {
 
 static void test_latepost(long cycles) {
   host_start();
-  CHECK(pomp_open_pool() == POMP_OK);
+  CHECK(open_pool() == POMP_OK);
   host_enter_all();
   wait_pool_size(limit - 1);
   for (long c = 0; c < cycles; ++c) {
@@ -677,7 +701,7 @@ static void *rootinpool_host(void *arg) {
 
 static void test_pushfirst(void) {
   host_start();
-  CHECK(pomp_open_pool() == POMP_OK);
+  CHECK(open_pool() == POMP_OK);
   host_enter_all();
   wait_pool_size(limit - 1);
   for (int want = 1; want <= limit; ++want) {
@@ -693,7 +717,7 @@ static void test_pushfirst(void) {
     host_start();
     atomic_store(&host[1].stop, 1);
     pthread_join(host[1].th, NULL);
-    CHECK(pomp_open_pool() == POMP_OK);
+    CHECK(open_pool() == POMP_OK);
     for (int i = 2; i < limit; ++i)
       atomic_fetch_add(&host[i].go, 1);
     wait_pool_size(limit - 2);
@@ -763,7 +787,7 @@ static void deep(int32_t *gtid, int32_t *tid) {
 
 static void test_nest(long cycles) {
   host_start();
-  CHECK(pomp_open_pool() == POMP_OK);
+  CHECK(open_pool() == POMP_OK);
   host_enter_all();
   wait_pool_size(limit - 1);
   for (long c = 0; c < cycles; ++c) {
@@ -834,7 +858,7 @@ static void steal_l1(int32_t *gtid, int32_t *tid, long *cycle) {
 
 static void test_steal(long cycles) {
   host_start();
-  CHECK(pomp_open_pool() == POMP_OK);
+  CHECK(open_pool() == POMP_OK);
   host_enter_all();
   wait_pool_size(limit - 1);
   for (long c = 0; c < cycles; ++c) {
@@ -881,7 +905,7 @@ static void slow_body(int32_t *gtid, int32_t *tid) {
 
 static void test_sleepjoin(long cycles) {
   host_start();
-  CHECK(pomp_open_pool() == POMP_OK);
+  CHECK(open_pool() == POMP_OK);
   host_enter_all();
   wait_pool_size(limit - 1);
   for (long c = 0; c < cycles; ++c) {
@@ -898,8 +922,9 @@ static void test_sleepjoin(long cycles) {
 }
 
 // -----------------------------------------------------------------------------
-// S12: no OMP_THREAD_LIMIT. Until pomp_set_thread_limit gives the limit, the
-// pool is closed, opens and entries are refused and regions run on one thread.
+// S12: no OMP_THREAD_LIMIT. Until an open gives the limit, the pool is
+// closed, entries are refused and regions run on one thread. The first open
+// fixes the thread limit; later ones may ask for less, never more.
 // -----------------------------------------------------------------------------
 
 static void test_nolimit(long cycles, int lim) {
@@ -908,29 +933,34 @@ static void test_nolimit(long cycles, int lim) {
   CHECK(pomp_is_pool_open() == 0);
   CHECK(pomp_enter_pool(1) == POMP_ERR_CLOSED);
   CHECK(run_region() == 1);
-  // No limit yet: the pool does not open, and only a valid limit is set.
-  CHECK(pomp_open_pool() == POMP_ERR_LIMIT);
-  CHECK(pomp_set_thread_limit(0) == POMP_ERR_LIMIT);
-  CHECK(pomp_set_thread_limit(-1) == POMP_ERR_LIMIT);
-  CHECK(pomp_set_thread_limit(POMP_MAX_THREADS + 1) == POMP_ERR_LIMIT);
+  // No limit yet: 0 asks for one there is not; bad requests are refused.
+  int n = 0;
+  CHECK(pomp_open_pool(&n) == POMP_ERR_LIMIT);
+  n = -1;
+  CHECK(pomp_open_pool(&n) == POMP_ERR_LIMIT);
+  n = POMP_MAX_THREADS + 1;
+  CHECK(pomp_open_pool(&n) == POMP_ERR_LIMIT);
   CHECK(pomp_get_thread_limit() == 0 && pomp_is_pool_open() == 0);
-  CHECK(pomp_set_thread_limit(lim) == POMP_OK);
-  CHECK(pomp_get_thread_limit() == lim && pomp_is_pool_open() == 0);
-  CHECK(lim < 2 || pomp_enter_pool(1) == POMP_ERR_CLOSED);
-  // The limit is then fixed: the same value succeeds, any other is refused.
-  CHECK(pomp_set_thread_limit(lim) == POMP_OK);
-  CHECK(pomp_set_thread_limit(lim + 1) == POMP_ERR_LIMIT);
-  CHECK(pomp_set_thread_limit(0) == POMP_ERR_LIMIT);
+  // The first open fixes the thread limit.
+  n = lim;
+  CHECK(pomp_open_pool(&n) == POMP_OK && n == lim);
+  CHECK(pomp_get_thread_limit() == lim && pomp_is_pool_open());
+  CHECK(pomp_close_pool() == POMP_OK);
+  // Later: more is capped, 0 asks for the cap.
+  n = lim + 1;
+  CHECK(pomp_open_pool(&n) == POMP_OK && n == lim);
+  CHECK(pomp_close_pool() == POMP_OK);
+  n = 0;
+  CHECK(pomp_open_pool(&n) == POMP_OK && n == lim);
+  CHECK(pomp_close_pool() == POMP_OK);
   CHECK(pomp_get_thread_limit() == lim);
-  CHECK(pomp_open_pool() == POMP_OK);
-  CHECK(pomp_is_pool_open());
   limit = lim;
   test_fresh(cycles);
 }
 
 // -----------------------------------------------------------------------------
 // S14: no OMP_THREAD_LIMIT. Host threads run nested serialized regions, and
-// regions, while another thread sets the limit and opens the pool. Until
+// regions, while another thread opens the pool, which sets the limit. Until
 // then there are no pool descriptors: every region runs on one thread, at the
 // right level. Once the pool is open, any region may use it; here no pool
 // thread has entered yet, so the nested ones still run on one thread.
@@ -984,8 +1014,8 @@ static void test_lateopen(int lim) {
   atomic_store(&late_go, 1);
   for (int i = 0; i < 1000; ++i)
     sched_yield();
-  CHECK(pomp_set_thread_limit(lim) == POMP_OK);
-  CHECK(pomp_open_pool() == POMP_OK);
+  limit = lim;
+  CHECK(open_pool() == POMP_OK);
   atomic_store(&late_open, 1);
   pthread_join(b, NULL);
   CHECK(atomic_load(&late_bad) == 0);
@@ -1022,7 +1052,7 @@ static void rejoin_body(int32_t *gtid, int32_t *tid) {
 static void test_rejoin(long cycles) {
   host_start();
   for (long c = 0; c < cycles; ++c) {
-    CHECK(pomp_open_pool() == POMP_OK);
+    CHECK(open_pool() == POMP_OK);
     host_enter_all();
     wait_pool_size(limit - 1);
     for (int r = 0; r < 3; ++r) {
@@ -1043,12 +1073,10 @@ static void test_rejoin(long cycles) {
 
 // -----------------------------------------------------------------------------
 // S16: pomp_set_option, before the pool is first opened and after. The limit
-// comes from a call (no OMP_THREAD_LIMIT). With OMP_NUM_THREADS set, calls
+// comes from the open (no OMP_THREAD_LIMIT). With OMP_NUM_THREADS set, calls
 // still override it, as in OpenMP.
 // -----------------------------------------------------------------------------
 
-int omp_get_max_threads(void);
-int omp_get_max_active_levels(void);
 
 static void test_options(int lim) {
   limit = lim;
@@ -1063,15 +1091,9 @@ static void test_options(int lim) {
   CHECK(pomp_set_option("OMP_NUM_THREADS", "2x") == POMP_ERR_LIMIT);
   CHECK(pomp_set_option("OMP_MAX_ACTIVE_LEVELS", "two") == POMP_ERR_LIMIT);
   CHECK(pomp_set_option("POMP_TREE_BARRIER", "") == POMP_ERR_LIMIT);
-  // The limit, through pomp_set_option as through pomp_set_thread_limit.
-  CHECK(pomp_set_option("OMP_THREAD_LIMIT", "0") == POMP_ERR_LIMIT);
+  // The limit is not a setting: the open gives it.
+  CHECK(pomp_set_option("OMP_THREAD_LIMIT", "4") == POMP_ERR_LIMIT);
   CHECK(pomp_get_thread_limit() == 0);
-  char buf[16];
-  snprintf(buf, sizeof(buf), "%d", lim);
-  CHECK(pomp_set_option("OMP_THREAD_LIMIT", buf) == POMP_OK);
-  CHECK(pomp_get_thread_limit() == lim);
-  snprintf(buf, sizeof(buf), "%d", lim + 1);
-  CHECK(pomp_set_option("OMP_THREAD_LIMIT", buf) == POMP_ERR_LIMIT);
   // Before the first open: every setting may change.
   CHECK(pomp_set_option("OMP_MAX_ACTIVE_LEVELS", "2") == POMP_OK);
   CHECK(omp_get_max_active_levels() == 2);
@@ -1081,12 +1103,12 @@ static void test_options(int lim) {
   CHECK(pomp_set_option("POMP_SPIN", "auto:20") == POMP_OK);
   CHECK(pomp_set_option("OMP_NUM_THREADS", "2") == POMP_OK);
   int want = lim < 2 ? lim : 2;
-  CHECK(omp_get_max_threads() == want);
-  // Regions use the team size set.
-  CHECK(pomp_open_pool() == POMP_OK);
+  // Regions use the team size set, once the open gives the limit.
+  CHECK(open_pool() == POMP_OK);
   host_start();
   host_enter_all();
   wait_pool_size(lim - 1);
+  CHECK(omp_get_max_threads() == want);
   for (int i = 0; i < 100; ++i)
     CHECK(run_region() == want);
   // Once opened: only POMP_SPIN may change; the others are refused.
@@ -1109,6 +1131,71 @@ static void test_options(int lim) {
   // Still refused once closed: the pool has been opened.
   CHECK(pomp_set_option("OMP_NUM_THREADS", "2") == POMP_ERR_STATE);
   printf("options: limit %d, errors %ld\n", lim, errors);
+}
+
+// -----------------------------------------------------------------------------
+// S20: cycles smaller than the thread limit, and racing opens. A cycle of
+// limit n has teams of at most n threads and refuses slots n and above,
+// whatever the thread limit; the thread limit itself does not change. Of
+// several threads that open at once, exactly one gets POMP_OK.
+// -----------------------------------------------------------------------------
+
+static atomic_int race_go, race_ok, race_open, race_bad;
+
+static void *race_opener(void *arg) {
+  int want = (int)(intptr_t)arg;
+  while (!atomic_load(&race_go))
+    sched_yield();
+  int n = want;
+  int rc = pomp_open_pool(&n);
+  if (rc == POMP_OK)
+    atomic_fetch_add(&race_ok, 1);
+  else if (rc == POMP_ERR_OPEN)
+    atomic_fetch_add(&race_open, 1);
+  else
+    atomic_fetch_add(&race_bad, 1);
+  // Either way, n is the open cycle's limit, in [1, the thread limit].
+  if (n < 1 || n > limit)
+    atomic_fetch_add(&race_bad, 1);
+  return NULL;
+}
+
+static void test_cyclelimit(long cycles) {
+  pthread_t th[64];
+  for (long c = 0; c < cycles; ++c) {
+    // Cycles of every size from 1 to the limit, in turn.
+    int lim = 1 + (int)(c % limit);
+    int n = lim;
+    CHECK(pomp_open_pool(&n) == POMP_OK && n == lim);
+    CHECK(omp_get_max_threads() == lim && omp_get_thread_limit() == limit);
+    CHECK(pomp_get_thread_limit() == limit);
+    if (lim < limit)
+      CHECK(pomp_enter_pool(lim) == POMP_ERR_SLOT);
+    for (int i = 1; i < lim; ++i)
+      pthread_create(&th[i], NULL, enter_once, (void *)(intptr_t)i);
+    wait_pool_size(lim - 1);
+    for (int r = 0; r < 5; ++r)
+      CHECK(run_region() == lim);
+    CHECK(pomp_close_pool() == POMP_OK);
+    for (int i = 1; i < lim; ++i)
+      pthread_join(th[i], NULL);
+  }
+  // Racing opens, with different requests: one owner, the others told.
+  for (long c = 0; c < cycles; ++c) {
+    pthread_t r[4];
+    atomic_store(&race_go, 0);
+    atomic_store(&race_ok, 0);
+    atomic_store(&race_open, 0);
+    for (int k = 0; k < 4; ++k)
+      pthread_create(&r[k], NULL, race_opener, (void *)(intptr_t)(k + 1));
+    atomic_store(&race_go, 1);
+    for (int k = 0; k < 4; ++k)
+      pthread_join(r[k], NULL);
+    CHECK(atomic_load(&race_ok) == 1 && atomic_load(&race_open) == 3);
+    CHECK(pomp_close_pool() == POMP_OK);
+  }
+  CHECK(atomic_load(&race_bad) == 0);
+  printf("cyclelimit: %ld cycles, errors %ld\n", cycles, errors);
 }
 
 int main(int argc, char **argv) {
@@ -1168,6 +1255,8 @@ int main(int argc, char **argv) {
     test_latepost(n);
   else if (!strcmp(test, "pushfirst"))
     test_pushfirst();
+  else if (!strcmp(test, "cyclelimit"))
+    test_cyclelimit(n);
   else {
     fprintf(stderr, "unknown test %s\n", test);
     return 1;

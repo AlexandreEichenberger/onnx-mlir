@@ -258,10 +258,10 @@ void Team::leaderJoin(Thread &leader, UniqueId uniqueBarrierId) {
 }
 
 void Thread::fork(int32_t want, Microtask fn, int32_t argc, void **argv) {
-  // Acquire: a root may predate the limit, and then reads the pool's
-  // descriptors for the first time (see Settings::limitAcquire). Until the
-  // limit is set, it is 0, and so is every team size: the fork serializes.
-  int limit = settings.limitAcquire();
+  // Until a limit is known it is 0, and so is every team size: the fork
+  // serializes. The pool's descriptors exist once it has been opened: the
+  // acquire load of its state below orders their allocation before their use.
+  int limit = settings.limit();
   if (want <= 0)
     want = settings.numThreads(regions_.active());
   if (want > limit)
