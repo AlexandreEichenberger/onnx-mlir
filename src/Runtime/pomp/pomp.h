@@ -59,6 +59,12 @@ extern "C" {
 //     return NULL;
 //   }
 //
+//   // Optional settings, before the process's first open (they are fixed
+//   // from then on, except POMP_SPIN); POMP_ERR_STATE if another thread
+//   // opened first: the settings stay as they were, and the cycle runs.
+//   pomp_set_option("POMP_TREE_BARRIER", "8");  // tree barrier from 8 threads
+//   pomp_set_option("POMP_SPIN", "auto:50");
+//
 //   int n;                                      // the limit it gets:
 //   int rc = pomp_open_pool(16, &n);            // OMP_THREAD_LIMIT, else 16
 //   if (rc == POMP_OK) {
@@ -174,7 +180,11 @@ int pomp_pool_size(void);
 //   POMP_TREE_BARRIER     the smallest team that uses the tree barrier
 //   POMP_SPIN             "auto", "auto:MAX" or a number of microseconds
 // POMP_SPIN may be set at any time and applies to the next waits; the others
-// only before the first pomp_open_pool (POMP_ERR_STATE after). As in OpenMP,
+// only before the first pomp_open_pool (POMP_ERR_STATE after, also once the
+// pool is closed: the members of a team must agree on them, so they are fixed
+// for the process). The place to set them is the owner's code just before its
+// first open, as in the example above. Until that open, regions run on one
+// thread, so setting them while models already run is safe too. As in OpenMP,
 // the environment variable, if set, only gives the initial value, and a call
 // overrides it. The thread limit is not one of them: pomp_open_pool sets it.
 // POMP_ERR_LIMIT: unknown name, or invalid value (the setting is unchanged).

@@ -77,10 +77,10 @@ private:
   };
   struct OptionDesc {
     const char *name; // Its environment variable's name.
-    // Whether it may change once frozen (see freeze): team sizes and the
-    // barrier kind are read at forks and barriers, so only before;
-    // POMP_SPIN at every wait, so at any time.
-    bool anytime;
+    // Whether it is fixed once the settings are frozen (see freeze): team
+    // sizes and the barrier kind are read at forks and barriers, so they
+    // are; POMP_SPIN, read at every wait, may change at any time.
+    bool frozen;
     // Parser: return false if `s` is invalid (the setting is unchanged);
     // otherwise set the setting. Under optionMutex_.
     bool (Settings::*set)(const char *s);
@@ -123,12 +123,12 @@ private:
 };
 
 const Settings::OptionDesc Settings::kOptions[kNumOptions] = {
-    {"OMP_NUM_THREADS", false, &Settings::setNumThreads,
+    {"OMP_NUM_THREADS", true, &Settings::setNumThreads,
         &Settings::showNumThreads},
-    {"OMP_MAX_ACTIVE_LEVELS", false, &Settings::setMaxActive,
+    {"OMP_MAX_ACTIVE_LEVELS", true, &Settings::setMaxActive,
         &Settings::showMaxActive},
-    {"POMP_TREE_BARRIER", false, &Settings::setTreeMin, &Settings::showTreeMin},
-    {"POMP_SPIN", true, &Settings::setSpin, &Settings::showSpin},
+    {"POMP_TREE_BARRIER", true, &Settings::setTreeMin, &Settings::showTreeMin},
+    {"POMP_SPIN", false, &Settings::setSpin, &Settings::showSpin},
 };
 
 POMP_CONSTINIT Settings settings;
@@ -187,7 +187,7 @@ int Settings::setOption(const char *name, const char *value, Source from) {
   // before any call is served) and a call overrides it. The freeze check and
   // the change, under one lock with freeze (see there).
   ScopedLock<Mutex> lock(optionMutex_);
-  if (from == kCall && !kOptions[k].anytime && frozen_.load(Order::Relaxed))
+  if (from == kCall && kOptions[k].frozen && frozen_.load(Order::Relaxed))
     return POMP_ERR_STATE;
   if (!(this->*kOptions[k].set)(value))
     return POMP_ERR_LIMIT;
