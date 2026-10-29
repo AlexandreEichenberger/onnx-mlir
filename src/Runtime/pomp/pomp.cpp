@@ -113,10 +113,11 @@ namespace {
 // pomp itself, in dependency order: not to be sorted.
 // clang-format off
 #include "pompIdentity.inc"
+#include "pompSettings.inc"
 #include "pompSyncTypes.inc"
-#include "pompTypes.inc"
-#include "pompInit.inc"
+#include "pompDescriptors.inc"
 #include "pompPool.inc"
+#include "pompRoots.inc"
 #include "pompSync.inc"
 #include "pompRegion.inc"
 #include "pompLoop.inc"

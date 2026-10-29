@@ -2,14 +2,15 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//===--------------------------- pompTypes.inc ----------------------------===//
+//===------------------------ pompDescriptors.inc -------------------------===//
 //
 // Copyright 2026 The IBM Research Authors.
 //
 // =============================================================================
 //
-// Part of pomp.cpp: the declarations of the region stack, team, thread,
-// pool, settings and root blocks, and the globals.
+// Part of pomp.cpp: the descriptors, a thread's region stack, its Team and
+// Thread, and the globals of the pool's descriptors; and their small methods,
+// which touch only their own fields.
 //
 //===----------------------------------------------------------------------===//
 
@@ -269,176 +270,6 @@ public:
   AdaptiveSpin idleSpin_, teamSpin_;
 };
 
-// The pool: which pool threads are idle, sleeping or released, and whether it
-// is open.
-class Pool {
-public:
-  // At init: the lock of open and close.
-  void init();
-  // Whether the pool's descriptors exist; acquired before reading them.
-  bool allocatedAcquire() const { return allocated_.load(Order::Acquire); }
-  // The host calls of pomp.h, in the order of a cycle: pomp_open_pool,
-  // pomp_enter_pool, pomp_close_pool and pomp_wait_pool_empty.
-  int open(int fallback, int *limit);
-  int enter(int32_t slot);
-  int close();
-  int waitEmpty();
-  bool isOpen(Order o = Order::SeqCst) const { return state_.load(o) == kOpen; }
-  int size() const { return numPoolThreads_.load(); }
-  // Fork that finds the pool not open: warn once if it was never opened.
-  void warnIfNeverOpened();
-
-  // Recruit up to `want` idle pool threads as workers, preferring `prefer`;
-  // return them after the join.
-  SlotMask recruit(Team &team, int want, SlotMask prefer);
-  // The idle pool threads (relaxed).
-  SlotMask idle() const;
-  // Post to the sleepers among `workers`; see "Wake-up and sleep".
-  void wakeSleeping(SlotMask workers);
-  // After the join: make a team's workers idle again.
-  void returnWorkers(SlotMask workers);
-
-private:
-  // The first open: allocate the descriptors of `n` slots; false if out of
-  // memory.
-  bool allocate(int n);
-  // Idle pool thread: wait for work (true) or for release (false).
-  bool waitWork(Thread &t, SlotMask self, uint64_t &last);
-  // Leaving pool thread: wake up to `n` released sleepers.
-  void wakeReleased(int n);
-  // Claim and release every idle pool thread.
-  void releaseIdle();
-  // Post to the sleepers among `workers` whose bit this call clears.
-  int wakeSleepers(SlotMask workers);
-
-  // Slot i is out iff it is an idle pool thread. Every slot starts busy.
-  alignas(kCacheLine) AtomicMask busy_{SlotMask::below(kMaxThreads)};
-  // Slot i is in while pool thread i sleeps, or is about to.
-  alignas(kCacheLine) AtomicMask sleeping_;
-  // Slot i is in from the release that claimed pool thread i until it leaves.
-  alignas(kCacheLine) AtomicMask released_;
-  // kNeverOpened (zero) at start, then kOpen and kClosed by open and close.
-  static constexpr int kNeverOpened = 0;
-  static constexpr int kOpen = 1;
-  static constexpr int kClosed = 2;
-  alignas(kCacheLine) Atomic<int> state_;
-  // Serializes open and close: an open that finds the pool open fails.
-  Mutex openMutex_;
-  Atomic<int> allocated_; // The descriptors exist.
-  Atomic<int> numPoolThreads_;
-  Atomic<int> neverOpenedSeen_;
-};
-
-// Settings: defaults, then the environment, then pomp_set_option calls. The
-// environment is read at init (the first call of any entry point) and gives
-// initial values; as in OpenMP, a call overrides them. The exception is the
-// thread limit: OMP_THREAD_LIMIT wins over calls. See "Environment" in
-// POMP.md.
-class Settings {
-public:
-  // Where a setting's value comes from, in the order they apply.
-  enum Source : int8_t { kDefault, kEnv, kCall };
-  // pomp_set_option: set setting `name` (its environment variable's name)
-  // from `value`. POMP_ERR_LIMIT: unknown name or invalid value;
-  // POMP_ERR_STATE: the setting cannot change now.
-  int setOption(const char *name, const char *value, Source from);
-  // At each successful open: from the first one on, only POMP_SPIN may
-  // change; and OMP_DISPLAY_ENV prints the settings, once.
-  void freeze();
-  // Read the environment, once, at init.
-  void init();
-  // Fix the limit, once: OMP_THREAD_LIMIT if set (at init), else the first
-  // open's fallback, once its descriptors are allocated (Pool::open).
-  void setLimit(int lim);
-
-  // The thread limit, OpenMP's thread-limit-var, slot 0 (a team's root)
-  // included: OMP_THREAD_LIMIT if set, else the fallback of the first
-  // successful open. 0 while neither is known; never changes once set.
-  int limit() const { return limit_.load(Order::Relaxed); }
-  // Slots 0..limit-1.
-  SlotMask limitSlots() const { return limitSlots_.load(Order::Relaxed); }
-  // Warn once that no limit is known.
-  void warnNoLimit();
-  // Default team size of a fork at `active` enclosing active levels.
-  int numThreads(int active) const {
-    return nthreads_[active < kMaxActive ? active : kMaxActive - 1].load(
-        Order::Relaxed);
-  }
-  int maxActive() const { return maxActive_.load(Order::Relaxed); }
-  // POMP_SPIN: a fixed spin in us, or -1 for auto, which adapts up to
-  // spinMaxUs().
-  bool spinAdaptive() const { return spinUs_.load(Order::Relaxed) < 0; }
-  long spinUs() const { return spinUs_.load(Order::Relaxed); }
-  long spinMaxUs() const { return spinMaxUs_.load(Order::Relaxed); }
-  int treeMin() const { return treeMin_.load(Order::Relaxed); }
-
-private:
-  // Parsers: return false if `s` is invalid (the setting is unchanged);
-  // otherwise set the setting. Under optionMutex_.
-  bool setNumThreads(const char *s);
-  bool setMaxActive(const char *s);
-  bool setTreeMin(const char *s);
-  bool setSpin(const char *s);
-  // Settings with a source, indexed as kOptions in pompInit.inc.
-  static constexpr int kNumOptions = 4;
-
-  Atomic<int> frozen_;               // Set by the first open (freeze).
-  // Serializes setOption (calls, and init's reads of the environment).
-  Mutex optionMutex_;
-  Source sources_[kNumOptions] = {};
-  int displayEnv_ = 0;               // OMP_DISPLAY_ENV: 0, 1 (true), 2 (verbose).
-  Atomic<int> displayed_;
-  int envNthreads_[kMaxActive] = {}; // OMP_NUM_THREADS as set, 0: unset.
-  // Whether OMP_NUM_THREADS listed more than one level, for the default of
-  // OMP_MAX_ACTIVE_LEVELS.
-  bool nthreadsNested_ = false;
-  Atomic<int> maxActive_;
-  // The limit (see limit()); written under limitMutex_.
-  Mutex limitMutex_;
-  Atomic<int> limit_;
-  AtomicMask limitSlots_;            // Slots 0..limit_-1.
-  Atomic<int> nthreads_[kMaxActive]; // Default team sizes, clamped to limit_.
-  bool limitFromEnv_ = false;        // For OMP_DISPLAY_ENV; set at init.
-  Atomic<int> noLimitSeen_;
-  // Read at every wait: atomics, as POMP_SPIN may change while regions run.
-  Atomic<long> spinUs_;
-  Atomic<long> spinMaxUs_;
-  Atomic<int> treeMin_; // Team size from which the tree barrier is used.
-};
-
-// A root's descriptor and the teams it leads, allocated together, recycled
-// together and never freed; see "Root blocks" in pompRegion.inc for the
-// rules that keep a late wake-up of a recycled block harmless.
-struct RootBlock {
-  Thread thread;
-  Team levelOne;
-  Team levelTwo;
-  RootBlock *next; // In the free list.
-};
-
-// The root blocks: those in use, one per root, and the free list.
-class Roots {
-public:
-  // At init: the lock, and the key whose destructor recycles a block.
-  void init();
-  // The calling thread, which has no descriptor, becomes a root.
-  Thread &acquire();
-  // The key's destructor: the thread of `block` has ended.
-  void recycle(RootBlock &block);
-
-private:
-  // A new block, zeroed and initialized; under mutex_.
-  RootBlock *allocate();
-
-  Mutex mutex_;
-  RootBlock *free_ = nullptr; // Under mutex_.
-  int32_t count_ = 0;         // Blocks allocated; under mutex_.
-  pthread_key_t exitKey_{};
-};
-
-POMP_CONSTINIT Settings settings;
-POMP_CONSTINIT Pool pool;
-POMP_CONSTINIT Roots roots;
 // The pool's descriptors, zero-allocated by Settings::allocate: threads[i] is
 // pool thread i and teams[i] the level-2 team it leads. Index 0 is unused:
 // each root has its own (RootBlock).
@@ -447,4 +278,60 @@ POMP_CONSTINIT Team *teams = nullptr;
 
 inline Thread &Team::member(int32_t slot) const {
   return slot ? threads[slot] : *leader_;
+}
+
+// -----------------------------------------------------------------------------
+// Small methods
+// -----------------------------------------------------------------------------
+
+// Called on each entry as this slot, before it is recruitable, and at the
+// allocation of a root block. Entries as a slot are serialized by `present_`.
+// The post is initialized once per descriptor, never again: a waker of a
+// previous occupant (or owner, for a root block) may still be inside its
+// post() ("Root blocks", rule 2, in pompRegion.inc).
+inline void Thread::init() {
+  if (!initialized_) {
+    post_.init();
+    initialized_ = true;
+  }
+}
+
+// Join and tree ids share a seed: they go to different flags. Once per team,
+// at allocation: never again, even when a root block is reused ("Root
+// blocks", rule 3).
+inline void Team::init(int32_t index, Thread &leader) {
+  leader_ = &leader;
+  leaderSlot_ = leader.slot();
+  join_.seed(index);
+  tree_.seed(index);
+}
+
+inline Thread *Thread::current() { return Self::get(); }
+
+inline RegionStack *Thread::currentRegions() {
+  Thread *self = current();
+  return self ? &self->regions() : nullptr;
+}
+
+inline bool Thread::callerInPomp() {
+  Thread *self = current();
+  return self && (self->slot() != 0 || self->regions().depth() > 0);
+}
+
+// The bump of `go` publishes the assignment (seq_cst).
+inline void Thread::assign(Team *team, int32_t tid) {
+  wake_.team = team;
+  wake_.tid = tid;
+  wake_.go.fetchAdd(1);
+}
+
+inline SlotMask Team::cachedPick(int want, SlotMask idle) const {
+  return cachedReq_ == want && cachedPick_ && !(cachedPick_ - idle)
+             ? cachedPick_
+             : SlotMask();
+}
+
+inline void Team::remember(int want, SlotMask pick) {
+  cachedReq_ = want;
+  cachedPick_ = pick;
 }

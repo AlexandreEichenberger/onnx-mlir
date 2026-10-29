@@ -2,41 +2,100 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//===---------------------------- pompInit.inc ----------------------------===//
+//===-------------------------- pompSettings.inc --------------------------===//
 //
 // Copyright 2026 The IBM Research Authors.
 //
 // =============================================================================
 //
-// Part of pomp.cpp: the settings, read from the environment once, and the
-// thread limit, with the allocation of the descriptors at the first open.
+// Part of pomp.cpp: the settings, read from the environment once and set by
+// pomp_set_option, and the thread limit. Settings depends on no other pomp
+// type, so it comes first.
 //
 //===----------------------------------------------------------------------===//
+
+// Settings: defaults, then the environment, then pomp_set_option calls. The
+// environment is read at init (the first call of any entry point) and gives
+// initial values; as in OpenMP, a call overrides them. The exception is the
+// thread limit: OMP_THREAD_LIMIT wins over calls. See "Environment" in
+// POMP.md.
+class Settings {
+public:
+  // Where a setting's value comes from, in the order they apply.
+  enum Source : int8_t { kDefault, kEnv, kCall };
+  // pomp_set_option: set setting `name` (its environment variable's name)
+  // from `value`. POMP_ERR_LIMIT: unknown name or invalid value;
+  // POMP_ERR_STATE: the setting cannot change now.
+  int setOption(const char *name, const char *value, Source from);
+  // At each successful open: from the first one on, only POMP_SPIN may
+  // change; and OMP_DISPLAY_ENV prints the settings, once.
+  void freeze();
+  // Read the environment, once, at init.
+  void init();
+  // Fix the limit, once: OMP_THREAD_LIMIT if set (at init), else the first
+  // open's fallback, once its descriptors are allocated (Pool::open).
+  void setLimit(int lim);
+
+  // The thread limit, OpenMP's thread-limit-var, slot 0 (a team's root)
+  // included: OMP_THREAD_LIMIT if set, else the fallback of the first
+  // successful open. 0 while neither is known; never changes once set.
+  int limit() const { return limit_.load(Order::Relaxed); }
+  // Slots 0..limit-1.
+  SlotMask limitSlots() const { return limitSlots_.load(Order::Relaxed); }
+  // Warn once that no limit is known.
+  void warnNoLimit();
+  // Default team size of a fork at `active` enclosing active levels.
+  int numThreads(int active) const {
+    return nthreads_[active < kMaxActive ? active : kMaxActive - 1].load(
+        Order::Relaxed);
+  }
+  int maxActive() const { return maxActive_.load(Order::Relaxed); }
+  // POMP_SPIN: a fixed spin in us, or -1 for auto, which adapts up to
+  // spinMaxUs().
+  bool spinAdaptive() const { return spinUs_.load(Order::Relaxed) < 0; }
+  long spinUs() const { return spinUs_.load(Order::Relaxed); }
+  long spinMaxUs() const { return spinMaxUs_.load(Order::Relaxed); }
+  int treeMin() const { return treeMin_.load(Order::Relaxed); }
+
+private:
+  // Parsers: return false if `s` is invalid (the setting is unchanged);
+  // otherwise set the setting. Under optionMutex_.
+  bool setNumThreads(const char *s);
+  bool setMaxActive(const char *s);
+  bool setTreeMin(const char *s);
+  bool setSpin(const char *s);
+  // Settings with a source, indexed as kOptions in pompInit.inc.
+  static constexpr int kNumOptions = 4;
+
+  Atomic<int> frozen_;               // Set by the first open (freeze).
+  // Serializes setOption (calls, and init's reads of the environment).
+  Mutex optionMutex_;
+  Source sources_[kNumOptions] = {};
+  int displayEnv_ = 0;               // OMP_DISPLAY_ENV: 0, 1 (true), 2 (verbose).
+  Atomic<int> displayed_;
+  int envNthreads_[kMaxActive] = {}; // OMP_NUM_THREADS as set, 0: unset.
+  // Whether OMP_NUM_THREADS listed more than one level, for the default of
+  // OMP_MAX_ACTIVE_LEVELS.
+  bool nthreadsNested_ = false;
+  Atomic<int> maxActive_;
+  // The limit (see limit()); written under limitMutex_.
+  Mutex limitMutex_;
+  Atomic<int> limit_;
+  AtomicMask limitSlots_;            // Slots 0..limit_-1.
+  Atomic<int> nthreads_[kMaxActive]; // Default team sizes, clamped to limit_.
+  bool limitFromEnv_ = false;        // For OMP_DISPLAY_ENV; set at init.
+  Atomic<int> noLimitSeen_;
+  // Read at every wait: atomics, as POMP_SPIN may change while regions run.
+  Atomic<long> spinUs_;
+  Atomic<long> spinMaxUs_;
+  Atomic<int> treeMin_; // Team size from which the tree barrier is used.
+};
+
+POMP_CONSTINIT Settings settings;
 
 // -----------------------------------------------------------------------------
 // Initialization
 // -----------------------------------------------------------------------------
-
-// `n` zeroed objects of `size` bytes, line-aligned, or nullptr.
-void *allocLines(size_t n, size_t size) {
-  char *p = static_cast<char *>(calloc(1, n * size + kCacheLine));
-  if (!p)
-    return nullptr;
-  uintptr_t a = (uintptr_t(p) + kCacheLine - 1) & ~uintptr_t(kCacheLine - 1);
-  return reinterpret_cast<void *>(a);
-}
-
-// Called on each entry as this slot, before it is recruitable, and at the
-// allocation of a root block. Entries as a slot are serialized by `present_`.
-// The post is initialized once per descriptor, never again: a waker of a
-// previous occupant (or owner, for a root block) may still be inside its
-// post() ("Root blocks", rule 2, in pompRegion.inc).
-inline void Thread::init() {
-  if (!initialized_) {
-    post_.init();
-    initialized_ = true;
-  }
-}
 
 void Settings::init() {
   limitMutex_.init();

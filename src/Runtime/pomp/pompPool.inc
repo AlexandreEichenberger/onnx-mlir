@@ -13,6 +13,68 @@
 //
 //===----------------------------------------------------------------------===//
 
+// The pool: which pool threads are idle, sleeping or released, and whether it
+// is open.
+class Pool {
+public:
+  // At init: the lock of open and close.
+  void init();
+  // Whether the pool's descriptors exist; acquired before reading them.
+  bool allocatedAcquire() const { return allocated_.load(Order::Acquire); }
+  // The host calls of pomp.h, in the order of a cycle: pomp_open_pool,
+  // pomp_enter_pool, pomp_close_pool and pomp_wait_pool_empty.
+  int open(int fallback, int *limit);
+  int enter(int32_t slot);
+  int close();
+  int waitEmpty();
+  bool isOpen(Order o = Order::SeqCst) const { return state_.load(o) == kOpen; }
+  int size() const { return numPoolThreads_.load(); }
+  // Fork that finds the pool not open: warn once if it was never opened.
+  void warnIfNeverOpened();
+
+  // Recruit up to `want` idle pool threads as workers, preferring `prefer`;
+  // return them after the join.
+  SlotMask recruit(Team &team, int want, SlotMask prefer);
+  // The idle pool threads (relaxed).
+  SlotMask idle() const;
+  // Post to the sleepers among `workers`; see "Wake-up and sleep".
+  void wakeSleeping(SlotMask workers);
+  // After the join: make a team's workers idle again.
+  void returnWorkers(SlotMask workers);
+
+private:
+  // The first open: allocate the descriptors of `n` slots; false if out of
+  // memory.
+  bool allocate(int n);
+  // Idle pool thread: wait for work (true) or for release (false).
+  bool waitWork(Thread &t, SlotMask self, uint64_t &last);
+  // Leaving pool thread: wake up to `n` released sleepers.
+  void wakeReleased(int n);
+  // Claim and release every idle pool thread.
+  void releaseIdle();
+  // Post to the sleepers among `workers` whose bit this call clears.
+  int wakeSleepers(SlotMask workers);
+
+  // Slot i is out iff it is an idle pool thread. Every slot starts busy.
+  alignas(kCacheLine) AtomicMask busy_{SlotMask::below(kMaxThreads)};
+  // Slot i is in while pool thread i sleeps, or is about to.
+  alignas(kCacheLine) AtomicMask sleeping_;
+  // Slot i is in from the release that claimed pool thread i until it leaves.
+  alignas(kCacheLine) AtomicMask released_;
+  // kNeverOpened (zero) at start, then kOpen and kClosed by open and close.
+  static constexpr int kNeverOpened = 0;
+  static constexpr int kOpen = 1;
+  static constexpr int kClosed = 2;
+  alignas(kCacheLine) Atomic<int> state_;
+  // Serializes open and close: an open that finds the pool open fails.
+  Mutex openMutex_;
+  Atomic<int> allocated_; // The descriptors exist.
+  Atomic<int> numPoolThreads_;
+  Atomic<int> neverOpenedSeen_;
+};
+
+POMP_CONSTINIT Pool pool;
+
 // -----------------------------------------------------------------------------
 // Wake-up and sleep
 //
@@ -21,13 +83,6 @@
 // the sleepers whose bit it clears. Waking spinning threads costs one load of
 // `sleeping`, and no system call.
 // -----------------------------------------------------------------------------
-
-// The bump of `go` publishes the assignment (seq_cst).
-inline void Thread::assign(Team *team, int32_t tid) {
-  wake_.team = team;
-  wake_.tid = tid;
-  wake_.go.fetchAdd(1);
-}
 
 inline void Pool::wakeSleeping(SlotMask workers) {
 #ifdef POMP_STATS
@@ -119,17 +174,6 @@ bool Pool::waitWork(Thread &t, SlotMask self, uint64_t &last) {
 
 SlotMask Pool::idle() const {
   return settings.limitSlots() - busy_.load(Order::Relaxed);
-}
-
-inline SlotMask Team::cachedPick(int want, SlotMask idle) const {
-  return cachedReq_ == want && cachedPick_ && !(cachedPick_ - idle)
-             ? cachedPick_
-             : SlotMask();
-}
-
-inline void Team::remember(int want, SlotMask pick) {
-  cachedReq_ = want;
-  cachedPick_ = pick;
 }
 
 SlotMask Pool::recruit(Team &team, int want, SlotMask prefer) {

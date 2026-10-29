@@ -175,16 +175,6 @@ inline void Team::leaderEndBarrier(UniqueId currUniqueBarrierId) {
     tree_.leaderEndRegion(currUniqueBarrierId);
 }
 
-// Join and tree ids share a seed: they go to different flags. Once per team,
-// at allocation: never again, even when a root block is reused ("Root
-// blocks", rule 3).
-inline void Team::init(int32_t index, Thread &leader) {
-  leader_ = &leader;
-  leaderSlot_ = leader.slot();
-  join_.seed(index);
-  tree_.seed(index);
-}
-
 // -----------------------------------------------------------------------------
 // Central barrier
 //

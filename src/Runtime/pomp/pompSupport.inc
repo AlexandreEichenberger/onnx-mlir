@@ -379,4 +379,17 @@ void invoke(
   Table::callers[argc](fn, &gtid, &tid, argv);
 }
 
+// -----------------------------------------------------------------------------
+// Memory
+// -----------------------------------------------------------------------------
+
+// `n` zeroed objects of `size` bytes, line-aligned, or nullptr.
+void *allocLines(size_t n, size_t size) {
+  char *p = static_cast<char *>(calloc(1, n * size + kCacheLine));
+  if (!p)
+    return nullptr;
+  uintptr_t a = (uintptr_t(p) + kCacheLine - 1) & ~uintptr_t(kCacheLine - 1);
+  return reinterpret_cast<void *>(a);
+}
+
 } // namespace
