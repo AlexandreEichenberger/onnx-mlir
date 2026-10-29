@@ -275,6 +275,8 @@ class Pool {
 public:
   // At init: the lock of open and close.
   void init();
+  // Whether the pool's descriptors exist; acquired before reading them.
+  bool allocatedAcquire() const { return allocated_.load(Order::Acquire); }
   // The host calls of pomp.h, in the order of a cycle: pomp_open_pool,
   // pomp_enter_pool, pomp_close_pool and pomp_wait_pool_empty.
   int open(int fallback, int *limit);
@@ -282,8 +284,6 @@ public:
   int close();
   int waitEmpty();
   bool isOpen(Order o = Order::SeqCst) const { return state_.load(o) == kOpen; }
-  // Whether the pool has ever been opened.
-  bool wasOpened() const { return state_.load() != kNeverOpened; }
   int size() const { return numPoolThreads_.load(); }
   // Fork that finds the pool not open: warn once if it was never opened.
   void warnIfNeverOpened();
@@ -299,6 +299,9 @@ public:
   void returnWorkers(SlotMask workers);
 
 private:
+  // The first open: allocate the descriptors of `n` slots; false if out of
+  // memory.
+  bool allocate(int n);
   // Idle pool thread: wait for work (true) or for release (false).
   bool waitWork(Thread &t, SlotMask self, uint64_t &last);
   // Leaving pool thread: wake up to `n` released sleepers.
@@ -321,6 +324,7 @@ private:
   alignas(kCacheLine) Atomic<int> state_;
   // Serializes open and close: an open that finds the pool open fails.
   Mutex openMutex_;
+  Atomic<int> allocated_; // The descriptors exist.
   Atomic<int> numPoolThreads_;
   Atomic<int> neverOpenedSeen_;
 };
@@ -338,26 +342,19 @@ public:
   // from `value`. POMP_ERR_LIMIT: unknown name or invalid value;
   // POMP_ERR_STATE: the setting cannot change now.
   int setOption(const char *name, const char *value, Source from);
-  // OMP_DISPLAY_ENV: print the settings on stderr, once, at the first open
-  // of the pool (when only POMP_SPIN can still change).
-  void displayOnce();
-  // Init pomp, once, on the first call of any entry point.
-  void ensureInit() {
-    if (initialized_.load(Order::Acquire) != 2)
-      initOnce();
-  }
-  // pomp_open_pool, while the pool is closed: the limit is OMP_THREAD_LIMIT if
-  // set, else `fallback`, in [0, kMaxThreads] (0: none). The first successful
-  // call allocates the pool's descriptors, and then fixes it. POMP_ERR_LIMIT:
-  // no limit; POMP_ERR_NOMEM, with nothing fixed.
-  int openLimit(int fallback);
+  // At each successful open: from the first one on, only POMP_SPIN may
+  // change; and OMP_DISPLAY_ENV prints the settings, once.
+  void freeze();
+  // Read the environment, once, at init.
+  void init();
+  // Fix the limit, once: OMP_THREAD_LIMIT if set (at init), else the first
+  // open's fallback, once its descriptors are allocated (Pool::open).
+  void setLimit(int lim);
 
   // The thread limit, OpenMP's thread-limit-var, slot 0 (a team's root)
   // included: OMP_THREAD_LIMIT if set, else the fallback of the first
   // successful open. 0 while neither is known; never changes once set.
   int limit() const { return limit_.load(Order::Relaxed); }
-  // Whether the pool's descriptors exist; acquired before reading them.
-  bool allocatedAcquire() const { return allocated_.load(Order::Acquire); }
   // Slots 0..limit-1.
   SlotMask limitSlots() const { return limitSlots_.load(Order::Relaxed); }
   // Warn once that no limit is known.
@@ -376,15 +373,6 @@ public:
   int treeMin() const { return treeMin_.load(Order::Relaxed); }
 
 private:
-  // Run init() once; concurrent callers wait for it.
-  void initOnce();
-  // Read the environment.
-  void init();
-  // Under limitMutex_: allocate the pool's descriptors for `n` slots, once;
-  // false if out of memory.
-  bool allocate(int n);
-  // Under limitMutex_: make `lim` the limit, once.
-  void setLimit(int lim);
   // Parsers: return false if `s` is invalid (the setting is unchanged);
   // otherwise set the setting. Under optionMutex_.
   bool setNumThreads(const char *s);
@@ -394,7 +382,7 @@ private:
   // Settings with a source, indexed as kOptions in pompInit.inc.
   static constexpr int kNumOptions = 4;
 
-  Atomic<int> initialized_;          // 0: no, 1: in progress, 2: done.
+  Atomic<int> frozen_;               // Set by the first open (freeze).
   // Serializes setOption (calls, and init's reads of the environment).
   Mutex optionMutex_;
   Source sources_[kNumOptions] = {};
@@ -410,7 +398,6 @@ private:
   Atomic<int> limit_;
   AtomicMask limitSlots_;            // Slots 0..limit_-1.
   Atomic<int> nthreads_[kMaxActive]; // Default team sizes, clamped to limit_.
-  Atomic<int> allocated_;            // The pool's descriptors exist.
   bool limitFromEnv_ = false;        // For OMP_DISPLAY_ENV; set at init.
   Atomic<int> noLimitSeen_;
   // Read at every wait: atomics, as POMP_SPIN may change while regions run.

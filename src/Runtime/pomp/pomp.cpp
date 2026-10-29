@@ -122,6 +122,33 @@ namespace {
 #include "pompLoop.inc"
 // clang-format on
 
+// -----------------------------------------------------------------------------
+// Initialization, at the first call of any entry point
+// -----------------------------------------------------------------------------
+
+// 0: not yet, 1: in progress, 2: done.
+POMP_CONSTINIT Atomic<int> initState;
+
+// Concurrent first calls wait for the one that does it.
+void initOnce() {
+  int expected = 0;
+  if (initState.compareExchange(expected, 1)) {
+    settings.init();
+    pool.init();
+    Self::createStorage();
+    roots.init();
+    initState.store(2, Order::Release);
+  } else {
+    while (initState.load(Order::Acquire) != 2)
+      sched_yield();
+  }
+}
+
+inline void ensureInit() {
+  if (initState.load(Order::Acquire) != 2)
+    initOnce();
+}
+
 } // namespace
 
 // -----------------------------------------------------------------------------
@@ -129,42 +156,42 @@ namespace {
 // -----------------------------------------------------------------------------
 
 int pomp_get_thread_limit(void) {
-  settings.ensureInit();
+  ensureInit();
   return settings.limit();
 }
 
 int pomp_open_pool(int fallback_limit, int *limit) {
-  settings.ensureInit();
+  ensureInit();
   return pool.open(fallback_limit, limit);
 }
 
 int pomp_enter_pool(int slot) {
-  settings.ensureInit();
+  ensureInit();
   return pool.enter(slot);
 }
 
 int pomp_close_pool(void) {
-  settings.ensureInit();
+  ensureInit();
   return pool.close();
 }
 
 int pomp_wait_pool_empty(void) {
-  settings.ensureInit();
+  ensureInit();
   return pool.waitEmpty();
 }
 
 int pomp_is_pool_open(void) {
-  settings.ensureInit();
+  ensureInit();
   return pool.isOpen();
 }
 
 int pomp_pool_size(void) {
-  settings.ensureInit();
+  ensureInit();
   return pool.size();
 }
 
 int pomp_set_option(const char *name, const char *value) {
-  settings.ensureInit();
+  ensureInit();
   return settings.setOption(name, value, Settings::kCall);
 }
 
@@ -195,7 +222,7 @@ int32_t __kmpc_global_thread_num(void *) {
 }
 
 void __kmpc_push_num_threads(void *, int32_t, int32_t nth) {
-  settings.ensureInit();
+  ensureInit();
   if (nth < 0)
     nth = 0;
   else if (nth > kMaxThreads)
@@ -208,7 +235,7 @@ void __kmpc_push_proc_bind(void *, int32_t, int32_t) {}
 void __kmpc_fork_call(void *, int32_t argc, Microtask fn, ...) {
   void *argv[kMaxArgs];
   va_list ap;
-  settings.ensureInit();
+  ensureInit();
   if (argc < 0)
     fatal("negative argument count for an outlined function");
   if (argc > kMaxArgs)
@@ -221,7 +248,7 @@ void __kmpc_fork_call(void *, int32_t argc, Microtask fn, ...) {
 }
 
 void __kmpc_serialized_parallel(void *, int32_t) {
-  settings.ensureInit();
+  ensureInit();
   Thread &self = Thread::currentOrNewRoot();
   self.takePending();
   self.regions().pushSerialized();
@@ -302,7 +329,7 @@ int omp_in_parallel(void) { return omp_get_active_level() > 0; }
 // Until a thread limit is set (pomp.h), these return 1 and warn once.
 int omp_get_max_threads(void) {
   int active = omp_get_active_level();
-  settings.ensureInit();
+  ensureInit();
   int n = settings.numThreads(active);
   if (n > 0)
     return n;
@@ -311,7 +338,7 @@ int omp_get_max_threads(void) {
 }
 
 int omp_get_thread_limit(void) {
-  settings.ensureInit();
+  ensureInit();
   int n = settings.limit();
   if (n > 0)
     return n;
@@ -320,7 +347,7 @@ int omp_get_thread_limit(void) {
 }
 
 int omp_get_max_active_levels(void) {
-  settings.ensureInit();
+  ensureInit();
   return settings.maxActive();
 }
 

@@ -206,9 +206,35 @@ void Pool::warnIfNeverOpened() {
 
 void Pool::init() { openMutex_.init(); }
 
+bool Pool::allocate(int n) {
+  // One block, never freed: `n` threads, then `n` teams from the next line,
+  // for the pool threads; index 0 is unused (roots have their own).
+  size_t tBytes =
+      (size_t(n) * sizeof(Thread) + kCacheLine - 1) & ~size_t(kCacheLine - 1);
+  char *p =
+      static_cast<char *>(allocLines(1, tBytes + size_t(n) * sizeof(Team)));
+  if (!p)
+    return false;
+  Thread *t = reinterpret_cast<Thread *>(p);
+  Team *m = reinterpret_cast<Team *>(p + tBytes);
+  // Not yet visible to other threads: the allocated_ store below publishes
+  // the descriptors. Pool threads init their sleep on entry.
+  threads = t;
+  teams = m;
+  for (int32_t i = 1; i < n; ++i) {
+    t[i].initIdentity(i, nullptr, &m[i]);
+    m[i].init(i, t[i]);
+  }
+  // Publishes the descriptors (see allocatedAcquire).
+  allocated_.store(1, Order::Release);
+  return true;
+}
+
 // One caller opens a cycle: the others find it open and get POMP_ERR_OPEN,
-// with the limit. The first open fixes the limit and allocates, before the
-// state store that lets threads enter.
+// with the limit. The first open allocates the descriptors for
+// OMP_THREAD_LIMIT, else for `fallback`, and only then fixes the limit: on
+// failure nothing is fixed, and a later open may retry, with another
+// fallback. All before the state store that lets threads enter.
 int Pool::open(int fallback, int *limit) {
   if (Thread::callerInPomp())
     return POMP_ERR_STATE;
@@ -218,17 +244,23 @@ int Pool::open(int fallback, int *limit) {
   *limit = settings.limit();
   if (isOpen())
     return POMP_ERR_OPEN;
-  int rc = settings.openLimit(fallback);
-  if (rc != POMP_OK)
-    return rc;
+  if (!allocated_.load(Order::Relaxed)) {
+    int lim = settings.limit() ? settings.limit() : fallback;
+    if (!lim)
+      return POMP_ERR_LIMIT;
+    if (!allocate(lim))
+      return POMP_ERR_NOMEM;
+    if (!settings.limit())
+      settings.setLimit(lim);
+  }
   *limit = settings.limit();
   state_.store(kOpen);
-  settings.displayOnce();
+  settings.freeze();
   return POMP_OK;
 }
 
 int Pool::enter(int32_t slot) {
-  if (!settings.allocatedAcquire())
+  if (!allocatedAcquire())
     return POMP_ERR_CLOSED; // No descriptors before the first open.
   if (slot < 1 || slot >= settings.limit())
     return POMP_ERR_SLOT;
@@ -316,7 +348,7 @@ int Pool::close() {
 int Pool::waitEmpty() {
   if (Thread::callerInPomp())
     return POMP_ERR_STATE;
-  if (!settings.allocatedAcquire())
+  if (!allocatedAcquire())
     return POMP_OK; // Never opened: no pool thread.
   int limit = settings.limit();
   // Wake any claimed thread still asleep, until all have left.

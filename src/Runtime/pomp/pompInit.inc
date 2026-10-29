@@ -38,25 +38,9 @@ inline void Thread::init() {
   }
 }
 
-// Concurrent first calls wait for the one that does it.
-// Initialized values: 0: no, 1: in progress, 2: done.
-void Settings::initOnce() {
-  int expected = 0;
-  if (initialized_.compareExchange(expected, 1)) {
-    init();
-    initialized_.store(2, Order::Release);
-  } else {
-    while (initialized_.load(Order::Acquire) != 2)
-      sched_yield();
-  }
-}
-
 void Settings::init() {
   limitMutex_.init();
   optionMutex_.init();
-  pool.init();
-  Self::createStorage();
-  roots.init();
 
   // Defaults; then each setting the environment sets.
   maxActive_.store(1, Order::Relaxed);
@@ -78,7 +62,7 @@ void Settings::init() {
           stderr, "pomp: warning: %s=\"%s\" is invalid and ignored\n", name, s);
 
   // OMP_THREAD_LIMIT, if valid, is the limit; nothing is allocated before
-  // the first open (see openLimit).
+  // the first open (see Pool::open).
   if ((s = getenv("OMP_THREAD_LIMIT"))) {
     const char *end;
     long v = parseInt(s, &end);
@@ -88,7 +72,6 @@ void Settings::init() {
           "ignored; pomp_open_pool must give the limit\n",
           s, kMaxThreads);
     else {
-      ScopedLock<Mutex> lock(limitMutex_);
       limitFromEnv_ = true;
       setLimit(int(v));
     }
@@ -120,7 +103,7 @@ int Settings::setOption(const char *name, const char *value, Source from) {
     ++k;
   if (k == kNumOptions)
     return POMP_ERR_LIMIT;
-  if (from == kCall && !kOptions[k].anytime && pool.wasOpened())
+  if (from == kCall && !kOptions[k].anytime && frozen_.load())
     return POMP_ERR_STATE;
   // As in OpenMP, the environment gives the initial value (init reads it
   // before any call is served) and a call overrides it.
@@ -139,9 +122,10 @@ const char *sourceName(Settings::Source s) {
 }
 } // namespace
 
-// In OpenMP's OMP_DISPLAY_ENV format, each line followed by where the value
+// OMP_DISPLAY_ENV: in OpenMP's format, each line followed by where the value
 // comes from.
-void Settings::displayOnce() {
+void Settings::freeze() {
+  frozen_.store(1);
   if (!displayEnv_ || displayed_.exchange(1))
     return;
   ScopedLock<Mutex> lock(optionMutex_);
@@ -269,48 +253,8 @@ bool Settings::setSpin(const char *s) {
   return true;
 }
 
-int Settings::openLimit(int fallback) {
-  ScopedLock<Mutex> lock(limitMutex_);
-  if (allocated_.load(Order::Relaxed))
-    return POMP_OK;
-  // The first open: allocate for OMP_THREAD_LIMIT, else for `fallback`, and
-  // only then fix the limit. On failure nothing is fixed, so a later open may
-  // retry, with another fallback.
-  int lim = limit() ? limit() : fallback;
-  if (!lim)
-    return POMP_ERR_LIMIT;
-  if (!allocate(lim))
-    return POMP_ERR_NOMEM;
-  if (!limit())
-    setLimit(lim);
-  return POMP_OK;
-}
-
-bool Settings::allocate(int n) {
-  // One block, never freed: `n` threads, then `n` teams from the next line,
-  // for the pool threads; index 0 is unused (roots have their own).
-  size_t tBytes =
-      (size_t(n) * sizeof(Thread) + kCacheLine - 1) & ~size_t(kCacheLine - 1);
-  char *p =
-      static_cast<char *>(allocLines(1, tBytes + size_t(n) * sizeof(Team)));
-  if (!p)
-    return false;
-  Thread *t = reinterpret_cast<Thread *>(p);
-  Team *m = reinterpret_cast<Team *>(p + tBytes);
-  // Not yet visible to other threads: the allocated_ store below publishes
-  // the descriptors. Pool threads init their sleep on entry.
-  threads = t;
-  teams = m;
-  for (int32_t i = 1; i < n; ++i) {
-    t[i].initIdentity(i, nullptr, &m[i]);
-    m[i].init(i, t[i]);
-  }
-  // Publishes the descriptors (see allocatedAcquire).
-  allocated_.store(1, Order::Release);
-  return true;
-}
-
 void Settings::setLimit(int lim) {
+  ScopedLock<Mutex> lock(limitMutex_);
   for (int i = 0; i < kMaxActive; ++i) {
     int n = envNthreads_[i];
     nthreads_[i].store(n && n < lim ? n : lim);
