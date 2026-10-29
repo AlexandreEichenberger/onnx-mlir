@@ -65,14 +65,38 @@ public:
   int treeMin() const { return treeMin_.load(Order::Relaxed); }
 
 private:
-  // Parsers: return false if `s` is invalid (the setting is unchanged);
-  // otherwise set the setting. Under optionMutex_.
+  // The settings pomp_set_option knows: their index in kOptions and
+  // sources_. In the order init reads them: OMP_NUM_THREADS first, as it
+  // gives OMP_MAX_ACTIVE_LEVELS its default.
+  enum Option : int {
+    kOptNumThreads,
+    kOptMaxActive,
+    kOptTreeMin,
+    kOptSpin,
+    kNumOptions
+  };
+  struct OptionDesc {
+    const char *name; // Its environment variable's name.
+    // Whether it may change once frozen (see freeze): team sizes and the
+    // barrier kind are read at forks and barriers, so only before;
+    // POMP_SPIN at every wait, so at any time.
+    bool anytime;
+    // Parser: return false if `s` is invalid (the setting is unchanged);
+    // otherwise set the setting. Under optionMutex_.
+    bool (Settings::*set)(const char *s);
+    // For OMP_DISPLAY_ENV: write the value as used, quoted, into `v`.
+    void (Settings::*show)(char *v, size_t n) const;
+  };
+  static const OptionDesc kOptions[kNumOptions];
+
   bool setNumThreads(const char *s);
   bool setMaxActive(const char *s);
   bool setTreeMin(const char *s);
   bool setSpin(const char *s);
-  // Settings with a source, indexed as kOptions below.
-  static constexpr int kNumOptions = 4;
+  void showNumThreads(char *v, size_t n) const;
+  void showMaxActive(char *v, size_t n) const;
+  void showTreeMin(char *v, size_t n) const;
+  void showSpin(char *v, size_t n) const;
 
   Atomic<int> frozen_; // Set by the first open (freeze); under optionMutex_.
   // Serializes setOption (calls, and init's reads of the environment).
@@ -98,6 +122,15 @@ private:
   Atomic<int> treeMin_; // Team size from which the tree barrier is used.
 };
 
+const Settings::OptionDesc Settings::kOptions[kNumOptions] = {
+    {"OMP_NUM_THREADS", false, &Settings::setNumThreads,
+        &Settings::showNumThreads},
+    {"OMP_MAX_ACTIVE_LEVELS", false, &Settings::setMaxActive,
+        &Settings::showMaxActive},
+    {"POMP_TREE_BARRIER", false, &Settings::setTreeMin, &Settings::showTreeMin},
+    {"POMP_SPIN", true, &Settings::setSpin, &Settings::showSpin},
+};
+
 POMP_CONSTINIT Settings settings;
 
 // -----------------------------------------------------------------------------
@@ -119,13 +152,11 @@ void Settings::init() {
     displayEnv_ = 1;
   else if (s && !strcasecmp(s, "verbose"))
     displayEnv_ = 2;
-  // OMP_NUM_THREADS first: it gives OMP_MAX_ACTIVE_LEVELS its default.
-  static const char *const names[] = {"OMP_NUM_THREADS",
-      "OMP_MAX_ACTIVE_LEVELS", "POMP_TREE_BARRIER", "POMP_SPIN"};
-  for (const char *name : names)
-    if ((s = getenv(name)) && setOption(name, s, kEnv) != POMP_OK)
-      fprintf(
-          stderr, "pomp: warning: %s=\"%s\" is invalid and ignored\n", name, s);
+  // In the order of kOptions (see there).
+  for (const OptionDesc &d : kOptions)
+    if ((s = getenv(d.name)) && setOption(d.name, s, kEnv) != POMP_OK)
+      fprintf(stderr, "pomp: warning: %s=\"%s\" is invalid and ignored\n",
+          d.name, s);
 
   // OMP_THREAD_LIMIT, if valid, is the limit; nothing is allocated before
   // the first open (see Pool::open).
@@ -144,25 +175,7 @@ void Settings::init() {
   }
 }
 
-// The settings pomp_set_option knows, in the order of sources_. Whether each
-// may change once frozen (see Settings::freeze): team sizes and the barrier
-// kind are read at forks and barriers, so only before; POMP_SPIN at every
-// wait, so at any time.
-namespace {
-struct OptionDesc {
-  const char *name;
-  bool anytime;
-  bool (Settings::*set)(const char *);
-};
-} // namespace
-
 int Settings::setOption(const char *name, const char *value, Source from) {
-  static const OptionDesc kOptions[kNumOptions] = {
-      {"OMP_NUM_THREADS", false, &Settings::setNumThreads},
-      {"OMP_MAX_ACTIVE_LEVELS", false, &Settings::setMaxActive},
-      {"POMP_TREE_BARRIER", false, &Settings::setTreeMin},
-      {"POMP_SPIN", true, &Settings::setSpin},
-  };
   if (!name || !value)
     return POMP_ERR_LIMIT;
   int k = 0;
@@ -203,24 +216,14 @@ void Settings::freeze() {
   snprintf(v, sizeof(v), "'%d'", limit());
   fprintf(stderr, "  %-22s = %-12s [%s]\n", "OMP_THREAD_LIMIT", v,
       limitFromEnv_ ? "environment" : "pomp_open_pool fallback");
-  // Team sizes as used: clamped to the limit.
-  snprintf(v, sizeof(v), "'%d,%d'", numThreads(0), numThreads(1));
-  fprintf(stderr, "  %-22s = %-12s [%s]\n", "OMP_NUM_THREADS", v,
-      sourceName(sources_[0]));
-  snprintf(v, sizeof(v), "'%d'", maxActive());
-  fprintf(stderr, "  %-22s = %-12s [%s%s]\n", "OMP_MAX_ACTIVE_LEVELS", v,
-      sourceName(sources_[1]),
-      sources_[1] == kDefault && nthreadsNested_ ? ", from OMP_NUM_THREADS"
-                                                 : "");
-  snprintf(v, sizeof(v), "'%d'", treeMin());
-  fprintf(stderr, "  %-22s = %-12s [%s]\n", "POMP_TREE_BARRIER", v,
-      sourceName(sources_[2]));
-  if (spinAdaptive())
-    snprintf(v, sizeof(v), "'auto:%ld'", spinMaxUs());
-  else
-    snprintf(v, sizeof(v), "'%ld'", spinUs());
-  fprintf(stderr, "  %-22s = %-12s [%s]\n", "POMP_SPIN", v,
-      sourceName(sources_[3]));
+  for (int k = 0; k < kNumOptions; ++k) {
+    (this->*kOptions[k].show)(v, sizeof(v));
+    fprintf(stderr, "  %-22s = %-12s [%s%s]\n", kOptions[k].name, v,
+        sourceName(sources_[k]),
+        k == kOptMaxActive && sources_[k] == kDefault && nthreadsNested_
+            ? ", from OMP_NUM_THREADS"
+            : "");
+  }
   if (displayEnv_ == 2) {
     fprintf(stderr, "  %-22s = '%d'\n", "[pomp] max threads", kMaxThreads);
     fprintf(stderr, "  %-22s = '%d'\n", "[pomp] cache line", kCacheLine);
@@ -236,6 +239,26 @@ void Settings::freeze() {
 #endif
   }
   fprintf(stderr, "OPENMP DISPLAY ENVIRONMENT END\n");
+}
+
+// Team sizes as used: clamped to the limit.
+void Settings::showNumThreads(char *v, size_t n) const {
+  snprintf(v, n, "'%d,%d'", numThreads(0), numThreads(1));
+}
+
+void Settings::showMaxActive(char *v, size_t n) const {
+  snprintf(v, n, "'%d'", maxActive());
+}
+
+void Settings::showTreeMin(char *v, size_t n) const {
+  snprintf(v, n, "'%d'", treeMin());
+}
+
+void Settings::showSpin(char *v, size_t n) const {
+  if (spinAdaptive())
+    snprintf(v, n, "'auto:%ld'", spinMaxUs());
+  else
+    snprintf(v, n, "'%ld'", spinUs());
 }
 
 // "n" or "n1,n2"; missing entries repeat the last one. Clamped to the limit
@@ -264,7 +287,7 @@ bool Settings::setNumThreads(const char *s) {
   // As libomp: a list of more than one level implies nesting, unless
   // OMP_MAX_ACTIVE_LEVELS is set.
   nthreadsNested_ = n > 1;
-  if (sources_[1] == kDefault)
+  if (sources_[kOptMaxActive] == kDefault)
     maxActive_.store(nthreadsNested_ ? kMaxActive : 1, Order::Relaxed);
   int lim = limit();
   if (lim)
