@@ -54,6 +54,15 @@ llvm::cl::opt<bool> nnpaDisableCompilerStickUnstick(
                    "stick/unstick code. Default is false."),
     llvm::cl::init(false), llvm::cl::cat(OnnxMlirCommonOptions));
 
+// Experimental, off by default: whether NNPA allows an operand of an
+// elementwise op to overlap its output is not documented.
+llvm::cl::opt<bool> nnpaZHighInplaceElementwise(
+    "nnpa-zhigh-inplace-elementwise",
+    llvm::cl::desc("[Experimental] Let zhigh.Add and zhigh.Mul write their "
+                   "result into an input buffer that is not used after the "
+                   "op. Default is false."),
+    llvm::cl::init(false), llvm::cl::cat(OnnxMlirCommonOptions));
+
 llvm::cl::opt<bool> nnpaEnableScalarBcastBinary(
     "nnpa-enable-scalar-bcast-binary",
     llvm::cl::desc("Enable the lowering to NNPA of binary operations with "

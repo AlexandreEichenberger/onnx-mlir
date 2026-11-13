@@ -978,6 +978,40 @@ struct ZLowOpFor<ZHighMaxOp> {
   using Op = ZLowMaxOp;
 };
 
+// Return the index of an operand of the elementwise op `op` whose buffer can
+// also hold the result, or -1 if there is none. `operands` are the converted
+// operands, `outType` the converted result type.
+//
+// The buffer of operand X can be reused when X is reachable through no other
+// value: X has a single use (this op), and it is the result of an op whose
+// lowering allocates a fresh buffer (never a view of another buffer). By
+// induction, the buffer of such a producer is not shared either, so chains of
+// in-place ops stay safe. Same type means same shape: ZHigh binary ops do not
+// broadcast. Operand 0 is preferred over operand 1.
+static int getInplaceOperandIndex(
+    Operation *op, ArrayRef<Value> operands, MemRefType outType) {
+  for (unsigned i = 0; i < 2; ++i) {
+    Value x = op->getOperand(i);
+    if (!x.hasOneUse())
+      continue;
+    // Function arguments belong to the caller.
+    Operation *def = x.getDefiningOp();
+    if (!def)
+      continue;
+    // Allowlist of producers lowered to a fresh alloc. Never add an op whose
+    // lowering may return a view (e.g. zhigh.Reshape, onnx.Reshape).
+    if (!isa<ZHighMatMulOp, ZHighAddOp, ZHighSubOp, ZHighMulOp, ZHighDivOp,
+            ZHighMinOp, ZHighMaxOp, ZHighSigmoidOp, ZHighExpOp, ZHighLogOp,
+            ZHighReluOp, ZHighTanhOp, ZHighGeluOp, ZHighSqrtOp, ZHighInvSqrtOp,
+            ZHighLeakyReluOp, ONNXLayerNormalizationOp>(def))
+      continue;
+    if (operands[i].getType() != outType)
+      continue;
+    return i;
+  }
+  return -1;
+}
+
 template <typename OP_TYPE>
 struct ZHighToZLowBinaryOpLowering : public ConversionPattern {
   ZHighToZLowBinaryOpLowering(TypeConverter &typeConverter, MLIRContext *ctx)
@@ -1000,9 +1034,20 @@ struct ZHighToZLowBinaryOpLowering : public ConversionPattern {
     ZHighBinaryOpShapeHelper shapeHelper(op, operands, &create.krnlIE);
     shapeHelper.computeShapeAndAssertOnFailure();
 
-    // Allocate a buffer for the result MemRef.
-    Value alloc = insertAllocForZMemRef(
-        zMemRefType, shapeHelper.getOutputDims(), op, rewriter);
+    // Write the result in place into an input that dies at this op (Add and
+    // Mul only, experimental), else allocate a buffer for the result MemRef.
+    Value alloc = nullptr;
+    if constexpr (std::is_same_v<OP_TYPE, ZHighAddOp> ||
+                  std::is_same_v<OP_TYPE, ZHighMulOp>) {
+      if (nnpaZHighInplaceElementwise) {
+        int i = getInplaceOperandIndex(op, operands, zMemRefType.value);
+        if (i >= 0)
+          alloc = operands[i];
+      }
+    }
+    if (!alloc)
+      alloc = insertAllocForZMemRef(
+          zMemRefType, shapeHelper.getOutputDims(), op, rewriter);
 
     // Get the original shape before it is vanished by lower passes.
     SmallVector<IndexExpr, 4> dims;

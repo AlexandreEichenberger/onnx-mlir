@@ -71,6 +71,7 @@ extern llvm::cl::opt<bool> nnpaDisableZHighToOnnx;
 extern llvm::cl::opt<bool> nnpaDisableZHighDecomposeStickUnstick;
 extern llvm::cl::opt<bool> nnpaDisableCompilerStickUnstick;
 extern llvm::cl::opt<bool> nnpaEnableScalarBcastBinary;
+extern llvm::cl::opt<bool> nnpaZHighInplaceElementwise;
 extern llvm::cl::opt<NNPAPlacementHeuristic> nnpaPlacementHeuristic;
 extern llvm::cl::opt<bool> profileZHighIR;
 extern llvm::cl::opt<bool> nnpaDisableSaturation;
